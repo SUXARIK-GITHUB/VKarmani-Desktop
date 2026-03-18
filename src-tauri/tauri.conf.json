@@ -1,0 +1,64 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "VKarmani Desktop",
+  "version": "0.13.8",
+  "identifier": "com.vkarmani.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "VKarmani Desktop",
+        "width": 1288,
+        "height": 736,
+        "minWidth": 1120,
+        "minHeight": 660,
+        "resizable": true,
+        "decorations": false,
+        "transparent": false,
+        "maximizable": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": [
+        "main-capability"
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "../public/assets/logo-dark.jpg",
+      "../public/assets/logo-white.jpg",
+      "../public/assets/wallpaper.jpg",
+      "../resources/core/windows/xray.exe",
+      "../resources/core/windows/geoip.dat",
+      "../resources/core/windows/geosite.dat",
+      "../resources/core/windows/wintun.dll"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "windows": {
+        "installMode": "passive"
+      },
+      "pubkey": "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY",
+      "endpoints": [
+        "https://github.com/YOUR_ORG/YOUR_REPO/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}
