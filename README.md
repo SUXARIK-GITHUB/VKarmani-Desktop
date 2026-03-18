@@ -1,12 +1,23 @@
 # 🚀 VKarmani Desktop
 
-> Современный desktop-клиент для **VKarmani** с удобным интерфейсом, поддержкой подключения через **Xray**, режимами **Proxy** и **TUN**, диагностикой, управлением профилем и локальным runtime на Windows.
+<p align="center">
+  Современный desktop-клиент для <b>VKarmani</b> с поддержкой <b>Xray</b>, режимов <b>Proxy</b> и <b>TUN</b>, диагностикой, управлением профилем и локальным runtime на Windows.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white" />
+  <img src="https://img.shields.io/badge/Desktop-Tauri%20v2-24C8DB?style=for-the-badge&logo=tauri&logoColor=white" />
+  <img src="https://img.shields.io/badge/Frontend-React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB" />
+  <img src="https://img.shields.io/badge/Language-TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white" />
+  <img src="https://img.shields.io/badge/Backend-Rust-000000?style=for-the-badge&logo=rust&logoColor=white" />
+  <img src="https://img.shields.io/badge/Core-Xray-orange?style=for-the-badge" />
+</p>
 
 ---
 
 ## ✨ О проекте
 
-**VKarmani Desktop** — это настольное приложение, созданное для удобного, стабильного и понятного подключения к инфраструктуре **VKarmani** через современный desktop-интерфейс.
+**VKarmani Desktop** — это настольное приложение, созданное для удобного, стабильного и современного подключения к инфраструктуре **VKarmani** через нативный desktop-интерфейс.
 
 Программа объединяет в себе:
 
@@ -14,10 +25,10 @@
 - 🔄 синхронизацию профиля и серверов
 - 🌐 подключение через локальный **Xray runtime**
 - 🛡️ режимы **Proxy** и **TUN**
-- 🧪 диагностику, проверку состояния и управление подключением
-- 🖥️ интеграцию desktop UI + backend runtime в одном приложении
+- 🧪 диагностику и проверку состояния подключения
+- 🖥️ интеграцию современного UI и нативного backend в одном приложении
 
-Основная цель проекта — дать быстрый, аккуратный и удобный VPN/Proxy-клиент для Windows на базе **Tauri + Rust + React/Vite**.
+Основная цель проекта — предоставить быстрый, понятный и аккуратный VPN/Proxy-клиент для Windows на базе **Tauri + Rust + React/Vite**.
 
 ---
 
@@ -32,7 +43,7 @@
 - 🩺 Диагностика состояния runtime и сети
 - 📱 Просмотр устройств и состояния профиля
 - ⚙️ Управление параметрами запуска и поведения клиента
-- 🦀 Desktop-оболочка на Tauri с нативным backend на Rust
+- 🦀 Нативный backend на Rust через Tauri
 
 ---
 
