@@ -8,7 +8,8 @@
     "build": "node ./node_modules/typescript/bin/tsc -p tsconfig.json --noEmit && node ./node_modules/vite/bin/vite.js build",
     "preview": "node ./node_modules/vite/bin/vite.js preview",
     "tauri:dev": "npx tauri dev",
-    "tauri:build": "npx tauri build"
+    "tauri:build": "npx tauri build",
+    "tauri": "npx tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "2.10.1",

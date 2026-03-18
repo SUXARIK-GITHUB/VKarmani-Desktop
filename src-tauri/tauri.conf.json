@@ -48,16 +48,17 @@
       "../resources/core/windows/geoip.dat",
       "../resources/core/windows/geosite.dat",
       "../resources/core/windows/wintun.dll"
-    ]
+    ],
+    "createUpdaterArtifacts": true
   },
   "plugins": {
     "updater": {
       "windows": {
         "installMode": "passive"
       },
-      "pubkey": "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE1RDk3MjRBQUFGOTY3RUEKUldUcVovbXFTbkxaRlpxMHlGck1Wai9wZFJxK1JXemZJOU1yZkpScW5aUmNSdHpnWVlPS1ZJZzUK",
       "endpoints": [
-        "https://github.com/YOUR_ORG/YOUR_REPO/releases/latest/download/latest.json"
+        "https://github.com/SUXARIK-GITHUB/VKarmani-Desktop/releases/latest/download/latest.json"
       ]
     }
   }
