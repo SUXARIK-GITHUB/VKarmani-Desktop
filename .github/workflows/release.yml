@@ -23,6 +23,14 @@ jobs:
         with:
           node-version: '22'
           cache: npm
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Force public npm registry
+        run: |
+          npm config set registry https://registry.npmjs.org/
+          npm config set audit false
+          npm config set fund false
+          npm config get registry
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

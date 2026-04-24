@@ -10,6 +10,36 @@ const fail = (message) => {
 };
 const ok = (message) => console.log(`[updater-check] OK: ${message}`);
 
+
+const forbiddenRegistryPatterns = [
+  /packages\.applied-caas-gateway/i,
+  /internal\.api\.openai\.org/i,
+  /artifactory\/api\/npm\/npm-public/i,
+];
+
+for (const file of ['package-lock.json', '.npmrc', '.github/workflows/release.yml']) {
+  const filePath = path.join(root, file);
+  if (!fs.existsSync(filePath)) continue;
+  const content = fs.readFileSync(filePath, 'utf8');
+  if (forbiddenRegistryPatterns.some((pattern) => pattern.test(content))) {
+    fail(`${file} contains an internal/private npm registry URL. Use https://registry.npmjs.org/ for GitHub Actions.`);
+  } else {
+    ok(`${file} does not contain internal npm registry URLs`);
+  }
+}
+
+const npmrcPath = path.join(root, '.npmrc');
+if (!fs.existsSync(npmrcPath)) {
+  fail('.npmrc is missing; keep it committed so GitHub Actions uses the public npm registry consistently');
+} else {
+  const npmrc = fs.readFileSync(npmrcPath, 'utf8');
+  if (!/^registry=https:\/\/registry\.npmjs\.org\/?$/m.test(npmrc)) {
+    fail('.npmrc must set registry=https://registry.npmjs.org/');
+  } else {
+    ok('.npmrc forces public npm registry');
+  }
+}
+
 const pkg = readJson('package.json');
 const tauri = readJson('src-tauri/tauri.conf.json');
 const cargo = fs.readFileSync(path.join(root, 'src-tauri/Cargo.toml'), 'utf8');
