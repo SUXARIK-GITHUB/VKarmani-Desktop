@@ -850,6 +850,104 @@ fn verify_core_artifacts(app: &AppHandle, core_path: &Path) -> Result<(), String
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct CoreArtifactManifest {
+    files: Vec<CoreArtifactManifestFile>,
+}
+
+#[derive(Deserialize)]
+struct CoreArtifactManifestFile {
+    file: String,
+    sha256: String,
+    size: Option<u64>,
+}
+
+#[cfg(target_os = "windows")]
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+(Get-FileHash -Algorithm SHA256 -LiteralPath $env:VKARMANI_HASH_PATH).Hash.ToLowerInvariant()
+"#;
+    run_powershell_with_env(
+        script,
+        &[("VKARMANI_HASH_PATH".to_string(), path.to_string_lossy().to_string())],
+    )
+    .map(|value| value.trim().to_ascii_lowercase())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn sha256_file(_path: &Path) -> Result<String, String> {
+    Err("Проверка SHA-256 core artifacts поддерживается только на Windows.".into())
+}
+
+fn verify_core_artifacts(app: &AppHandle, core_path: &Path) -> Result<(), String> {
+    let core_dir = core_path
+        .parent()
+        .ok_or_else(|| "Не удалось определить каталог Xray-core.".to_string())?;
+    let manifest_path = core_dir.join("core-manifest.json");
+
+    let env_core_path = std::env::var("VKARMANI_XRAY_PATH").ok().map(PathBuf::from);
+    let is_custom_env_core = env_core_path
+        .as_ref()
+        .map(|path| path.as_path() == core_path)
+        .unwrap_or(false);
+
+    if !manifest_path.exists() {
+        if is_custom_env_core {
+            let _ = append_runtime_event(
+                app,
+                "Core integrity: VKARMANI_XRAY_PATH используется без core-manifest.json; проверка пропущена для dev/custom core.",
+            );
+            return Ok(());
+        }
+
+        return Err("Не найден core-manifest.json рядом с xray.exe. Нельзя запускать неподтверждённые bundled-бинарники.".into());
+    }
+
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("Не удалось прочитать core-manifest.json: {error}"))?;
+    let manifest: CoreArtifactManifest = serde_json::from_str(&manifest_text)
+        .map_err(|error| format!("Некорректный core-manifest.json: {error}"))?;
+
+    let mut xray_declared = false;
+    for entry in manifest.files {
+        if entry.file.trim().is_empty() || entry.file.contains('/') || entry.file.contains('\\') || entry.file.contains("..") {
+            return Err(format!("Некорректное имя файла в core-manifest.json: {}", entry.file));
+        }
+
+        if entry.file.eq_ignore_ascii_case("xray.exe") {
+            xray_declared = true;
+        }
+
+        let artifact_path = core_dir.join(&entry.file);
+        let metadata = fs::metadata(&artifact_path)
+            .map_err(|error| format!("Core artifact отсутствует или недоступен: {} ({error})", entry.file))?;
+
+        if let Some(expected_size) = entry.size {
+            if metadata.len() != expected_size {
+                return Err(format!(
+                    "Core artifact {} не прошёл size-check: ожидалось {}, получено {}.",
+                    entry.file,
+                    expected_size,
+                    metadata.len()
+                ));
+            }
+        }
+
+        let actual_hash = sha256_file(&artifact_path)?;
+        if actual_hash != entry.sha256.trim().to_ascii_lowercase() {
+            return Err(format!("Core artifact {} не прошёл SHA-256 проверку.", entry.file));
+        }
+    }
+
+    if !xray_declared {
+        return Err("core-manifest.json не содержит xray.exe.".into());
+    }
+
+    let _ = append_runtime_event(app, "Core integrity: bundled artifacts прошли SHA-256 проверку.");
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn resolve_core_sidecar_path(core_path: &Path, file_name: &str) -> Option<PathBuf> {
     core_path.parent().map(|dir| dir.join(file_name))
