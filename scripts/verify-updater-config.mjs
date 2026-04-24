@@ -50,14 +50,14 @@ if (!fs.existsSync(workflowPath)) {
   ok('GitHub Actions release workflow exists');
   const workflow = fs.readFileSync(workflowPath, 'utf8');
   if (!/tauri-apps\/tauri-action@v0(\.\d+\.\d+)?/.test(workflow)) {
-    fail("release workflow must use available tauri-apps/tauri-action@v0 or @v0.x.x");
+    fail('release workflow must use available tauri-apps/tauri-action@v0 or @v0.x.x');
   } else {
-    ok("release workflow uses tauri-action v0");
+    ok('release workflow uses tauri-action v0');
   }
-  if (!/uploadUpdaterJson:\s*true/.test(workflow)) {
-    fail('release workflow must set uploadUpdaterJson: true');
+  if (!/includeUpdaterJson:\s*true/.test(workflow)) {
+    fail('release workflow must set includeUpdaterJson: true');
   } else {
-    ok('release workflow uploads latest.json');
+    ok('release workflow includes latest.json');
   }
   if (!/releaseDraft:\s*false/.test(workflow)) {
     fail('release workflow must publish a non-draft release, otherwise /releases/latest/download/latest.json can return 404');
