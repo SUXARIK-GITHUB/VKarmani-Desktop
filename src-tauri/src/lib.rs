@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::Write,
-    net::{TcpStream, ToSocketAddrs, UdpSocket},
+    net::{IpAddr, TcpStream, ToSocketAddrs, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
@@ -15,7 +16,7 @@ use std::os::windows::process::CommandExt;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager,
+    AppHandle, Emitter, Manager, WindowEvent,
 };
 
 const SOCKS_PORT: u16 = 10808;
@@ -23,6 +24,7 @@ const HTTP_PORT: u16 = 10809;
 const PROXY_BYPASS: &str = "<local>";
 const IPIFY_URL: &str = "https://api.ipify.org?format=json";
 const APP_USER_AGENT: &str = concat!("VKarmani-Desktop/", env!("CARGO_PKG_VERSION"));
+const MAX_REMOTE_FETCH_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(all(target_os = "windows", not(debug_assertions)))]
 const STARTUP_REGISTRY_VALUE: &str = "VKarmani Desktop";
 const TUN_INTERFACE_NAME: &str = "vkarmani-tun";
@@ -58,6 +60,7 @@ struct AppState {
     runtime: Mutex<Option<ManagedCore>>,
     last_exit_code: Mutex<Option<i32>>,
     previous_proxy: Mutex<Option<ProxyStatus>>,
+    instance_lock_path: Mutex<Option<PathBuf>>,
 }
 
 #[derive(Serialize)]
@@ -215,6 +218,130 @@ fn reveal_main_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+    }
+}
+
+fn admin_preference_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .or_else(|_| app.path().app_config_dir())
+        .map_err(|error| format!("Не удалось определить каталог настроек приложения: {error}"))?;
+    fs::create_dir_all(&base).map_err(|error| format!("Не удалось создать каталог настроек приложения: {error}"))?;
+    Ok(base.join("run-as-admin.flag"))
+}
+
+#[cfg_attr(any(debug_assertions, not(target_os = "windows")), allow(dead_code))]
+fn read_admin_preference(app: &AppHandle) -> bool {
+    admin_preference_path(app)
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|value| value.trim().eq_ignore_ascii_case("true") || value.trim() == "1")
+        .unwrap_or(false)
+}
+
+fn write_admin_preference(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let path = admin_preference_path(app)?;
+    fs::write(path, if enabled { "true" } else { "false" })
+        .map_err(|error| format!("Не удалось сохранить настройку запуска от администратора: {error}"))
+}
+
+fn instance_lock_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .or_else(|_| app.path().app_config_dir())
+        .map_err(|error| format!("Не удалось определить каталог данных приложения: {error}"))?;
+    fs::create_dir_all(&base).map_err(|error| format!("Не удалось создать каталог данных приложения: {error}"))?;
+    Ok(base.join("vkarmani-desktop.lock"))
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "if (Get-Process -Id {} -ErrorAction SilentlyContinue) {{ 'true' }} else {{ 'false' }}",
+            pid
+        );
+        return run_powershell(&script)
+            .map(|value| value.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn focus_existing_instance(pid: u32) {
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class WindowFocusNative {{
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+}}
+"@
+$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue
+if ($p -and $p.MainWindowHandle -ne 0) {{
+  [WindowFocusNative]::ShowWindowAsync($p.MainWindowHandle, 9) | Out-Null
+  [WindowFocusNative]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+}}
+"#,
+        pid = pid
+    );
+    let _ = run_powershell(&script);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn focus_existing_instance(_pid: u32) {}
+
+fn acquire_single_instance_lock(app: &AppHandle, state: &tauri::State<AppState>) -> Result<bool, String> {
+    let path = instance_lock_path(app)?;
+
+    if path.exists() {
+        let existing_pid = fs::read_to_string(&path)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or_default();
+
+        if is_pid_alive(existing_pid) {
+            focus_existing_instance(existing_pid);
+            let _ = append_interface_event(app, "Найден уже запущенный экземпляр VKarmani. Новый экземпляр закрыт.");
+            return Ok(false);
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    fs::write(&path, std::process::id().to_string())
+        .map_err(|error| format!("Не удалось создать lock-файл единственного экземпляра: {error}"))?;
+
+    if let Ok(mut guard) = state.instance_lock_path.lock() {
+        *guard = Some(path);
+    }
+
+    Ok(true)
+}
+
+fn release_single_instance_lock(state: &tauri::State<AppState>) {
+    if let Ok(mut guard) = state.instance_lock_path.lock() {
+        if let Some(path) = guard.take() {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -449,18 +576,19 @@ fn append_interface_event(app: &AppHandle, line: &str) -> Result<(), String> {
 fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
+    // 1. Explicit dev/custom override. START_VKarmani.bat sets this to the bundled
+    //    project core, so it must stay first.
     if let Ok(env_path) = std::env::var("VKARMANI_XRAY_PATH") {
         paths.push(PathBuf::from(env_path));
     }
 
+    // 2. Tauri packaged resource path. This is the expected path for installed builds.
     if let Ok(resource_dir) = app.path().resource_dir() {
         paths.push(resource_dir.join("core").join("windows").join("xray.exe"));
     }
 
-    if let Ok(app_local) = app.path().app_local_data_dir() {
-        paths.push(app_local.join("core").join("xray.exe"));
-    }
-
+    // 3. Development/project paths. Keep these before AppData so an old broken
+    //    cached core cannot shadow the fixed bundled core while running from source.
     if let Ok(current_dir) = std::env::current_dir() {
         paths.push(current_dir.join("resources").join("core").join("windows").join("xray.exe"));
         paths.push(current_dir.join("src-tauri").join("bin").join("xray.exe"));
@@ -472,6 +600,12 @@ fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
         }
     }
 
+    // 4. Legacy/cache fallback. This path is intentionally last because stale
+    //    AppData binaries caused Win32 launch errors after archive updates.
+    if let Ok(app_local) = app.path().app_local_data_dir() {
+        paths.push(app_local.join("core").join("xray.exe"));
+    }
+
     paths
 }
 
@@ -479,6 +613,241 @@ fn resolve_core_path(app: &AppHandle) -> Option<PathBuf> {
     candidate_core_paths(app)
         .into_iter()
         .find(|path| path.exists() && path.is_file())
+}
+fn check_core_launchable(path: &Path) -> Result<(), String> {
+    let mut command = Command::new(path);
+    command
+        .arg("version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_child_console(&mut command);
+
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "Xray-core найден, но Windows отказалась его запускать: {} ({error}). Удалите старый core из AppData, замените resources\\core\\windows\\xray.exe официальным Xray-windows-64.zip и запустите START_VKarmani.bat ещё раз.",
+            path.display()
+        )
+    })?;
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("Не удалось проверить запуск Xray-core {}: {error}", path.display()))?
+        {
+            if status.success() {
+                return Ok(());
+            }
+
+            return Err(format!(
+                "Xray-core {} запускается, но команда `xray.exe version` завершилась с кодом {:?}.",
+                path.display(),
+                status.code()
+            ));
+        }
+
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "Xray-core {} завис на проверке `xray.exe version`.",
+                path.display()
+            ));
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn resolve_launchable_core_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let mut seen = HashSet::new();
+    let mut errors = Vec::new();
+
+    for path in candidate_core_paths(app) {
+        let key = path.to_string_lossy().to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+
+        if !path.exists() || !path.is_file() {
+            continue;
+        }
+
+        match validate_windows_x64_executable(&path).and_then(|_| check_core_launchable(&path)) {
+            Ok(()) => return Ok(path),
+            Err(error) => errors.push(format!("{} — {error}", path.display())),
+        }
+    }
+
+    if errors.is_empty() {
+        Err("Xray-core не найден. Положите xray.exe в resources/core/windows или задайте VKARMANI_XRAY_PATH.".to_string())
+    } else {
+        Err(format!(
+            "Не найден рабочий Xray-core. Проверенные файлы не запускаются:\n{}\n\nЗапустите START_VKarmani.bat: он проверит bundled core и при необходимости скачает официальный Xray-windows-64.zip.",
+            errors.join("\n")
+        ))
+    }
+}
+
+
+#[cfg(target_os = "windows")]
+fn validate_windows_x64_executable(path: &Path) -> Result<(), String> {
+    let data = fs::read(path)
+        .map_err(|error| format!("Не удалось прочитать Xray-core {}: {error}", path.display()))?;
+
+    if data.len() < 0x100 {
+        return Err(format!(
+            "Xray-core повреждён или неполный: {} слишком маленький файл ({} байт).",
+            path.display(),
+            data.len()
+        ));
+    }
+
+    if data.get(0..2) != Some(&b"MZ"[..]) {
+        return Err(format!(
+            "Xray-core повреждён: {} не является Windows EXE-файлом. Ожидался MZ-заголовок. Удалите старый файл и распакуйте полный архив заново.",
+            path.display()
+        ));
+    }
+
+    let pe_offset = u32::from_le_bytes([data[0x3c], data[0x3d], data[0x3e], data[0x3f]]) as usize;
+    if pe_offset.checked_add(0x18).map_or(true, |end| end > data.len()) {
+        return Err(format!(
+            "Xray-core повреждён: {} содержит некорректный PE-заголовок.",
+            path.display()
+        ));
+    }
+
+    if data.get(pe_offset..pe_offset + 4) != Some(&b"PE\0\0"[..]) {
+        return Err(format!(
+            "Xray-core повреждён: {} не содержит корректную PE-сигнатуру.",
+            path.display()
+        ));
+    }
+
+    let machine = u16::from_le_bytes([data[pe_offset + 4], data[pe_offset + 5]]);
+    if machine != 0x8664 {
+        return Err(format!(
+            "Xray-core имеет неподходящую архитектуру: {}. Ожидался Windows x64 executable, machine=0x8664, получено machine=0x{machine:04x}.",
+            path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn validate_windows_x64_executable(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct CoreArtifactManifest {
+    files: Vec<CoreArtifactManifestFile>,
+}
+
+#[derive(Deserialize)]
+struct CoreArtifactManifestFile {
+    file: String,
+    sha256: String,
+    size: Option<u64>,
+}
+
+#[cfg(target_os = "windows")]
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+(Get-FileHash -Algorithm SHA256 -LiteralPath $env:VKARMANI_HASH_PATH).Hash.ToLowerInvariant()
+"#;
+    run_powershell_with_env(
+        script,
+        &[("VKARMANI_HASH_PATH".to_string(), path.to_string_lossy().to_string())],
+    )
+    .map(|value| value.trim().to_ascii_lowercase())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn sha256_file(_path: &Path) -> Result<String, String> {
+    Err("Проверка SHA-256 core artifacts поддерживается только на Windows.".into())
+}
+
+fn verify_core_artifacts(app: &AppHandle, core_path: &Path) -> Result<(), String> {
+    validate_windows_x64_executable(core_path)?;
+
+    let core_dir = core_path
+        .parent()
+        .ok_or_else(|| "Не удалось определить каталог Xray-core.".to_string())?;
+    let manifest_path = core_dir.join("core-manifest.json");
+
+    let env_core_path = std::env::var("VKARMANI_XRAY_PATH").ok().map(PathBuf::from);
+    let is_custom_env_core = env_core_path
+        .as_ref()
+        .map(|path| path.as_path() == core_path)
+        .unwrap_or(false);
+
+    if !manifest_path.exists() {
+        if is_custom_env_core {
+            let _ = append_runtime_event(
+                app,
+                "Core integrity: VKARMANI_XRAY_PATH используется без core-manifest.json; проверка пропущена для dev/custom core.",
+            );
+            return Ok(());
+        }
+
+        return Err("Не найден core-manifest.json рядом с xray.exe. Нельзя запускать неподтверждённые bundled-бинарники.".into());
+    }
+
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("Не удалось прочитать core-manifest.json: {error}"))?;
+    let manifest_text = manifest_text.trim_start_matches('\u{feff}');
+    if manifest_text.trim().is_empty() {
+        return Err(format!(
+            "Некорректный core-manifest.json: файл пустой ({})",
+            manifest_path.display()
+        ));
+    }
+
+    let manifest: CoreArtifactManifest = serde_json::from_str(manifest_text)
+        .map_err(|error| format!("Некорректный core-manifest.json: {error}"))?;
+
+    let mut xray_declared = false;
+    for entry in manifest.files {
+        if entry.file.trim().is_empty() || entry.file.contains('/') || entry.file.contains('\\') || entry.file.contains("..") {
+            return Err(format!("Некорректное имя файла в core-manifest.json: {}", entry.file));
+        }
+
+        if entry.file.eq_ignore_ascii_case("xray.exe") {
+            xray_declared = true;
+        }
+
+        let artifact_path = core_dir.join(&entry.file);
+        let metadata = fs::metadata(&artifact_path)
+            .map_err(|error| format!("Core artifact отсутствует или недоступен: {} ({error})", entry.file))?;
+
+        if let Some(expected_size) = entry.size {
+            if metadata.len() != expected_size {
+                return Err(format!(
+                    "Core artifact {} не прошёл size-check: ожидалось {}, получено {}.",
+                    entry.file,
+                    expected_size,
+                    metadata.len()
+                ));
+            }
+        }
+
+        let actual_hash = sha256_file(&artifact_path)?;
+        if actual_hash != entry.sha256.trim().to_ascii_lowercase() {
+            return Err(format!("Core artifact {} не прошёл SHA-256 проверку.", entry.file));
+        }
+    }
+
+    if !xray_declared {
+        return Err("core-manifest.json не содержит xray.exe.".into());
+    }
+
+    let _ = append_runtime_event(app, "Core integrity: bundled artifacts прошли SHA-256 проверку.");
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -926,6 +1295,140 @@ fn extract_outbound_address_and_port(template: &RuntimeTemplate) -> (Option<Stri
     }
 
     (None, default_port)
+}
+
+fn validate_outbound_endpoint(host: &str, port: u16) -> Result<(), String> {
+    let normalized_host = host.trim();
+    if normalized_host.is_empty() {
+        return Err("Runtime-конфиг не содержит адрес сервера.".into());
+    }
+
+    if normalized_host.eq_ignore_ascii_case("localhost") || normalized_host.ends_with(".localhost") || normalized_host.ends_with(".local") {
+        return Err("Runtime-конфиг не может указывать на localhost/.local сервер.".into());
+    }
+
+    if port == 0 {
+        return Err("Runtime-конфиг содержит некорректный порт сервера.".into());
+    }
+
+    if let Ok(ip) = normalized_host.parse::<IpAddr>() {
+        if is_blocked_fetch_ip(ip) {
+            return Err("Runtime-конфиг указывает на локальный, приватный или служебный IP-адрес.".into());
+        }
+        return Ok(());
+    }
+
+    let resolved = (normalized_host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("Не удалось проверить DNS адрес сервера из runtime-конфига: {error}"))?
+        .collect::<Vec<_>>();
+
+    if resolved.is_empty() {
+        return Err("DNS не вернул адреса сервера из runtime-конфига.".into());
+    }
+
+    if resolved.iter().any(|addr| is_blocked_fetch_ip(addr.ip())) {
+        return Err("Runtime-конфиг через DNS указывает на локальный, приватный или служебный IP-адрес.".into());
+    }
+
+    Ok(())
+}
+
+fn validate_string_field(value: Option<&Value>, field: &str, min_len: usize, max_len: usize) -> Result<(), String> {
+    let Some(text) = value.and_then(Value::as_str).map(str::trim) else {
+        return Err(format!("Runtime-конфиг не содержит обязательное поле {field}."));
+    };
+
+    if text.len() < min_len || text.len() > max_len {
+        return Err(format!("Runtime-конфиг содержит некорректную длину поля {field}."));
+    }
+
+    Ok(())
+}
+
+fn validate_runtime_template(template: &RuntimeTemplate) -> Result<(), String> {
+    if template.family.to_ascii_lowercase() != "xray" {
+        return Err("Сейчас поддерживается только Xray runtime family.".into());
+    }
+
+    let protocol = template.protocol.to_ascii_lowercase();
+    if !matches!(protocol.as_str(), "vless" | "vmess" | "trojan" | "shadowsocks") {
+        return Err(format!("Неподдерживаемый протокол runtime-конфига: {}.", template.protocol));
+    }
+
+    let outbound = template.outbound.as_object().ok_or_else(|| "Runtime-конфиг должен содержать outbound object.".to_string())?;
+    for banned_key in ["inbounds", "outbounds", "routing", "dns", "log", "api", "stats", "policy", "reverse"] {
+        if outbound.contains_key(banned_key) {
+            return Err(format!("Runtime-конфиг содержит запрещённое поле outbound.{banned_key}."));
+        }
+    }
+
+    if outbound.contains_key("sendThrough") {
+        return Err("Runtime-конфиг не должен задавать sendThrough: клиент выставляет его сам для безопасного TUN режима.".into());
+    }
+
+    let outbound_protocol = outbound
+        .get("protocol")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if outbound_protocol != protocol {
+        return Err("Runtime-конфиг содержит несовпадающий outbound.protocol.".into());
+    }
+
+    let (host, port) = extract_outbound_address_and_port(template);
+    validate_outbound_endpoint(host.as_deref().unwrap_or_default(), port)?;
+
+    let settings = outbound.get("settings").ok_or_else(|| "Runtime-конфиг не содержит outbound.settings.".to_string())?;
+    match protocol.as_str() {
+        "vless" | "vmess" => {
+            let first = settings
+                .get("vnext")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .ok_or_else(|| "Runtime-конфиг VLESS/VMess не содержит vnext.".to_string())?;
+            let first_user = first
+                .get("users")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .ok_or_else(|| "Runtime-конфиг VLESS/VMess не содержит users.".to_string())?;
+            validate_string_field(first_user.get("id"), "users[0].id", 8, 96)?;
+        }
+        "trojan" => {
+            let first = settings
+                .get("servers")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .ok_or_else(|| "Runtime-конфиг Trojan не содержит servers.".to_string())?;
+            validate_string_field(first.get("password"), "servers[0].password", 1, 512)?;
+        }
+        "shadowsocks" => {
+            let first = settings
+                .get("servers")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .ok_or_else(|| "Runtime-конфиг Shadowsocks не содержит servers.".to_string())?;
+            validate_string_field(first.get("method"), "servers[0].method", 2, 80)?;
+            validate_string_field(first.get("password"), "servers[0].password", 1, 512)?;
+        }
+        _ => {}
+    }
+
+    if let Some(stream_settings) = outbound.get("streamSettings") {
+        let stream_object = stream_settings.as_object().ok_or_else(|| "streamSettings должен быть object.".to_string())?;
+        if let Some(network) = stream_object.get("network").and_then(Value::as_str) {
+            if !matches!(network.to_ascii_lowercase().as_str(), "raw" | "tcp" | "ws" | "grpc" | "httpupgrade" | "xhttp") {
+                return Err(format!("Неподдерживаемый network в streamSettings: {network}."));
+            }
+        }
+        if let Some(security) = stream_object.get("security").and_then(Value::as_str) {
+            if !matches!(security.to_ascii_lowercase().as_str(), "none" | "tls" | "reality") {
+                return Err(format!("Неподдерживаемый security в streamSettings: {security}."));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn resolve_ipv4_address(host: &str, port: u16) -> Option<String> {
@@ -1450,54 +1953,105 @@ fn build_runtime_status(app: &AppHandle, state: tauri::State<AppState>) -> Runti
 
 
 
-fn validate_remote_fetch_url(raw_url: &str) -> Result<(), String> {
+
+fn is_blocked_fetch_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(value) => {
+            let octets = value.octets();
+            value.is_private()
+                || value.is_loopback()
+                || value.is_link_local()
+                || value.is_broadcast()
+                || value.is_documentation()
+                || value.is_multicast()
+                || value.is_unspecified()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+                || octets[0] >= 224
+        }
+        IpAddr::V6(value) => {
+            let octets = value.octets();
+            value.is_loopback()
+                || value.is_unspecified()
+                || value.is_multicast()
+                || (octets[0] & 0xfe) == 0xfc
+                || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        }
+    }
+}
+
+fn validate_remote_fetch_url(raw_url: &str) -> Result<reqwest::Url, String> {
     let parsed = reqwest::Url::parse(raw_url).map_err(|_| "Некорректный URL для удалённого запроса.".to_string())?;
     if parsed.scheme() != "https" {
         return Err("Удалённые запросы разрешены только по HTTPS.".into());
     }
-    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    if host.is_empty()
-        || host == "localhost"
-        || host.ends_with(".local")
-        || host.starts_with("127.")
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host.starts_with("172.16.")
-        || host.starts_with("172.17.")
-        || host.starts_with("172.18.")
-        || host.starts_with("172.19.")
-        || host.starts_with("172.2")
-        || host.starts_with("172.30.")
-        || host.starts_with("172.31.")
-        || host == "0.0.0.0"
-    {
-        return Err("Локальные и приватные адреса запрещены для удалённого fetch.".into());
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL с логином или паролем запрещён для удалённого fetch.".into());
     }
-    Ok(())
+
+    let host = parsed.host_str().unwrap_or_default().trim().to_ascii_lowercase();
+    if host.is_empty() || host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+        return Err("Локальные адреса запрещены для удалённого fetch.".into());
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_fetch_ip(ip) {
+            return Err("Локальные, приватные и служебные IP-адреса запрещены для удалённого fetch.".into());
+        }
+        return Ok(parsed);
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let resolved = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|error| format!("Не удалось проверить DNS для удалённого fetch: {error}"))?
+        .collect::<Vec<_>>();
+
+    if resolved.is_empty() {
+        return Err("DNS не вернул адреса для удалённого fetch.".into());
+    }
+
+    if resolved.iter().any(|addr| is_blocked_fetch_ip(addr.ip())) {
+        return Err("DNS удалённого fetch указывает на локальный, приватный или служебный IP-адрес.".into());
+    }
+
+    Ok(parsed)
 }
 
 #[tauri::command]
 fn fetch_remote_text(url: String, accept: Option<String>) -> Result<String, String> {
-    validate_remote_fetch_url(&url)?;
+    let parsed_url = validate_remote_fetch_url(&url)?;
     let client = build_http_client(None, Duration::from_secs(8))?;
 
     let response = client
-        .get(&url)
+        .get(parsed_url.clone())
         .header(reqwest::header::USER_AGENT, APP_USER_AGENT)
         .header(
             reqwest::header::ACCEPT,
             accept.unwrap_or_else(|| "text/plain, application/json, text/html".to_string()),
         )
         .send()
-        .map_err(|error| format!("Не удалось получить ответ от {url}: {error}"))?;
+        .map_err(|error| format!("Не удалось получить ответ от {}: {error}", parsed_url.host_str().unwrap_or("remote")))?;
 
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
 
-    response
-        .text()
-        .map_err(|error| format!("Не удалось прочитать тело ответа: {error}"))
+    if response.content_length().unwrap_or(0) > MAX_REMOTE_FETCH_BYTES {
+        return Err("Ответ удалённого fetch слишком большой.".into());
+    }
+
+    let bytes = response
+        .bytes()
+        .map_err(|error| format!("Не удалось прочитать тело ответа: {error}"))?;
+
+    if bytes.len() as u64 > MAX_REMOTE_FETCH_BYTES {
+        return Err("Ответ удалённого fetch слишком большой.".into());
+    }
+
+    Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
 #[tauri::command]
@@ -1637,12 +2191,10 @@ fn request_connect(
     state: tauri::State<AppState>,
     app: AppHandle,
 ) -> Result<RuntimeStatus, String> {
-    if runtime_template.family.to_lowercase() != "xray" {
-        return Err("Сейчас поддерживается только Xray runtime family.".into());
-    }
+    validate_runtime_template(&runtime_template)?;
 
-    let core_path = resolve_core_path(&app)
-        .ok_or_else(|| "Xray-core не найден. Положите xray.exe в resources/core/windows или задайте VKARMANI_XRAY_PATH.".to_string())?;
+    let core_path = resolve_launchable_core_path(&app)?;
+    verify_core_artifacts(&app, &core_path)?;
 
     let normalized_network_mode = match network_mode
         .unwrap_or_else(|| "proxy".to_string())
@@ -1961,6 +2513,21 @@ fn window_start_drag(window: tauri::WebviewWindow) -> Result<(), String> {
 }
 
 
+
+#[tauri::command]
+fn set_run_as_admin_preference(enabled: bool, app: AppHandle) -> Result<bool, String> {
+    write_admin_preference(&app, enabled)?;
+    let _ = append_interface_event(
+        &app,
+        if enabled {
+            "Настройка запуска от администратора включена. Следующий старт будет запрошен до показа окна."
+        } else {
+            "Настройка запуска от администратора отключена."
+        },
+    );
+    Ok(enabled)
+}
+
 #[tauri::command]
 fn ensure_admin_launch(app: AppHandle) -> Result<bool, String> {
     #[cfg(all(not(debug_assertions), target_os = "windows"))]
@@ -2089,6 +2656,41 @@ fn set_system_proxy(enabled: bool, app: AppHandle, state: tauri::State<AppState>
 }
 
 
+fn restore_saved_proxy_snapshot(app: &AppHandle, state: &tauri::State<AppState>) {
+    let previous = state.previous_proxy.lock().ok().and_then(|mut value| value.take());
+    let result = if let Some(snapshot) = previous {
+        apply_windows_proxy_snapshot(&snapshot)
+    } else if current_proxy_snapshot().map(|snapshot| snapshot.enabled).unwrap_or(false) {
+        set_windows_proxy(false)
+    } else {
+        current_proxy_snapshot()
+    };
+
+    match result {
+        Ok(status) => {
+            let _ = append_runtime_event(
+                app,
+                &format!(
+                    "Cleanup: Windows proxy восстановлен/проверен | enabled={} | server={}",
+                    status.enabled,
+                    status.server.unwrap_or_else(|| "—".into())
+                ),
+            );
+        }
+        Err(error) => {
+            let _ = append_runtime_event(app, &format!("Cleanup: не удалось восстановить Windows proxy: {error}"));
+        }
+    }
+}
+
+fn cleanup_runtime_and_network(app: &AppHandle, state: &tauri::State<AppState>) {
+    let _ = append_runtime_event(app, "Cleanup: останавливаем runtime, TUN routes и системный proxy.");
+    let _ = stop_existing_runtime(app, state);
+    let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, None);
+    restore_saved_proxy_snapshot(app, state);
+}
+
+
 #[tauri::command]
 fn connectivity_probe() -> Result<ConnectivityProbe, String> {
     let checked_at = unix_now_string();
@@ -2159,7 +2761,9 @@ fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
 }
 
 #[tauri::command]
-fn restart_application(app: AppHandle) -> Result<(), String> {
+fn restart_application(app: AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+    cleanup_runtime_and_network(&app, &state);
+    release_single_instance_lock(&state);
     let current_exe = std::env::current_exe().map_err(|error| format!("Не удалось определить путь приложения: {error}"))?;
     let mut command = Command::new(current_exe);
     hide_child_console(&mut command);
@@ -2180,6 +2784,20 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .setup(|app| {
+            let app_handle = app.handle().clone();
+            let state = app.state::<AppState>();
+            if !acquire_single_instance_lock(&app_handle, &state)? {
+                std::process::exit(0);
+            }
+
+            #[cfg(all(not(debug_assertions), target_os = "windows"))]
+            if read_admin_preference(&app_handle) && !is_process_elevated()? {
+                let _ = append_interface_event(&app_handle, "До показа окна запрошен запуск VKarmani от имени администратора.");
+                release_single_instance_lock(&state);
+                let _ = ensure_admin_launch(app_handle.clone())?;
+                std::process::exit(0);
+            }
+
             let _ = interface_logs_dir(&app.handle());
             let _ = routing_logs_dir(&app.handle());
             let _ = ensure_log_tree(&app.handle());
@@ -2224,7 +2842,8 @@ pub fn run() {
                     }
                     "restart_app" => {
                         let _ = append_interface_event(app, "Tray: перезапуск приложения.");
-                        let _ = restart_application(app.clone());
+                        let state = app.state::<AppState>();
+                        let _ = restart_application(app.clone(), state);
                     }
                     "restart_proxy" => {
                         let _ = append_interface_event(app, "Tray: перезапуск proxy.");
@@ -2233,6 +2852,9 @@ pub fn run() {
                     }
                     "quit" => {
                         let _ = append_interface_event(app, "Tray: выход из приложения.");
+                        let state = app.state::<AppState>();
+                        cleanup_runtime_and_network(app, &state);
+                        release_single_instance_lock(&state);
                         app.exit(0)
                     },
                     _ => {}
@@ -2250,7 +2872,16 @@ pub fn run() {
                 .build(app)?;
 
             app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+            reveal_main_window(&app_handle);
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if matches!(event, WindowEvent::CloseRequested { .. }) {
+                let app = window.app_handle();
+                let state = app.state::<AppState>();
+                cleanup_runtime_and_network(&app, &state);
+                release_single_instance_lock(&state);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             bootstrap_info,
@@ -2270,6 +2901,7 @@ pub fn run() {
             window_hide,
             window_start_drag,
             ensure_admin_launch,
+            set_run_as_admin_preference,
             set_launch_on_startup,
             proxy_status,
             set_system_proxy,
