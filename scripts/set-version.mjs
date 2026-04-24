@@ -5,7 +5,7 @@ import path from 'node:path';
 const version = process.argv[2]?.trim();
 if (!version || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
   console.error('Usage: node scripts/set-version.mjs <semver>');
-  console.error('Example: node scripts/set-version.mjs 0.13.22');
+  console.error('Example: node scripts/set-version.mjs 0.13.23');
   process.exit(1);
 }
 
@@ -47,7 +47,7 @@ const cargoLockPath = path.join(root, 'src-tauri', 'Cargo.lock');
 if (fs.existsSync(cargoLockPath)) {
   let cargoLock = fs.readFileSync(cargoLockPath, 'utf8');
   cargoLock = cargoLock.replace(
-    /(name = "vkarmani-desktop"\nversion = ")[^"]+(")/,
+    /(\[\[package\]\]\r?\nname\s*=\s*"vkarmani-desktop"\r?\nversion\s*=\s*")[^"]+(")/,
     `$1${version}$2`,
   );
   fs.writeFileSync(cargoLockPath, cargoLock);

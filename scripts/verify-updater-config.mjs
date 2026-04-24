@@ -46,7 +46,10 @@ const cargo = fs.readFileSync(path.join(root, 'src-tauri/Cargo.toml'), 'utf8');
 const cargoVersion = cargo.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 const cargoLockPath = path.join(root, 'src-tauri/Cargo.lock');
 const cargoLock = fs.existsSync(cargoLockPath) ? fs.readFileSync(cargoLockPath, 'utf8') : '';
-const cargoLockVersion = cargoLock.match(/name = "vkarmani-desktop"\nversion = "([^"]+)"/m)?.[1];
+const cargoLockVersion = (() => {
+  const block = cargoLock.match(/\[\[package\]\]\r?\nname\s*=\s*"vkarmani-desktop"\r?\nversion\s*=\s*"([^"]+)"/m);
+  return block?.[1];
+})();
 
 if (!pkg.version) fail('package.json version is missing');
 if (!tauri.version) fail('src-tauri/tauri.conf.json version is missing');
