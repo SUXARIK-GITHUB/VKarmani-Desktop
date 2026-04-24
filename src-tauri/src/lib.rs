@@ -9,6 +9,9 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -23,6 +26,16 @@ const APP_USER_AGENT: &str = concat!("VKarmani-Desktop/", env!("CARGO_PKG_VERSIO
 #[cfg(all(target_os = "windows", not(debug_assertions)))]
 const STARTUP_REGISTRY_VALUE: &str = "VKarmani Desktop";
 const TUN_INTERFACE_NAME: &str = "vkarmani-tun";
+
+#[cfg(target_os = "windows")]
+fn hide_child_console(command: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_child_console(_command: &mut Command) {}
+
 
 struct ManagedCore {
     child: Child,
@@ -1103,7 +1116,9 @@ fn tcp_port_open(host: &str, port: u16, timeout_ms: u64) -> bool {
 
 #[cfg(target_os = "windows")]
 fn run_powershell(script: &str) -> Result<String, String> {
-    let output = Command::new("powershell")
+    let mut command = Command::new("powershell");
+    hide_child_console(&mut command);
+    let output = command
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .map_err(|error| format!("Не удалось запустить PowerShell: {error}"))?;
@@ -1118,6 +1133,7 @@ fn run_powershell(script: &str) -> Result<String, String> {
 #[cfg(target_os = "windows")]
 fn run_powershell_with_env(script: &str, envs: &[(String, String)]) -> Result<String, String> {
     let mut command = Command::new("powershell");
+    hide_child_console(&mut command);
     command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
     for (key, value) in envs {
         command.env(key, value);
@@ -2145,7 +2161,9 @@ fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
 #[tauri::command]
 fn restart_application(app: AppHandle) -> Result<(), String> {
     let current_exe = std::env::current_exe().map_err(|error| format!("Не удалось определить путь приложения: {error}"))?;
-    Command::new(current_exe)
+    let mut command = Command::new(current_exe);
+    hide_child_console(&mut command);
+    command
         .spawn()
         .map_err(|error| format!("Не удалось перезапустить приложение: {error}"))?;
     app.exit(0);
