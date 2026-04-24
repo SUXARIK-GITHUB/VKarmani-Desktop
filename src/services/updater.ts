@@ -10,9 +10,25 @@ function normalizeError(error: unknown) {
 
 function normalizeUpdaterError(error: unknown) {
   const message = normalizeError(error);
-  return /updater|endpoint|pubkey|signature|manifest|latest\.json/i.test(message)
-    ? 'Tauri updater не настроен или release manifest недоступен. Проверьте tauri.conf.json, latest.json и pubkey.'
-    : message;
+  const lowerMessage = message.toLowerCase();
+
+  if (lowerMessage.includes('404') || lowerMessage.includes('not found')) {
+    return [
+      'Не удалось получить latest.json с GitHub Releases.',
+      'Проверьте, что release опубликован, файл latest.json есть в Assets, а репозиторий или release-репозиторий публично доступен.',
+      `Техническая ошибка: ${message}`
+    ].join(' ');
+  }
+
+  if (/updater|endpoint|pubkey|signature|manifest|latest\.json/i.test(message)) {
+    return [
+      'Tauri updater не смог проверить обновления.',
+      'Проверьте endpoint latest.json, pubkey, подпись .sig и публичную доступность GitHub Release.',
+      `Техническая ошибка: ${message}`
+    ].join(' ');
+  }
+
+  return message;
 }
 
 export async function checkForUpdates(channel: ReleaseChannel): Promise<UpdateInfo> {
