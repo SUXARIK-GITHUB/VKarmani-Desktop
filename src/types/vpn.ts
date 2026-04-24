@@ -201,7 +201,7 @@ export interface UpdateInfo {
   version?: string;
   notes?: string;
   publishedAt?: string;
-  source: 'mock' | 'tauri';
+  source: 'mock' | 'tauri' | 'github';
   status: 'idle' | 'checking' | 'available' | 'downloading' | 'installing' | 'updated' | 'error';
   downloadedPercent?: number;
   message?: string;
