@@ -52,6 +52,11 @@ if (!fs.existsSync(gitattributesPath)) {
       ok(`.gitattributes protects ${pattern}`);
     }
   }
+  if (/filter\s*=\s*lfs/i.test(gitattributes)) {
+    fail('.gitattributes must not enable Git LFS automatically for xray.exe; accidental LFS pointers break installed runtime');
+  } else {
+    ok('.gitattributes does not force Git LFS for runtime binaries');
+  }
 }
 const pkg = readJson('package.json');
 const tauri = readJson('src-tauri/tauri.conf.json');
@@ -238,8 +243,18 @@ if (!fs.existsSync(workflowPath)) {
 } else {
   ok('GitHub Actions release workflow exists');
   const workflow = fs.readFileSync(workflowPath, 'utf8');
+  if (!/runs-on:\s*windows-2022/.test(workflow)) {
+    fail('release workflow must use windows-2022 for a deterministic x64 Windows runner');
+  } else {
+    ok('release workflow uses windows-2022 x64 runner');
+  }
+  if (!/fetch-xray-windows\.ps1/.test(workflow)) {
+    fail('release workflow must run scripts/fetch-xray-windows.ps1 before verify/build so CI bundles an official launch-tested Xray binary');
+  } else {
+    ok('release workflow fetches official Xray Windows x64 runtime before build');
+  }
   if (!/lfs:\s*true/.test(workflow)) {
-    fail('release workflow checkout must set lfs: true so binary assets are real files, not Git LFS pointers');
+    fail('release workflow checkout must set lfs: true so binary assets are real files if the repository uses Git LFS');
   } else {
     ok('release workflow checkout uses lfs: true');
   }

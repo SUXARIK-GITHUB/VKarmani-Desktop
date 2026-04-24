@@ -1,7 +1,7 @@
 {
   "name": "vkarmani-desktop",
   "private": true,
-  "version": "0.13.25",
+  "version": "0.13.26",
   "type": "module",
   "scripts": {
     "dev": "node ./node_modules/vite/bin/vite.js",
@@ -11,7 +11,8 @@
     "tauri:build": "npx tauri build",
     "tauri": "npx tauri",
     "verify:updater": "node scripts/verify-updater-config.mjs",
-    "release:version": "node scripts/set-version.mjs"
+    "release:version": "node scripts/set-version.mjs",
+    "prepare:xray:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-xray-windows.ps1 -Force"
   },
   "dependencies": {
     "@tauri-apps/api": "2.10.1",

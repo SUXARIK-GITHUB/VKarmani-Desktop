@@ -5,7 +5,7 @@ import path from 'node:path';
 const version = process.argv[2]?.trim();
 if (!version || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
   console.error('Usage: node scripts/set-version.mjs <semver>');
-  console.error('Example: node scripts/set-version.mjs 0.13.25');
+  console.error('Example: node scripts/set-version.mjs 0.13.26');
   process.exit(1);
 }
 

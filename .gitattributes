@@ -2,6 +2,8 @@
 * text=auto
 
 # Runtime/bundle assets must never be normalized by Git.
+# Do NOT enable Git LFS here automatically: all core files are under GitHub's normal file-size limits,
+# and an accidental LFS pointer in xray.exe breaks Windows runtime.
 *.exe binary
 *.dll binary
 *.dat binary

@@ -5,18 +5,26 @@ param(
 $ErrorActionPreference = 'Stop'
 $coreDir = Join-Path $ProjectDir 'resources\core\windows'
 $manifestPath = Join-Path $coreDir 'core-manifest.json'
+$fetchScript = Join-Path $PSScriptRoot 'fetch-xray-windows.ps1'
 $required = @('xray.exe', 'geoip.dat', 'geosite.dat', 'wintun.dll')
 
-function Write-Info([string]$Message) {
-  Write-Host "[INFO] $Message"
-}
+function Write-Info([string]$Message) { Write-Host "[INFO] $Message" }
+function Write-WarnLine([string]$Message) { Write-Host "[WARN] $Message" -ForegroundColor Yellow }
+function Write-ErrLine([string]$Message) { Write-Host "[ERROR] $Message" -ForegroundColor Red }
 
-function Write-WarnLine([string]$Message) {
-  Write-Host "[WARN] $Message" -ForegroundColor Yellow
-}
+function Test-XrayLaunch([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
 
-function Write-ErrLine([string]$Message) {
-  Write-Host "[ERROR] $Message" -ForegroundColor Red
+  try {
+    $stdout = [System.IO.Path]::GetTempFileName()
+    $stderr = [System.IO.Path]::GetTempFileName()
+    $process = Start-Process -FilePath $Path -ArgumentList @('version') -WorkingDirectory (Split-Path -Parent $Path) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+    return $process.ExitCode -eq 0
+  } catch {
+    Write-WarnLine "xray.exe cannot launch: $($_.Exception.Message)"
+    return $false
+  }
 }
 
 function Test-CoreFiles {
@@ -71,6 +79,11 @@ function Test-CoreFiles {
     }
   }
 
+  $xrayPath = Join-Path $coreDir 'xray.exe'
+  if (-not (Test-XrayLaunch $xrayPath)) {
+    $problems.Add('xray.exe exists but does not launch as a valid Windows x64 application')
+  }
+
   return $problems
 }
 
@@ -80,12 +93,22 @@ if (-not (Test-Path -LiteralPath $coreDir)) {
 
 $problems = Test-CoreFiles
 if ($problems.Count -eq 0) {
-  Write-Info 'Xray-core files are present and valid.'
+  Write-Info 'Xray-core files are present and launchable.'
   exit 0
 }
 
 Write-WarnLine 'Xray-core validation found problems:'
 $problems | ForEach-Object { Write-WarnLine " - $_" }
+
+if (Test-Path -LiteralPath $fetchScript -PathType Leaf) {
+  Write-Info 'Trying to download official Windows x64 Xray-core...'
+  & $fetchScript -ProjectDir $ProjectDir -Force
+  $problems = Test-CoreFiles
+  if ($problems.Count -eq 0) {
+    Write-Info 'Xray-core files repaired successfully.'
+    exit 0
+  }
+}
 
 $git = Get-Command git -ErrorAction SilentlyContinue
 $gitDir = Join-Path $ProjectDir '.git'
@@ -105,8 +128,8 @@ if ($git -and (Test-Path -LiteralPath $gitDir)) {
   }
 }
 
-Write-ErrLine 'Xray-core files are still missing or corrupted.'
+Write-ErrLine 'Xray-core files are still missing, corrupted, or not launchable.'
 Write-ErrLine "Expected directory: $coreDir"
 Write-ErrLine 'Required files: xray.exe, geoip.dat, geosite.dat, wintun.dll'
-Write-ErrLine 'Fix: use the full repository/archive that contains resources/core/windows, or restore these files before running/building.'
+Write-ErrLine 'Fix: run scripts/fetch-xray-windows.ps1 or use the GitHub Actions release artifact built from v0.13.26 or newer.'
 exit 1

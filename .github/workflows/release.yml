@@ -12,13 +12,17 @@ permissions:
 jobs:
   build-windows:
     name: Build Windows release with updater artifacts
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           lfs: true
+
+      - name: Download official Xray Windows x64 runtime
+        shell: pwsh
+        run: .\scripts\fetch-xray-windows.ps1 -Force
 
       - name: Verify bundled Xray binary on Windows
         shell: pwsh

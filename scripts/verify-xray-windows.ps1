@@ -31,6 +31,9 @@ function Assert-WindowsX64Pe([string]$Path, [string]$Label) {
     throw "$Label is suspiciously small: $($item.Length) bytes"
   }
 
+  $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+  Write-Host "[xray-check] INFO: $Label sha256=$hash"
+
   $header = Read-HeaderBytes $Path 4096
   if ($header.Length -lt 256) {
     throw "$Label header is too small: $($header.Length) bytes"
@@ -38,7 +41,7 @@ function Assert-WindowsX64Pe([string]$Path, [string]$Label) {
 
   $prefix = [System.Text.Encoding]::ASCII.GetString($header, 0, [Math]::Min(32, $header.Length))
   if ($prefix.StartsWith('version https://git-lfs')) {
-    throw "$Label is a Git LFS pointer, not a real binary. Use actions/checkout with lfs:true."
+    throw "$Label is a Git LFS pointer, not a real binary."
   }
 
   if ($header[0] -ne 0x4D -or $header[1] -ne 0x5A) {
@@ -72,7 +75,12 @@ Assert-WindowsX64Pe $XrayPath 'xray.exe'
 Assert-WindowsX64Pe $WintunPath 'wintun.dll'
 
 Write-Host '[xray-check] Running xray.exe version...'
-& $XrayPath version
+try {
+  & $XrayPath version
+} catch {
+  throw "xray.exe failed to run on this Windows runner: $($_.Exception.Message). The release workflow must run scripts/fetch-xray-windows.ps1 before verification/build so the installer contains an official Windows x64 Xray-core binary."
+}
+
 if ($LASTEXITCODE -ne 0) {
   throw "xray.exe version failed with exit code $LASTEXITCODE"
 }
