@@ -134,7 +134,6 @@ export function OverviewTab({
       return haystack.includes(normalizedRunningAppsQuery);
     })
     : runningApps;
-  const isConnectDisabled = isBusy || (!canConnect && connectionState === 'idle');
 
   function handleProgramSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -211,7 +210,7 @@ export function OverviewTab({
               <button
                 className={`power-button ${connectionState}`}
                 onClick={onToggleConnection}
-                disabled={isConnectDisabled}
+                disabled={isBusy || (!canConnect && connectionState === 'idle')}
                 aria-label={connectLabel}
               >
                 <Power size={34} />
@@ -219,15 +218,7 @@ export function OverviewTab({
             </div>
 
             <div className="connection-text">
-              <button
-                type="button"
-                className={`connection-title-button ${connectionState}`}
-                onClick={onToggleConnection}
-                disabled={isConnectDisabled}
-                aria-label={connectLabel}
-              >
-                {connectLabel}
-              </button>
+              <h2>{connectLabel}</h2>
               <p>{connectionLocation}</p>
 
               <div className="inline-stats wrap-inline-stats">

@@ -5,7 +5,7 @@ chcp 65001 >nul
 set "SCRIPT_DIR=%~dp0"
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 set "PROJECT_DIR=%SCRIPT_DIR%"
-if not exist "%PROJECT_DIR%\package.json" set "PROJECT_DIR=D:\GIT\VKarmani"
+if not exist "%PROJECT_DIR%\package.json" set "PROJECT_DIR=D:\GIT\VKarmani-Desktop"
 
 if not exist "%PROJECT_DIR%\package.json" (
     echo [ERROR] package.json not found.
@@ -92,11 +92,11 @@ if not exist "node_modules" (
     set "REPAIRED=1"
 )
 
-call :ensure_pkg "@vitejs/plugin-react/package.json" "npm install -D @vitejs/plugin-react@4.3.1 --no-audit --fund=false" "@vitejs/plugin-react"
+call :ensure_pkg "@vitejs/plugin-react/package.json" "npm install -D @vitejs/plugin-react@4.7.0 --no-audit --fund=false" "@vitejs/plugin-react"
 if errorlevel 1 goto :npm_failed
 call :ensure_pkg "vite/package.json" "npm install -D vite@5.4.21 --no-audit --fund=false" "vite"
 if errorlevel 1 goto :npm_failed
-call :ensure_pkg "typescript/package.json" "npm install -D typescript@5.6.3 --no-audit --fund=false" "typescript"
+call :ensure_pkg "typescript/package.json" "npm install -D typescript@5.9.3 --no-audit --fund=false" "typescript"
 if errorlevel 1 goto :npm_failed
 call :ensure_pkg "lucide-react/package.json" "npm install lucide-react@0.511.0 --no-audit --fund=false" "lucide-react"
 if errorlevel 1 goto :npm_failed

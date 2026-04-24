@@ -19,7 +19,6 @@ import {
   isTauriRuntime,
   requestWindowHide,
   setNativeLaunchOnStartup,
-  setNativeRunAsAdminPreference,
   writeNativeInterfaceLog,
   writeNativeRoutingLog,
   normalizeNativeError
@@ -189,17 +188,6 @@ export default function App() {
   }, [activeTab]);
 
   useEffect(() => {
-    if (!isTauriRuntime) {
-      return;
-    }
-
-    void setNativeRunAsAdminPreference(settings.runAsAdmin).catch((error) => {
-      void writeNativeInterfaceLog(
-        'Не удалось сохранить настройку запуска от администратора.',
-        normalizeNativeError(error, 'admin preference error').message
-      );
-    });
-
     if (!settings.runAsAdmin || hasTriedAdminLaunch.current) {
       return;
     }
@@ -466,9 +454,7 @@ export default function App() {
   const connectLabel = connectLabelMap[connectionState as ConnectionState];
 
   const sessionDurationText = new Date(sessionDuration * 1000).toISOString().slice(11, 19);
-  const hasConnectCandidate = Boolean(selectedServer && (selectedServer.runtimeTemplate || servers.some((server: VpnServer) => Boolean(server.runtimeTemplate)) || accessKey.trim()));
-  const canConnectSelectedServer = connectionState === 'connected' || hasConnectCandidate;
-  const isUpdateChecking = updateInfo.status === 'checking';
+  const canConnectSelectedServer = Boolean((selectedServer?.runtimeTemplate || servers.some((server: VpnServer) => Boolean(server.runtimeTemplate))) && runtimeStatus.coreInstalled);
 
   async function refreshDiagnosticsAndRuntime() {
     const [runtime, nextDiagnostics, nextProxy] = await Promise.all([
@@ -942,22 +928,18 @@ export default function App() {
   }
 
   async function handleReconnectToServer(nextServer: VpnServer, previousServer: VpnServer | null) {
-    if (settings.tunnelMode === 'tun' && getActiveSplitTunnelEntries().length === 0) {
-      if (previousServer?.id) {
-        setSelectedServerId(previousServer.id);
-        setConnectionState('connected');
-      } else {
-        setConnectionState('idle');
-      }
-      pushToast(
-        tr(language, 'Для TUN сначала добавьте хотя бы одну программу или службу.', 'For TUN, add at least one program or service first.'),
-        'info'
-      );
-      return;
-    }
-
     try {
       setConnectionState('connecting');
+      if (settings.tunnelMode === 'tun' && getActiveSplitTunnelEntries().length === 0) {
+        if (previousServer?.id) {
+          setSelectedServerId(previousServer.id);
+        }
+        pushToast(
+          tr(language, 'Для TUN сначала добавьте хотя бы одну программу или службу.', 'For TUN, add at least one program or service first.'),
+          'info'
+        );
+        return;
+      }
 
       const response = await remnawaveClient.connect(nextServer, {
         useSystemProxy: shouldUseSystemProxy(settings.tunnelMode),
@@ -1282,7 +1264,7 @@ export default function App() {
     }
 
     hasAutoCheckedUpdates.current = true;
-    void handleCheckUpdates(true, false);
+    void handleCheckUpdates(true, true);
   }, [settings.autoUpdate, settings.releaseChannel]);
 
   function toggleSetting(key: keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode'>) {
@@ -1316,12 +1298,6 @@ export default function App() {
             onInstallUpdate={updateInfo.available ? () => void handleInstallUpdate() : undefined}
             onRequestHideToTray={() => void requestWindowHide()}
           />
-          {isUpdateChecking ? (
-            <div className="startup-update-check" role="status" aria-live="polite">
-              <span className="startup-update-spinner" />
-              <span>{tr(language, 'Проверяем обновления… Вход и работа доступны.', 'Checking updates… Sign-in and app use are available.')}</span>
-            </div>
-          ) : null}
           <AuthScreen
             accessKey={accessKey}
             authLoading={authLoading}
@@ -1351,12 +1327,6 @@ export default function App() {
           onInstallUpdate={updateInfo.available ? () => void handleInstallUpdate() : undefined}
           onRequestHideToTray={() => void requestWindowHide()}
         />
-        {isUpdateChecking ? (
-          <div className="startup-update-check" role="status" aria-live="polite">
-            <span className="startup-update-spinner" />
-            <span>{tr(language, 'Проверяем обновления… Приложение не заблокировано.', 'Checking updates… The app is not blocked.')}</span>
-          </div>
-        ) : null}
 
         <main className="workspace-grid">
           <SidebarNav
