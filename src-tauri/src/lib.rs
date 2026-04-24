@@ -447,6 +447,8 @@ fn append_interface_event(app: &AppHandle, line: &str) -> Result<(), String> {
 }
 
 const MIN_XRAY_CORE_SIZE_BYTES: u64 = 1_000_000;
+const PE_MACHINE_AMD64: u16 = 0x8664;
+const PE32_PLUS_MAGIC: u16 = 0x20b;
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|item| item == &path) {
@@ -457,12 +459,21 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 fn validate_pe_binary(path: &Path, label: &str) -> Result<(), String> {
     let mut file = File::open(path)
         .map_err(|error| format!("не удалось открыть {label}: {error}"))?;
-    let mut header = [0u8; 64];
-    file.read_exact(&mut header)
+    let mut header = [0u8; 4096];
+    let read = file
+        .read(&mut header)
         .map_err(|error| format!("не удалось прочитать PE-заголовок {label}: {error}"))?;
+
+    if read < 256 {
+        return Err(format!("повреждённый PE-файл: слишком короткий заголовок, прочитано {read} байт"));
+    }
+
     if &header[0..2] != b"MZ" {
         if &header[0..4] == [0, 0, 0, 0] && &header[4..6] == b"MZ" {
             return Err("повреждённый PE-файл: перед сигнатурой MZ есть 4 лишних нулевых байта".to_string());
+        }
+        if header.starts_with(b"version https://git-lfs") {
+            return Err("вместо настоящего xray.exe упакован Git LFS pointer; включите checkout lfs:true в GitHub Actions и пересоберите релиз".to_string());
         }
         return Err(format!(
             "повреждённый PE-файл: ожидалась сигнатура MZ, первые байты {:02X} {:02X}",
@@ -470,24 +481,87 @@ fn validate_pe_binary(path: &Path, label: &str) -> Result<(), String> {
         ));
     }
 
-    let pe_offset = u32::from_le_bytes([header[0x3c], header[0x3d], header[0x3e], header[0x3f]]) as u64;
+    let pe_offset = u32::from_le_bytes([header[0x3c], header[0x3d], header[0x3e], header[0x3f]]) as usize;
     if !(64..=8192).contains(&pe_offset) {
         return Err(format!("повреждённый PE-файл: некорректный offset PE-заголовка {pe_offset}"));
     }
+    if pe_offset + 26 > read {
+        return Err(format!("повреждённый PE-файл: PE-заголовок обрывается на offset {pe_offset}"));
+    }
 
-    file.seek(SeekFrom::Start(pe_offset))
-        .map_err(|error| format!("не удалось перейти к PE-заголовку {label}: {error}"))?;
-    let mut pe_signature = [0u8; 4];
-    file.read_exact(&mut pe_signature)
-        .map_err(|error| format!("не удалось прочитать PE-сигнатуру {label}: {error}"))?;
-    if &pe_signature != b"PE\0\0" {
+    if &header[pe_offset..pe_offset + 4] != b"PE\0\0" {
         return Err(format!(
             "повреждённый PE-файл: ожидалась сигнатура PE, получено {:02X} {:02X} {:02X} {:02X}",
-            pe_signature[0], pe_signature[1], pe_signature[2], pe_signature[3]
+            header[pe_offset], header[pe_offset + 1], header[pe_offset + 2], header[pe_offset + 3]
+        ));
+    }
+
+    let machine = u16::from_le_bytes([header[pe_offset + 4], header[pe_offset + 5]]);
+    if machine != PE_MACHINE_AMD64 {
+        return Err(format!(
+            "неподходящий PE-файл: {label} должен быть Windows x64/AMD64, machine=0x{machine:04X}"
+        ));
+    }
+
+    let optional_header_magic = u16::from_le_bytes([header[pe_offset + 24], header[pe_offset + 25]]);
+    if optional_header_magic != PE32_PLUS_MAGIC {
+        return Err(format!(
+            "неподходящий PE-файл: {label} должен быть PE32+ x64, optional_header=0x{optional_header_magic:04X}"
         ));
     }
 
     Ok(())
+}
+
+fn format_xray_spawn_error(error: &std::io::Error, core_path: &Path) -> String {
+    let code = error.raw_os_error();
+    let hint = match code {
+        Some(193) => "Windows вернул os error 193: установленный xray.exe не запускается как Windows x64-приложение. Обычно это значит, что в installer/updater попал неправильный или повреждённый файл xray.exe. Полностью удалите старую установку VKarmani, установите актуальную версию и убедитесь, что GitHub Actions прошёл шаг Verify bundled Xray binary on Windows.",
+        Some(1392) => "Windows вернул os error 1392: файл xray.exe повреждён на диске или был частично перезаписан во время обновления. Закройте VKarmani, удалите папку core рядом с приложением и установите актуальную версию заново.",
+        Some(5) => "Windows вернул os error 5: доступ запрещён. Проверьте антивирус/SmartScreen и права доступа к папке установки.",
+        _ => "Проверьте, что рядом с приложением лежит настоящий Xray-core для Windows x64, а не Linux/ARM/LFS-pointer/повреждённый файл.",
+    };
+
+    format!(
+        "Не удалось запустить Xray-core: {error}. Путь: {}. {hint}",
+        core_path.display()
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_core_launchable(path: &Path) -> Result<(), String> {
+    validate_core_path(path)?;
+    let core_working_dir = path.parent().ok_or_else(|| {
+        "Не удалось определить рабочую папку Xray-core для проверки запуска.".to_string()
+    })?;
+
+    let mut command = Command::new(path);
+    command
+        .current_dir(core_working_dir)
+        .arg("version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_child_console(&mut command);
+
+    let status = command
+        .status()
+        .map_err(|error| format_xray_spawn_error(&error, path))?;
+
+    if !status.success() {
+        return Err(format!(
+            "Xray-core найден, но проверка xray.exe version завершилась с кодом {:?}. Путь: {}",
+            status.code(),
+            path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_core_launchable(path: &Path) -> Result<(), String> {
+    validate_core_path(path)
 }
 
 fn validate_core_path(path: &Path) -> Result<(), String> {
@@ -1768,6 +1842,7 @@ fn request_connect(
 
     let core_path = resolve_core_path(&app)
         .ok_or_else(|| core_not_found_message(&app))?;
+    ensure_core_launchable(&core_path)?;
 
     let normalized_network_mode = match network_mode
         .unwrap_or_else(|| "proxy".to_string())
@@ -1913,21 +1988,20 @@ fn request_connect(
         "Не удалось определить рабочую папку Xray-core для запуска runtime.".to_string()
     })?;
 
-    let mut child = Command::new(&core_path)
+    let mut command = Command::new(&core_path);
+    command
         .current_dir(core_working_dir)
         .arg("run")
         .arg("-config")
         .arg(&config_path)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
+        .stderr(Stdio::from(stderr_file));
+    hide_child_console(&mut command);
+
+    let mut child = command
         .spawn()
-        .map_err(|error| {
-            format!(
-                "Не удалось запустить Xray-core: {error}. Путь: {}. Если Windows показывает os error 1392, установленный xray.exe повреждён: обновите VKarmani до актуальной версии или переустановите приложение.",
-                core_path.display()
-            )
-        })?;
+        .map_err(|error| format_xray_spawn_error(&error, &core_path))?;
 
     std::thread::sleep(Duration::from_millis(350));
     if let Some(status) = child

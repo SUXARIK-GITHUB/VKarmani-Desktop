@@ -40,6 +40,19 @@ if (!fs.existsSync(npmrcPath)) {
   }
 }
 
+const gitattributesPath = path.join(root, '.gitattributes');
+if (!fs.existsSync(gitattributesPath)) {
+  fail('.gitattributes is missing; binary runtime assets must be marked as binary');
+} else {
+  const gitattributes = fs.readFileSync(gitattributesPath, 'utf8');
+  for (const pattern of ['*.exe binary', '*.dll binary', '*.dat binary']) {
+    if (!gitattributes.includes(pattern)) {
+      fail(`.gitattributes must contain "${pattern}" to prevent binary corruption`);
+    } else {
+      ok(`.gitattributes protects ${pattern}`);
+    }
+  }
+}
 const pkg = readJson('package.json');
 const tauri = readJson('src-tauri/tauri.conf.json');
 const cargo = fs.readFileSync(path.join(root, 'src-tauri/Cargo.toml'), 'utf8');
@@ -139,6 +152,24 @@ const assertWindowsPeBinary = (filePath, file) => {
     ok(`PE signature verified: ${file}`);
   }
 
+  const machine = buffer.readUInt16LE(peOffset + 4);
+  if (machine !== 0x8664) {
+    fail(`${file} must be Windows x64/AMD64, got machine=0x${machine.toString(16)}`);
+  } else {
+    ok(`PE machine x64 verified: ${file}`);
+  }
+
+  const optionalHeaderMagic = buffer.readUInt16LE(peOffset + 24);
+  if (optionalHeaderMagic !== 0x20b) {
+    fail(`${file} must be PE32+ x64, got optional header=0x${optionalHeaderMagic.toString(16)}`);
+  } else {
+    ok(`PE32+ header verified: ${file}`);
+  }
+
+  if (buffer.subarray(0, 32).toString('utf8').startsWith('version https://git-lfs')) {
+    fail(`${file} is a Git LFS pointer instead of a real binary`);
+  }
+
   return buffer;
 };
 
@@ -207,6 +238,16 @@ if (!fs.existsSync(workflowPath)) {
 } else {
   ok('GitHub Actions release workflow exists');
   const workflow = fs.readFileSync(workflowPath, 'utf8');
+  if (!/lfs:\s*true/.test(workflow)) {
+    fail('release workflow checkout must set lfs: true so binary assets are real files, not Git LFS pointers');
+  } else {
+    ok('release workflow checkout uses lfs: true');
+  }
+  if (!/verify-xray-windows\.ps1/.test(workflow)) {
+    fail('release workflow must run scripts/verify-xray-windows.ps1 before building installer');
+  } else {
+    ok('release workflow verifies xray.exe on Windows before build');
+  }
   if (!/tauri-apps\/tauri-action@v0(\.\d+\.\d+)?/.test(workflow)) {
     fail('release workflow must use available tauri-apps/tauri-action@v0 or @v0.x.x');
   } else {

@@ -1,6 +1,16 @@
 ; VKarmani NSIS installer hooks.
 ; Tauri creates the normal shortcuts using productName = "VKarmani".
-; These hooks only remove legacy duplicate shortcuts from older builds.
+; Hooks keep upgrades clean and remove legacy duplicate shortcuts.
+
+!macro NSIS_HOOK_PREINSTALL
+  ; Stop a running Xray process before replacing bundled core files.
+  ; If xray.exe is locked during updater/install, Windows can leave a stale or corrupted core file.
+  nsExec::ExecToLog 'taskkill /F /IM xray.exe /T'
+
+  ; Force a clean copy of runtime core files on reinstall/update.
+  ; The app stores user settings in AppData, not in $INSTDIR\core.
+  RMDir /r "$INSTDIR\core"
+!macroend
 
 !macro NSIS_HOOK_POSTINSTALL
   SetShellVarContext current

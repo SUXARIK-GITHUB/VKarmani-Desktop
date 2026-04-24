@@ -1215,6 +1215,35 @@ export default function App() {
   }
 
   async function handleInstallUpdate(silent = false) {
+    if (connectionState === 'connected') {
+      setUpdateInfo((current: UpdateInfo) => ({
+        ...current,
+        status: 'installing',
+        message: tr(language, 'Отключаем VPN перед обновлением…', 'Disconnecting VPN before update…')
+      }));
+      try {
+        setConnectionState('disconnecting');
+        await remnawaveClient.disconnect({ useSystemProxy: proxyStatus.enabled || shouldUseSystemProxy(settings.tunnelMode) });
+        setVpnExternalIp('—');
+        setSessionDuration(0);
+        setConnectivityProbe(null);
+        setConnectionState('idle');
+        await refreshDiagnosticsAndRuntime();
+      } catch (error) {
+        setConnectionState('idle');
+        const message = normalizeNativeError(error, tr(language, 'Не удалось остановить VPN перед обновлением.', 'Failed to stop VPN before update.')).message;
+        setUpdateInfo((current: UpdateInfo) => ({
+          ...current,
+          status: 'error',
+          message
+        }));
+        if (!silent) {
+          pushToast(message, 'error');
+        }
+        return;
+      }
+    }
+
     setUpdateInfo((current: UpdateInfo) => ({
       ...current,
       status: 'downloading',
