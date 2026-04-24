@@ -1,11 +1,11 @@
 {
-  "version": "0.13.23",
+  "version": "0.13.24",
   "generatedFor": "VKarmani Desktop bundled core artifacts",
   "files": [
     {
       "file": "xray.exe",
-      "size": 34683904,
-      "sha256": "7e850a5e98066752d12e427fc3c423c24a4c50d64bd79985cf14aa4eadceaa77"
+      "size": 34683900,
+      "sha256": "bc73016324adba0514b123ea7ceb367a9e4b7344015bdf857bd00d0b57d24f4b"
     },
     {
       "file": "wintun.dll",

@@ -108,6 +108,40 @@ if (!resources || Array.isArray(resources)) {
   }
 }
 
+
+
+const assertWindowsPeBinary = (filePath, file) => {
+  const buffer = fs.readFileSync(filePath);
+  if (buffer.length < 64) {
+    fail(`${file} is too small to contain a valid PE header`);
+    return buffer;
+  }
+
+  if (buffer[0] !== 0x4d || buffer[1] !== 0x5a) {
+    if (buffer[0] === 0x00 && buffer[1] === 0x00 && buffer[2] === 0x00 && buffer[3] === 0x00 && buffer[4] === 0x4d && buffer[5] === 0x5a) {
+      fail(`${file} is corrupted: it has 4 extra null bytes before the MZ header`);
+    } else {
+      fail(`${file} is corrupted: missing MZ header, first bytes are ${buffer[0]?.toString(16)} ${buffer[1]?.toString(16)}`);
+    }
+    return buffer;
+  }
+  ok(`PE MZ header verified: ${file}`);
+
+  const peOffset = buffer.readUInt32LE(0x3c);
+  if (peOffset < 64 || peOffset + 4 > buffer.length || peOffset > 8192) {
+    fail(`${file} is corrupted: invalid PE header offset ${peOffset}`);
+    return buffer;
+  }
+
+  if (buffer[peOffset] !== 0x50 || buffer[peOffset + 1] !== 0x45 || buffer[peOffset + 2] !== 0x00 || buffer[peOffset + 3] !== 0x00) {
+    fail(`${file} is corrupted: missing PE signature at offset ${peOffset}`);
+  } else {
+    ok(`PE signature verified: ${file}`);
+  }
+
+  return buffer;
+};
+
 const manifestPath = path.join(root, 'resources/core/windows/core-manifest.json');
 let manifest = null;
 if (!fs.existsSync(manifestPath)) {
@@ -141,6 +175,10 @@ for (const file of coreFiles) {
     continue;
   }
 
+  const fileBuffer = ['xray.exe', 'wintun.dll'].includes(file)
+    ? assertWindowsPeBinary(filePath, file)
+    : fs.readFileSync(filePath);
+
   const expected = manifest?.files?.find?.((entry) => entry.file === file);
   if (!expected) {
     fail(`core manifest does not include ${file}`);
@@ -154,7 +192,7 @@ for (const file of coreFiles) {
   }
 
   if (expected.sha256) {
-    const actualHash = crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+    const actualHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
     if (expected.sha256 !== actualHash) {
       fail(`core manifest sha256 mismatch for ${file}: manifest=${expected.sha256}, actual=${actualHash}`);
     } else {
@@ -194,6 +232,4 @@ if (!process.env.TAURI_SIGNING_PRIVATE_KEY && process.env.GITHUB_ACTIONS) {
   console.log('[updater-check] INFO: local run: TAURI_SIGNING_PRIVATE_KEY is not required unless you build release artifacts locally.');
 }
 
-if (process.exitCode) {
-  process.exit(process.exitCode);
-}
+process.exit(process.exitCode ?? 0);

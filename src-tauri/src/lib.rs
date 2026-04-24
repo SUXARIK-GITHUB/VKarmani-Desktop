@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     net::{TcpStream, ToSocketAddrs, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -454,11 +454,56 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+fn validate_pe_binary(path: &Path, label: &str) -> Result<(), String> {
+    let mut file = File::open(path)
+        .map_err(|error| format!("не удалось открыть {label}: {error}"))?;
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header)
+        .map_err(|error| format!("не удалось прочитать PE-заголовок {label}: {error}"))?;
+    if &header[0..2] != b"MZ" {
+        if &header[0..4] == [0, 0, 0, 0] && &header[4..6] == b"MZ" {
+            return Err("повреждённый PE-файл: перед сигнатурой MZ есть 4 лишних нулевых байта".to_string());
+        }
+        return Err(format!(
+            "повреждённый PE-файл: ожидалась сигнатура MZ, первые байты {:02X} {:02X}",
+            header[0], header[1]
+        ));
+    }
+
+    let pe_offset = u32::from_le_bytes([header[0x3c], header[0x3d], header[0x3e], header[0x3f]]) as u64;
+    if !(64..=8192).contains(&pe_offset) {
+        return Err(format!("повреждённый PE-файл: некорректный offset PE-заголовка {pe_offset}"));
+    }
+
+    file.seek(SeekFrom::Start(pe_offset))
+        .map_err(|error| format!("не удалось перейти к PE-заголовку {label}: {error}"))?;
+    let mut pe_signature = [0u8; 4];
+    file.read_exact(&mut pe_signature)
+        .map_err(|error| format!("не удалось прочитать PE-сигнатуру {label}: {error}"))?;
+    if &pe_signature != b"PE\0\0" {
+        return Err(format!(
+            "повреждённый PE-файл: ожидалась сигнатура PE, получено {:02X} {:02X} {:02X} {:02X}",
+            pe_signature[0], pe_signature[1], pe_signature[2], pe_signature[3]
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_core_path(path: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("не удалось проверить файл: {error}"))?;
+    if !metadata.is_file() {
+        return Err("это не файл".to_string());
+    }
+    if metadata.len() < MIN_XRAY_CORE_SIZE_BYTES {
+        return Err(format!("слишком маленький файл: {} байт", metadata.len()));
+    }
+    validate_pe_binary(path, "xray.exe")
+}
+
 fn is_usable_core_path(path: &Path) -> bool {
-    path.is_file()
-        && fs::metadata(path)
-            .map(|metadata| metadata.len() >= MIN_XRAY_CORE_SIZE_BYTES)
-            .unwrap_or(false)
+    validate_core_path(path).is_ok()
 }
 
 fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
@@ -539,11 +584,9 @@ fn core_not_found_message(app: &AppHandle) -> String {
         .into_iter()
         .map(|path| {
             let state = if path.exists() {
-                match fs::metadata(&path) {
-                    Ok(metadata) if metadata.is_file() && metadata.len() >= MIN_XRAY_CORE_SIZE_BYTES => "ok".to_string(),
-                    Ok(metadata) if metadata.is_file() => format!("слишком маленький файл: {} байт", metadata.len()),
-                    Ok(_) => "это не файл".to_string(),
-                    Err(error) => format!("не удалось проверить: {error}"),
+                match validate_core_path(&path) {
+                    Ok(()) => "ok".to_string(),
+                    Err(error) => error,
                 }
             } else {
                 "нет файла".to_string()
@@ -1785,10 +1828,18 @@ fn request_connect(
             .as_ref()
             .map(|dir| dir.join("geosite.dat").exists())
             .unwrap_or(false);
-        let wintun_exists = core_dir
+        let wintun_status = core_dir
             .as_ref()
-            .map(|dir| dir.join("wintun.dll").exists())
-            .unwrap_or(false);
+            .map(|dir| {
+                let path = dir.join("wintun.dll");
+                if !path.exists() {
+                    "нет файла".to_string()
+                } else {
+                    validate_pe_binary(&path, "wintun.dll").map(|_| "ok".to_string()).unwrap_or_else(|error| error)
+                }
+            })
+            .unwrap_or_else(|| "не удалось определить папку core".to_string());
+        let wintun_exists = wintun_status == "ok";
         let _ = append_runtime_event(
             &app,
             &format!(
@@ -1798,7 +1849,7 @@ fn request_connect(
                 log_path.display(),
                 geoip_exists,
                 geosite_exists,
-                wintun_exists,
+                wintun_status,
                 outbound_host.as_deref().unwrap_or("—"),
                 outbound_ip.as_deref().unwrap_or("—"),
                 send_through_ip.as_deref().unwrap_or("—")
@@ -1807,7 +1858,7 @@ fn request_connect(
 
         if !wintun_exists {
             return Err(format!(
-                "TUN режим не может стартовать: рядом с xray.exe отсутствует wintun.dll. Положите официальный amd64 wintun.dll в {} и повторите подключение.",
+                "TUN режим не может стартовать: рядом с xray.exe отсутствует или повреждён wintun.dll ({wintun_status}). Положите официальный amd64 wintun.dll в {} и повторите подключение.",
                 core_dir
                     .as_ref()
                     .map(|dir| dir.display().to_string())
@@ -1871,7 +1922,12 @@ fn request_connect(
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .spawn()
-        .map_err(|error| format!("Не удалось запустить Xray-core: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "Не удалось запустить Xray-core: {error}. Путь: {}. Если Windows показывает os error 1392, установленный xray.exe повреждён: обновите VKarmani до актуальной версии или переустановите приложение.",
+                core_path.display()
+            )
+        })?;
 
     std::thread::sleep(Duration::from_millis(350));
     if let Some(status) = child
