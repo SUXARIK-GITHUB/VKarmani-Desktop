@@ -44,8 +44,32 @@ if (tauri.bundle?.createUpdaterArtifacts !== true) {
 }
 
 const workflowPath = path.join(root, '.github/workflows/release.yml');
-if (!fs.existsSync(workflowPath)) fail('.github/workflows/release.yml is missing');
-else ok('GitHub Actions release workflow exists');
+if (!fs.existsSync(workflowPath)) {
+  fail('.github/workflows/release.yml is missing');
+} else {
+  ok('GitHub Actions release workflow exists');
+  const workflow = fs.readFileSync(workflowPath, 'utf8');
+  if (!workflow.includes('tauri-apps/tauri-action@v1')) {
+    fail('release workflow must use tauri-apps/tauri-action@v1');
+  } else {
+    ok('release workflow uses tauri-action v1');
+  }
+  if (!/uploadUpdaterJson:\s*true/.test(workflow)) {
+    fail('release workflow must set uploadUpdaterJson: true');
+  } else {
+    ok('release workflow uploads latest.json');
+  }
+  if (!/uploadUpdaterSignatures:\s*true/.test(workflow)) {
+    fail('release workflow must set uploadUpdaterSignatures: true');
+  } else {
+    ok('release workflow uploads updater signatures');
+  }
+  if (!/releaseDraft:\s*false/.test(workflow)) {
+    fail('release workflow must publish a non-draft release, otherwise /releases/latest/download/latest.json can return 404');
+  } else {
+    ok('release workflow publishes non-draft releases');
+  }
+}
 
 if (!process.env.TAURI_SIGNING_PRIVATE_KEY && process.env.GITHUB_ACTIONS) {
   fail('GitHub secret TAURI_SIGNING_PRIVATE_KEY is missing');
