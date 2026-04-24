@@ -10,7 +10,8 @@
     "tauri:dev": "npx tauri dev",
     "tauri:build": "npx tauri build",
     "tauri": "npx tauri",
-    "verify:updater": "node scripts/verify-updater-config.mjs"
+    "verify:updater": "node scripts/verify-updater-config.mjs",
+    "release:version": "node scripts/set-version.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.10.1",
