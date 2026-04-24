@@ -311,9 +311,16 @@ button {
 }
 
 .secondary-button:disabled,
+.primary-button:disabled,
+.ghost-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  filter: grayscale(0.35) saturate(0.7);
+  box-shadow: none;
+}
+
 .primary-button:disabled {
-  opacity: 0.7;
-  cursor: wait;
+  background: linear-gradient(135deg, rgba(132,146,176,0.62), rgba(84,96,124,0.64));
 }
 
 .ghost-button {
@@ -548,8 +555,14 @@ button {
 }
 
 .power-button:disabled {
-  cursor: wait;
-  opacity: 0.85;
+  cursor: not-allowed;
+  opacity: 0.58;
+  filter: grayscale(0.45) saturate(0.65);
+  box-shadow: 0 0 0 12px rgba(255,255,255,0.015), 0 18px 32px rgba(13,20,40,0.18);
+}
+
+.power-button:disabled::before {
+  opacity: 0;
 }
 
 .connection-text {
@@ -4739,4 +4752,71 @@ textarea,
   padding: 6px 9px;
   margin-top: 0 !important;
   white-space: nowrap !important;
+}
+
+.startup-update-check {
+  position: relative;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  align-self: center;
+  margin: 10px auto 0;
+  padding: 10px 16px;
+  border-radius: 999px;
+  border: 1px solid rgba(120, 170, 255, 0.24);
+  background: rgba(10, 18, 34, 0.78);
+  color: #dce7ff;
+  font-size: 13px;
+  font-weight: 700;
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(14px);
+}
+
+.startup-update-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.28);
+  border-top-color: rgba(255, 255, 255, 0.92);
+  animation: vk-spin 0.75s linear infinite;
+}
+
+@keyframes vk-spin {
+  to { transform: rotate(360deg); }
+}
+
+.connection-title-button {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 1.55rem;
+  font-weight: 800;
+  line-height: 1.08;
+  text-align: left;
+  cursor: pointer;
+}
+
+.connection-title-button:hover:not(:disabled),
+.connection-title-button:focus-visible:not(:disabled) {
+  color: var(--accent-strong, #dfeaff);
+  text-decoration: underline;
+  text-underline-offset: 5px;
+}
+
+.connection-title-button:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.85);
+  outline-offset: 4px;
+  border-radius: 10px;
+}
+
+.connection-title-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
 }

@@ -1,0 +1,26 @@
+{
+  "version": "0.13.20",
+  "generatedFor": "VKarmani Desktop bundled core artifacts",
+  "files": [
+    {
+      "file": "xray.exe",
+      "size": 34683900,
+      "sha256": "bc73016324adba0514b123ea7ceb367a9e4b7344015bdf857bd00d0b57d24f4b"
+    },
+    {
+      "file": "wintun.dll",
+      "size": 427552,
+      "sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+    },
+    {
+      "file": "geoip.dat",
+      "size": 20226649,
+      "sha256": "8cf3dac7d99e428a380bd3aa1330f57718a794d45fe4f9dd20077c010dc0bcdb"
+    },
+    {
+      "file": "geosite.dat",
+      "size": 9976949,
+      "sha256": "1cef268aba784cf84196b6576698c0308e6e8bde8bc27a3e7d5b7c4983e06bf8"
+    }
+  ]
+}
