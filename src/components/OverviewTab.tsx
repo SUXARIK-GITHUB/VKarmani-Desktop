@@ -7,6 +7,7 @@ import {
   Globe2,
   MapPin,
   MonitorCog,
+  MousePointer2,
   Plus,
   Power,
   ShieldCheck,
@@ -18,10 +19,11 @@ import {
   X
 } from 'lucide-react';
 import { tr, type UiLanguage } from '../i18n';
-import { writeNativeInterfaceLog } from '../services/runtime';
+import { listNativeRunningApps, writeNativeInterfaceLog } from '../services/runtime';
 import type {
   ConnectionState,
   RuntimeStatus,
+  RunningAppInfo,
   SplitTunnelEntry,
   TunnelMode,
   VpnServer
@@ -78,6 +80,9 @@ export function OverviewTab({
   const [isSplitTunnelEditorOpen, setIsSplitTunnelEditorOpen] = useState(false);
   const [programValue, setProgramValue] = useState('');
   const [serviceValue, setServiceValue] = useState('');
+  const [runningApps, setRunningApps] = useState<RunningAppInfo[]>([]);
+  const [isRunningAppsOpen, setIsRunningAppsOpen] = useState(false);
+  const [isLoadingRunningApps, setIsLoadingRunningApps] = useState(false);
 
   useEffect(() => {
     if (isSplitTunnelEditorOpen) {
@@ -127,6 +132,29 @@ export function OverviewTab({
     if (onAddSplitTunnelEntry('app', programValue)) {
       setProgramValue('');
     }
+  }
+
+  async function handleOpenRunningApps() {
+    setIsLoadingRunningApps(true);
+    setIsRunningAppsOpen(true);
+    try {
+      const apps = await listNativeRunningApps();
+      setRunningApps(apps);
+      void writeNativeInterfaceLog('Открыт список запущенных приложений для TUN.', `Найдено: ${apps.length}`);
+    } catch (error) {
+      setRunningApps([]);
+      void writeNativeInterfaceLog('Не удалось получить список запущенных приложений.', error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsLoadingRunningApps(false);
+    }
+  }
+
+  function handleSelectRunningApp(app: RunningAppInfo) {
+    const value = app.path?.trim() || (app.name.endsWith('.exe') ? app.name : `${app.name}.exe`);
+    if (onAddSplitTunnelEntry('app', value)) {
+      setProgramValue('');
+    }
+    setIsRunningAppsOpen(false);
   }
 
   function handleServiceSubmit(event: FormEvent<HTMLFormElement>) {
@@ -327,7 +355,56 @@ export function OverviewTab({
                   </button>
                 </div>
               </form>
+
+              <div className="split-tunnel-form compact-split-tunnel-form split-running-apps-form">
+                <label>
+                  <strong><MousePointer2 size={15} /> {tr(language, 'Запущенные', 'Running')}</strong>
+                </label>
+                <button
+                  type="button"
+                  className="ghost-button split-running-apps-button"
+                  onClick={handleOpenRunningApps}
+                  disabled={isLoadingRunningApps}
+                >
+                  {isLoadingRunningApps
+                    ? tr(language, 'Загрузка…', 'Loading…')
+                    : tr(language, 'Выбрать запущенное приложение', 'Choose running app')}
+                </button>
+              </div>
             </div>
+
+            {isRunningAppsOpen ? (
+              <div className="split-running-apps-panel">
+                <div className="split-running-apps-panel-header">
+                  <strong>{tr(language, 'Запущенные приложения', 'Running apps')}</strong>
+                  <button type="button" className="ghost-button split-modal-close" onClick={() => setIsRunningAppsOpen(false)}>
+                    <X size={14} />
+                  </button>
+                </div>
+                <div className="split-running-apps-list">
+                  {isLoadingRunningApps ? (
+                    <div className="split-tunnel-empty compact">
+                      <span>{tr(language, 'Получаю список процессов…', 'Loading process list…')}</span>
+                    </div>
+                  ) : runningApps.length ? runningApps.map((app: RunningAppInfo) => (
+                    <button
+                      type="button"
+                      key={`${app.pid}-${app.path ?? app.name}`}
+                      className="split-running-app-item"
+                      onClick={() => handleSelectRunningApp(app)}
+                    >
+                      <strong>{app.name}</strong>
+                      <span>{app.title || app.path || `PID ${app.pid}`}</span>
+                    </button>
+                  )) : (
+                    <div className="split-tunnel-empty compact">
+                      <strong>{tr(language, 'Ничего не найдено', 'Nothing found')}</strong>
+                      <span>{tr(language, 'Можно ввести exe вручную.', 'You can enter the exe manually.')}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : null}
 
             <div className="split-tunnel-list compact-split-tunnel-list">
               {splitTunnelEntries.length ? splitTunnelEntries.map((entry: SplitTunnelEntry) => (

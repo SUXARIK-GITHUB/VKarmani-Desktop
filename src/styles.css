@@ -4294,3 +4294,318 @@ textarea,
   width: 0;
   height: 0;
 }
+
+
+/* v7 fixed-size desktop overview fit: keep the default 1288x736 window, reduce only internal spacing. */
+.overview-content-area {
+  padding: 10px 12px;
+  overflow: auto;
+}
+
+.overview-screen {
+  height: 100%;
+  min-height: 0;
+  gap: 10px;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.compact-hero-banner {
+  min-height: 106px;
+  padding: 12px 16px;
+  gap: 10px;
+  border-radius: 22px;
+}
+
+.compact-hero-banner .hero-copy {
+  gap: 5px;
+}
+
+.compact-hero-banner h1 {
+  font-size: clamp(1.42rem, 1.8vw, 1.95rem);
+  line-height: 1.05;
+  margin: 2px 0 0;
+}
+
+.compact-hero-banner .status-chip {
+  padding: 7px 12px;
+}
+
+.compact-hero-banner .hero-status-card {
+  padding: 10px 12px;
+  gap: 8px;
+  border-radius: 18px;
+  max-width: 232px;
+}
+
+.compact-hero-banner .hero-status-card-header strong {
+  font-size: 0.9rem;
+}
+
+.compact-hero-badges {
+  gap: 7px;
+}
+
+.compact-hero-badges > div,
+.hero-status-list > div {
+  min-height: 38px;
+  padding: 7px 10px;
+  border-radius: 14px;
+}
+
+.compact-overview-grid {
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) 212px;
+  align-items: stretch;
+  min-height: 0;
+}
+
+.compact-overview-grid .connection-card {
+  min-height: 0;
+  grid-template-columns: 126px minmax(0, 1fr);
+  gap: 10px;
+  padding: 14px 16px;
+  border-radius: 22px;
+}
+
+.compact-overview-grid .connection-ring-wrap {
+  min-width: 0;
+}
+
+.compact-overview-grid .power-button {
+  width: 104px;
+  height: 104px;
+  box-shadow: 0 0 0 12px rgba(255,255,255,0.018), 0 0 0 26px rgba(58,185,255,0.035), 0 14px 34px rgba(58,185,255,0.14);
+}
+
+.compact-overview-grid .connection-text h2 {
+  font-size: clamp(1.55rem, 2vw, 2rem);
+  margin: 0 0 4px;
+}
+
+.compact-overview-grid .connection-text p {
+  margin: 0 0 4px;
+}
+
+.compact-overview-grid .inline-stats {
+  gap: 7px;
+  margin-top: 7px;
+}
+
+.compact-overview-grid .inline-stats span {
+  padding: 6px 9px;
+  border-radius: 12px;
+}
+
+.compact-mode-actions {
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.compact-mode-actions .mode-toggle-button,
+.compact-mode-actions .split-tunnel-launcher-button {
+  min-height: 52px;
+  padding: 8px 10px;
+  border-radius: 16px;
+}
+
+.compact-mode-actions .mode-toggle-button {
+  min-width: 210px;
+  flex-basis: 230px;
+}
+
+.compact-mode-actions .mode-toggle-icon-shell {
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+}
+
+.compact-mode-actions .mode-toggle-kicker {
+  font-size: 0.62rem;
+}
+
+.compact-mode-actions .mode-toggle-copy strong {
+  font-size: 0.94rem;
+}
+
+.compact-mode-actions .mode-toggle-meta {
+  display: none;
+}
+
+.compact-mode-actions .split-tunnel-launcher-button {
+  width: 64px;
+  min-width: 64px;
+}
+
+.compact-metrics-card {
+  padding: 12px;
+  gap: 8px;
+  border-radius: 22px;
+  align-self: stretch;
+}
+
+.compact-metrics-card .metrics-card-header strong {
+  font-size: 0.9rem;
+}
+
+.compact-metrics-card .metric-item {
+  padding: 10px 12px;
+  border-radius: 15px;
+}
+
+.compact-metrics-card .metric-label {
+  gap: 7px;
+  font-size: 0.9rem;
+}
+
+.compact-metrics-card .metric-item strong {
+  display: block;
+  margin: 5px 0 0;
+  font-size: 0.92rem;
+  line-height: 1.25;
+}
+
+.compact-metrics-card .metric-note {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.82rem;
+  line-height: 1.25;
+}
+
+@media (max-height: 740px) {
+  .titlebar {
+    min-height: 64px;
+    padding-top: 9px;
+    padding-bottom: 9px;
+  }
+
+  .workspace-grid {
+    height: calc(100% - 64px);
+  }
+
+  .sidebar {
+    padding: 12px 10px;
+    gap: 10px;
+  }
+
+  .sidebar-profile {
+    padding: 13px;
+  }
+
+  .nav-button {
+    min-height: 42px;
+    padding: 10px 12px;
+  }
+
+  .compact-hero-banner {
+    min-height: 98px;
+    padding: 10px 14px;
+  }
+
+  .compact-hero-banner h1 {
+    font-size: clamp(1.35rem, 1.65vw, 1.78rem);
+  }
+
+  .compact-hero-badges > div,
+  .hero-status-list > div {
+    min-height: 35px;
+    padding: 6px 9px;
+  }
+
+  .compact-overview-grid .connection-card {
+    grid-template-columns: 116px minmax(0, 1fr);
+    padding: 12px 14px;
+  }
+
+  .compact-overview-grid .power-button {
+    width: 96px;
+    height: 96px;
+  }
+
+  .compact-metrics-card .metric-item {
+    padding: 9px 10px;
+  }
+}
+
+/* Split tunnel: running application picker */
+.split-tunnel-form-grid.compact-split-tunnel-form-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(190px, 0.8fr);
+}
+
+.split-running-apps-form {
+  min-width: 0;
+}
+
+.split-running-apps-button {
+  width: 100%;
+  min-height: 50px;
+  justify-content: center;
+  padding: 0 14px;
+  font-weight: 800;
+  white-space: normal;
+  line-height: 1.2;
+}
+
+.split-running-apps-panel {
+  border: 1px solid rgba(96, 132, 255, 0.24);
+  border-radius: 18px;
+  background: rgba(8, 15, 36, 0.72);
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.split-running-apps-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.split-running-apps-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  max-height: 180px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.split-running-app-item {
+  border: 1px solid rgba(96, 132, 255, 0.22);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-primary);
+  padding: 10px 12px;
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.split-running-app-item strong,
+.split-running-app-item span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.split-running-app-item span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  margin-top: 3px;
+}
+
+.split-running-app-item:hover {
+  border-color: rgba(119, 152, 255, 0.48);
+  background: rgba(96, 132, 255, 0.12);
+}
+
+@media (max-width: 1120px) {
+  .split-tunnel-form-grid.compact-split-tunnel-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .split-running-apps-list {
+    grid-template-columns: 1fr;
+  }
+}

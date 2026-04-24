@@ -12,6 +12,13 @@ export type TunnelMode = 'proxy' | 'tun';
 export type SplitTunnelEntryKind = 'app' | 'service';
 
 
+export interface RunningAppInfo {
+  pid: number;
+  name: string;
+  path?: string;
+  title?: string;
+}
+
 export interface SplitTunnelEntry {
   id: string;
   kind: SplitTunnelEntryKind;

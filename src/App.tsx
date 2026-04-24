@@ -10,7 +10,6 @@ import { ToastViewport } from './components/ToastViewport';
 import { TabErrorBoundary } from './components/TabErrorBoundary';
 import { WindowHeader } from './components/WindowHeader';
 import { tr } from './i18n';
-import { usePersistentState } from './hooks/usePersistentState';
 import { remnawaveClient } from './services/remnawave';
 import {
   appVersion,
@@ -29,6 +28,7 @@ import {
   loadSettings,
   loadSplitTunnelEntries,
   loadStoredAccessKey,
+  loadStoredAccessKeySecure,
   saveSettings,
   saveSplitTunnelEntries,
   saveStoredAccessKey
@@ -98,7 +98,7 @@ function pickPreferredServer(servers: VpnServer[], strategy: AppSettings['protoc
 }
 
 export default function App() {
-  const [accessKey, setAccessKey] = usePersistentState('vkarmani.form.access-key', loadStoredAccessKey());
+  const [accessKey, setAccessKey] = useState(() => loadStoredAccessKey());
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
   const [splitTunnelEntries, setSplitTunnelEntries] = useState<SplitTunnelEntry[]>(() => loadSplitTunnelEntries());
   const [activeTab, setActiveTab] = useState<AppTab>('overview');
@@ -145,6 +145,24 @@ export default function App() {
   const hasTriedAdminLaunch = useRef(false);
   const lastRuntimeTunnelActive = useRef(false);
   const lastAppliedSplitTunnelSignature = useRef('');
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void loadStoredAccessKeySecure()
+      .then((storedKey) => {
+        if (!cancelled && storedKey.trim()) {
+          setAccessKey(storedKey.trim());
+        }
+      })
+      .catch((error) => {
+        void writeNativeInterfaceLog('Не удалось загрузить ключ из защищённого хранилища.', normalizeNativeError(error, 'secure storage error').message);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const language = settings.language;
 
@@ -248,6 +266,10 @@ export default function App() {
 
           if (event.payload === 'disconnect' && connectionState === 'connected') {
             void handleConnectionToggle();
+          }
+
+          if (event.payload === 'restart_proxy') {
+            void handleRestartSystemProxy();
           }
         });
 
@@ -623,6 +645,32 @@ export default function App() {
     }
   }
 
+  async function handleRestartSystemProxy() {
+    if (isBusySystemAction) {
+      return;
+    }
+
+    setIsBusySystemAction(true);
+    try {
+      await remnawaveClient.applySystemProxy(false);
+      await sleep(350);
+      const nextProxy = await remnawaveClient.applySystemProxy(true);
+      setProxyStatus(nextProxy);
+      await refreshDiagnosticsAndRuntime();
+      pushToast(tr(language, 'Прокси перезапущен.', 'Proxy restarted.'), 'success');
+      void writeNativeRoutingLog('Системный proxy перезапущен из меню tray.', nextProxy.server ?? '127.0.0.1:10809');
+    } catch (error) {
+      pushToast(
+        error instanceof Error
+          ? error.message
+          : tr(language, 'Не удалось перезапустить proxy.', 'Failed to restart proxy.'),
+        'error'
+      );
+    } finally {
+      setIsBusySystemAction(false);
+    }
+  }
+
   async function handleRunConnectivityProbe() {
     if (isBusySystemAction) {
       return;
@@ -777,7 +825,7 @@ export default function App() {
     }
 
     try {
-      void writeNativeInterfaceLog('Запущена синхронизация профиля Remnawave.', normalizedAccessKey.slice(0, 12));
+      void writeNativeInterfaceLog('Запущена синхронизация профиля Remnawave.');
       setIsSyncingProfile(true);
       setProfileSyncInfo((current: ProfileSyncInfo) => ({
         ...current,
@@ -841,7 +889,7 @@ export default function App() {
     }
 
     try {
-      void writeNativeInterfaceLog('Начата авторизация по ключу доступа.', normalizedAccessKey.slice(0, 12));
+      void writeNativeInterfaceLog('Начата авторизация по ключу доступа.');
       setAuthLoading(true);
       setErrorText('');
       setAccessKey(normalizedAccessKey);
@@ -850,7 +898,7 @@ export default function App() {
       const nextDevices = await remnawaveClient.loadDevices();
       setDevices(nextDevices);
       setIsAuthorized(true);
-      saveStoredAccessKey(normalizedAccessKey);
+      await saveStoredAccessKey(normalizedAccessKey);
       pushToast(tr(language, 'Ключ доступа принят.', 'Access key accepted.'), 'success');
       void writeNativeInterfaceLog('Авторизация по ключу доступа завершена успешно.');
 
@@ -1130,7 +1178,7 @@ export default function App() {
     }
   }
 
-  async function handleCheckUpdates(silent = false) {
+  async function handleCheckUpdates(silent = false, autoInstall = false): Promise<UpdateInfo> {
     setUpdateInfo((current: UpdateInfo) => ({
       ...current,
       status: 'checking',
@@ -1144,22 +1192,29 @@ export default function App() {
       if (!silent) {
         pushToast(result.message ?? tr(language, 'Не удалось проверить обновления.', 'Failed to check for updates.'), 'error');
       }
-      return;
+      return result;
     }
 
     if (result.available) {
       if (!silent) {
         pushToast(`${tr(language, 'Найдено обновление', 'Update found')} ${result.version}`, 'info');
       }
-      return;
+
+      if (autoInstall && isTauriRuntime) {
+        await handleInstallUpdate(true);
+      }
+
+      return result;
     }
 
     if (!silent) {
       pushToast(tr(language, 'Новых обновлений нет.', 'No updates available.'), 'success');
     }
+
+    return result;
   }
 
-  async function handleInstallUpdate() {
+  async function handleInstallUpdate(silent = false) {
     setUpdateInfo((current: UpdateInfo) => ({
       ...current,
       status: 'downloading',
@@ -1182,7 +1237,9 @@ export default function App() {
         status: 'error',
         message: result.message
       }));
-      pushToast(result.message, 'error');
+      if (!silent) {
+        pushToast(result.message, 'error');
+      }
       return;
     }
 
@@ -1192,10 +1249,12 @@ export default function App() {
       status: 'updated',
       downloadedPercent: 100,
       message: isTauriRuntime
-        ? tr(language, 'Установка передана встроенному updater.', 'Update was handed over to the built-in updater.')
+        ? tr(language, 'Обновление установлено встроенным updater. Перезапустите приложение, если новая версия не открылась автоматически.', 'The update was installed by the built-in updater. Restart the app if the new version did not open automatically.')
         : tr(language, 'Демо-установка завершена. В Tauri это действие поставит релиз пользователю.', 'Demo install completed. In Tauri this will install the release for the user.')
     }));
-    pushToast(tr(language, 'Обновление подготовлено.', 'Update prepared.'), 'success');
+    if (!silent) {
+      pushToast(tr(language, 'Обновление подготовлено.', 'Update prepared.'), 'success');
+    }
   }
 
 
@@ -1205,7 +1264,7 @@ export default function App() {
     }
 
     hasAutoCheckedUpdates.current = true;
-    void handleCheckUpdates(true);
+    void handleCheckUpdates(true, true);
   }, [settings.autoUpdate, settings.releaseChannel]);
 
   function toggleSetting(key: keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode'>) {
@@ -1213,7 +1272,7 @@ export default function App() {
   }
 
   function handleClearAccessKey() {
-    clearStoredAccessKey();
+    void clearStoredAccessKey();
     setAccessKey('');
     pushToast(tr(language, 'Сохранённый ключ очищен.', 'Stored key cleared.'), 'info');
   }

@@ -44,6 +44,7 @@ struct AppState {
     last_sync_source: Mutex<Option<String>>,
     runtime: Mutex<Option<ManagedCore>>,
     last_exit_code: Mutex<Option<i32>>,
+    previous_proxy: Mutex<Option<ProxyStatus>>,
 }
 
 #[derive(Serialize)]
@@ -88,6 +89,15 @@ struct ProxyStatus {
     method: String,
     scope: String,
     checked_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunningAppInfo {
+    pid: u32,
+    name: String,
+    path: Option<String>,
+    title: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -251,6 +261,7 @@ fn local_day_folder_name() -> String {
     unix_now_string()
 }
 
+#[allow(dead_code)]
 fn looks_like_launch_root(path: &Path) -> bool {
     path.join("package.json").exists()
         || path.join("START_VKarmani.bat").exists()
@@ -258,10 +269,12 @@ fn looks_like_launch_root(path: &Path) -> bool {
         || path.join("src-tauri").exists()
 }
 
+#[allow(dead_code)]
 fn looks_like_tauri_subdir(path: &Path) -> bool {
     matches!(path.file_name().and_then(|name| name.to_str()), Some("src-tauri") | Some("target") | Some("debug") | Some("release"))
 }
 
+#[allow(dead_code)]
 fn normalize_log_base_candidate(path: PathBuf) -> PathBuf {
     let mut candidate = path;
 
@@ -284,6 +297,7 @@ fn normalize_log_base_candidate(path: PathBuf) -> PathBuf {
     candidate
 }
 
+#[allow(dead_code)]
 fn push_candidate_dir(candidates: &mut Vec<PathBuf>, value: Option<PathBuf>) {
     if let Some(path) = value {
         let normalized = normalize_log_base_candidate(path);
@@ -294,42 +308,16 @@ fn push_candidate_dir(candidates: &mut Vec<PathBuf>, value: Option<PathBuf>) {
 }
 
 fn app_logs_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let mut candidates = Vec::new();
-
-    if let Ok(current_dir) = std::env::current_dir() {
-        if looks_like_launch_root(&current_dir) {
-            push_candidate_dir(&mut candidates, Some(current_dir.clone()));
-        } else if matches!(current_dir.file_name().and_then(|name| name.to_str()), Some("src-tauri")) {
-            push_candidate_dir(&mut candidates, current_dir.parent().map(|path| path.to_path_buf()));
-        }
-
-        if !looks_like_tauri_subdir(&current_dir) {
-            push_candidate_dir(&mut candidates, Some(current_dir));
-        }
-    }
-
-    if let Ok(executable) = std::env::current_exe() {
-        let exe_parent = executable.parent().map(|parent| parent.to_path_buf());
-        push_candidate_dir(&mut candidates, exe_parent.clone());
-
-        if let Some(parent) = exe_parent {
-            if matches!(parent.file_name().and_then(|name| name.to_str()), Some("debug") | Some("release")) {
-                push_candidate_dir(&mut candidates, parent.parent().and_then(|path| path.parent()).and_then(|path| path.parent()).map(|path| path.to_path_buf()));
-            }
-        }
-    }
-
-    push_candidate_dir(&mut candidates, app.path().app_local_data_dir().ok());
-
-    for base in candidates {
-        let logs_root = base.join("logs");
-        if fs::create_dir_all(&logs_root).is_ok() {
-            return Ok(logs_root);
-        }
-    }
-
-    Err("Не удалось создать logs каталог рядом с приложением или в app data.".to_string())
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("Не удалось определить каталог данных приложения для логов: {error}"))?;
+    let logs_root = base.join("logs");
+    fs::create_dir_all(&logs_root)
+        .map_err(|error| format!("Не удалось создать logs каталог в app data: {error}"))?;
+    Ok(logs_root)
 }
+
 
 fn daily_log_root(app: &AppHandle) -> Result<PathBuf, String> {
     let root = app_logs_base_dir(app)?.join(local_day_folder_name());
@@ -382,6 +370,53 @@ fn ensure_log_tree(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn redact_sensitive(input: &str) -> String {
+    let mut result = input.to_string();
+    for scheme in ["vless://", "vmess://", "trojan://", "ss://"] {
+        while let Some(start) = result.to_ascii_lowercase().find(scheme) {
+            let end = result[start..]
+                .find(char::is_whitespace)
+                .map(|offset| start + offset)
+                .unwrap_or(result.len());
+            result.replace_range(start..end, "[redacted-vpn-link]");
+        }
+    }
+
+    let mut output = String::with_capacity(result.len());
+    for token in result.split_whitespace() {
+        let trimmed = token.trim_matches(|c: char| {
+            !c.is_ascii_alphanumeric()
+                && c != '-'
+                && c != '_'
+                && c != '='
+                && c != ':'
+                && c != '/'
+                && c != '.'
+                && c != '?'
+                && c != '&'
+        });
+        let should_mask = trimmed.len() >= 28
+            && trimmed.chars().filter(|c| c.is_ascii_alphanumeric()).count() >= 20
+            && (trimmed.contains('-') || trimmed.contains('_') || trimmed.contains('=') || trimmed.contains("http"));
+
+        let rendered = if should_mask {
+            let prefix: String = trimmed.chars().take(6).collect();
+            let suffix_rev: String = trimmed.chars().rev().take(4).collect();
+            let suffix: String = suffix_rev.chars().rev().collect();
+            token.replace(trimmed, &format!("{prefix}…{suffix}"))
+        } else {
+            token.to_string()
+        };
+
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        output.push_str(&rendered);
+    }
+
+    output
+}
+
 fn append_log_line(path: &PathBuf, scope: &str, line: &str) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -389,7 +424,7 @@ fn append_log_line(path: &PathBuf, scope: &str, line: &str) -> Result<(), String
         .open(path)
         .map_err(|error| format!("Не удалось открыть лог-файл {}: {error}", path.display()))?;
 
-    writeln!(file, "[{}] [{}] {}", log_timestamp_string(), scope, line)
+    writeln!(file, "[{}] [{}] {}", log_timestamp_string(), scope, redact_sensitive(line))
         .map_err(|error| format!("Не удалось записать лог {}: {error}", path.display()))
 }
 
@@ -433,10 +468,12 @@ fn resolve_core_path(app: &AppHandle) -> Option<PathBuf> {
         .find(|path| path.exists() && path.is_file())
 }
 
+#[allow(dead_code)]
 fn resolve_core_sidecar_path(core_path: &Path, file_name: &str) -> Option<PathBuf> {
     core_path.parent().map(|dir| dir.join(file_name))
 }
 
+#[tauri::command]
 fn read_runtime_log_excerpt(path: &Path, lines: usize) -> Vec<String> {
     fs::read_to_string(path)
         .map(|content| {
@@ -464,6 +501,18 @@ fn runtime_output_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let path = base.join("runtime");
     fs::create_dir_all(&path).map_err(|error| format!("Не удалось создать runtime каталог: {error}"))?;
     Ok(path)
+}
+
+fn cleanup_runtime_config_files(app: &AppHandle) -> Result<(), String> {
+    let dir = runtime_output_dir(app)?;
+    for entry in fs::read_dir(&dir).map_err(|error| format!("Не удалось прочитать runtime каталог: {error}"))? {
+        let path = entry.map_err(|error| format!("Не удалось прочитать runtime файл: {error}"))?.path();
+        let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+        if name.starts_with("xray-config") && name.ends_with(".json") {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
 }
 
 fn runtime_log_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1021,7 +1070,9 @@ fn stop_existing_runtime(app: &AppHandle, state: &tauri::State<AppState>) -> Res
             );
         }
 
-        if let Some(code) = status.and_then(|item| item.code()) {
+                let _ = fs::remove_file(Path::new(&runtime.config_path));
+
+if let Some(code) = status.and_then(|item| item.code()) {
             if let Ok(mut exit_guard) = state.last_exit_code.lock() {
                 *exit_guard = Some(code);
             }
@@ -1054,6 +1105,24 @@ fn tcp_port_open(host: &str, port: u16, timeout_ms: u64) -> bool {
 fn run_powershell(script: &str) -> Result<String, String> {
     let output = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|error| format!("Не удалось запустить PowerShell: {error}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_powershell_with_env(script: &str, envs: &[(String, String)]) -> Result<String, String> {
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("Не удалось запустить PowerShell: {error}"))?;
 
@@ -1105,6 +1174,49 @@ fn current_proxy_snapshot() -> Result<ProxyStatus, String> {
         enabled: false,
         server: None,
         bypass: None,
+        method: "mock".into(),
+        scope: "current-user".into(),
+        checked_at: unix_now_string(),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_proxy_snapshot(snapshot: &ProxyStatus) -> Result<ProxyStatus, String> {
+    let proxy_enable = if snapshot.enabled { 1 } else { 0 };
+    let proxy_server = snapshot.server.clone().unwrap_or_default();
+    let proxy_bypass = snapshot.bypass.clone().unwrap_or_default();
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+Set-ItemProperty -Path $key -Name ProxyEnable -Value {proxy_enable}
+Set-ItemProperty -Path $key -Name ProxyServer -Value '{proxy_server}'
+Set-ItemProperty -Path $key -Name ProxyOverride -Value '{proxy_bypass}'
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class WinInetNative {{
+  [DllImport("wininet.dll", SetLastError=true)]
+  public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
+}}
+"@
+[WinInetNative]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
+[WinInetNative]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
+"#,
+        proxy_enable = proxy_enable,
+        proxy_server = ps_quote(&proxy_server),
+        proxy_bypass = ps_quote(&proxy_bypass),
+    );
+    run_powershell(&script)?;
+    current_proxy_snapshot()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_windows_proxy_snapshot(snapshot: &ProxyStatus) -> Result<ProxyStatus, String> {
+    Ok(ProxyStatus {
+        enabled: snapshot.enabled,
+        server: snapshot.server.clone(),
+        bypass: snapshot.bypass.clone(),
         method: "mock".into(),
         scope: "current-user".into(),
         checked_at: unix_now_string(),
@@ -1300,7 +1412,7 @@ fn build_runtime_status(app: &AppHandle, state: tauri::State<AppState>) -> Runti
         last_sync_source,
         message,
         core_path: runtime_snapshot.as_ref().map(|snapshot| snapshot.0.clone()).or(core_path),
-        config_path: runtime_snapshot.as_ref().map(|snapshot| snapshot.1.clone()),
+        config_path: None,
         log_path: runtime_snapshot.as_ref().map(|snapshot| snapshot.2.clone()),
         launch_mode: if runtime_snapshot.is_some() {
             "xray-sidecar".into()
@@ -1322,8 +1434,35 @@ fn build_runtime_status(app: &AppHandle, state: tauri::State<AppState>) -> Runti
 
 
 
+fn validate_remote_fetch_url(raw_url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(raw_url).map_err(|_| "Некорректный URL для удалённого запроса.".to_string())?;
+    if parsed.scheme() != "https" {
+        return Err("Удалённые запросы разрешены только по HTTPS.".into());
+    }
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".local")
+        || host.starts_with("127.")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("172.16.")
+        || host.starts_with("172.17.")
+        || host.starts_with("172.18.")
+        || host.starts_with("172.19.")
+        || host.starts_with("172.2")
+        || host.starts_with("172.30.")
+        || host.starts_with("172.31.")
+        || host == "0.0.0.0"
+    {
+        return Err("Локальные и приватные адреса запрещены для удалённого fetch.".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn fetch_remote_text(url: String, accept: Option<String>) -> Result<String, String> {
+    validate_remote_fetch_url(&url)?;
     let client = build_http_client(None, Duration::from_secs(8))?;
 
     let response = client
@@ -1379,6 +1518,85 @@ fn public_ip_snapshot(mode: Option<String>) -> Result<String, String> {
     let client = build_http_client(None, Duration::from_secs(4))?;
     fetch_public_ip(&client)
 }
+
+fn secure_access_key_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("Не удалось определить каталог данных приложения: {error}"))?;
+    fs::create_dir_all(&dir).map_err(|error| format!("Не удалось создать каталог данных приложения: {error}"))?;
+    Ok(dir.join("access-key.dpapi"))
+}
+
+#[cfg(target_os = "windows")]
+fn encrypt_access_key(value: &str) -> Result<String, String> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Security
+$plain = [Environment]::GetEnvironmentVariable('VKARMANI_ACCESS_KEY_PLAINTEXT', 'Process')
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($plain)
+$encrypted = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+[Convert]::ToBase64String($encrypted)
+"#;
+    run_powershell_with_env(script, &[("VKARMANI_ACCESS_KEY_PLAINTEXT".to_string(), value.to_string())])
+}
+
+#[cfg(target_os = "windows")]
+fn decrypt_access_key(value: &str) -> Result<String, String> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Security
+$blob = [Environment]::GetEnvironmentVariable('VKARMANI_ACCESS_KEY_BLOB', 'Process')
+$encrypted = [Convert]::FromBase64String($blob)
+$bytes = [System.Security.Cryptography.ProtectedData]::Unprotect($encrypted, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+[System.Text.Encoding]::UTF8.GetString($bytes)
+"#;
+    run_powershell_with_env(script, &[("VKARMANI_ACCESS_KEY_BLOB".to_string(), value.to_string())])
+}
+
+#[cfg(not(target_os = "windows"))]
+fn encrypt_access_key(value: &str) -> Result<String, String> {
+    Ok(value.to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn decrypt_access_key(value: &str) -> Result<String, String> {
+    Ok(value.to_string())
+}
+
+#[tauri::command]
+fn save_access_key_secure(value: String, app: AppHandle) -> Result<(), String> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return clear_access_key_secure(app);
+    }
+    let encrypted = encrypt_access_key(normalized)?;
+    fs::write(secure_access_key_path(&app)?, encrypted)
+        .map_err(|error| format!("Не удалось сохранить ключ доступа в защищённое хранилище: {error}"))
+}
+
+#[tauri::command]
+fn load_access_key_secure(app: AppHandle) -> Result<Option<String>, String> {
+    let path = secure_access_key_path(&app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let encrypted = fs::read_to_string(path)
+        .map_err(|error| format!("Не удалось прочитать защищённый ключ доступа: {error}"))?;
+    let value = decrypt_access_key(encrypted.trim())?;
+    Ok(Some(value))
+}
+
+#[tauri::command]
+fn clear_access_key_secure(app: AppHandle) -> Result<(), String> {
+    let path = secure_access_key_path(&app)?;
+    if path.exists() {
+        fs::remove_file(path).map_err(|error| format!("Не удалось удалить сохранённый ключ доступа: {error}"))?;
+    }
+    Ok(())
+}
+
+
 
 #[tauri::command]
 fn bootstrap_info() -> BootstrapInfo {
@@ -1441,7 +1659,8 @@ fn request_connect(
     stop_existing_runtime(&app, &state)?;
 
     let output_dir = runtime_output_dir(&app)?;
-    let config_path = output_dir.join("xray-config.json");
+    let _ = cleanup_runtime_config_files(&app);
+    let config_path = output_dir.join(format!("xray-config-{}-{}.json", std::process::id(), unix_now_string()));
     let active_split_tunnel_entries = split_tunnel_entries.unwrap_or_default();
     let runtime_trace_path = runtime_log_path(&app)?;
     let _ = fs::write(&runtime_trace_path, "");
@@ -1825,18 +2044,34 @@ fn set_system_proxy(enabled: bool, app: AppHandle, state: tauri::State<AppState>
         return Err("Сначала запустите runtime, затем включайте системный proxy.".into());
     }
 
-    let status = set_windows_proxy(enabled)?;
+    let status = if enabled {
+        if let Ok(mut previous_guard) = state.previous_proxy.lock() {
+            if previous_guard.is_none() {
+                *previous_guard = current_proxy_snapshot().ok();
+            }
+        }
+        set_windows_proxy(true)?
+    } else {
+        let previous = state.previous_proxy.lock().ok().and_then(|mut value| value.take());
+        if let Some(snapshot) = previous {
+            apply_windows_proxy_snapshot(&snapshot)?
+        } else {
+            set_windows_proxy(false)?
+        }
+    };
+
     let _ = append_runtime_event(
         &app,
         &format!(
             "Windows system proxy {} | server={} | bypass={}",
-            if enabled { "включён" } else { "отключён" },
+            if enabled { "включён" } else { "восстановлен/отключён" },
             status.server.clone().unwrap_or_else(|| "—".into()),
             status.bypass.clone().unwrap_or_else(|| "—".into())
         ),
     );
     Ok(status)
 }
+
 
 #[tauri::command]
 fn connectivity_probe() -> Result<ConnectivityProbe, String> {
@@ -1872,6 +2107,51 @@ fn connectivity_probe() -> Result<ConnectivityProbe, String> {
     })
 }
 
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+Get-Process | Where-Object { $_.Path -and $_.Path.ToLower().EndsWith('.exe') } |
+  Sort-Object ProcessName, Id |
+  Select-Object -First 80 @{Name='pid';Expression={$_.Id}}, @{Name='name';Expression={ if ($_.ProcessName.ToLower().EndsWith('.exe')) { $_.ProcessName } else { $_.ProcessName + '.exe' } }}, @{Name='path';Expression={$_.Path}}, @{Name='title';Expression={$_.MainWindowTitle}} |
+  ConvertTo-Json -Compress
+"#;
+
+    let raw = run_powershell(script)?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let value: Value = serde_json::from_str(&raw).map_err(|error| format!("Не удалось прочитать список процессов: {error}"))?;
+    let apps: Vec<RunningAppInfo> = if value.is_array() {
+        serde_json::from_value(value).map_err(|error| format!("Некорректный список процессов: {error}"))?
+    } else {
+        vec![serde_json::from_value(value).map_err(|error| format!("Некорректный процесс: {error}"))?]
+    };
+
+    Ok(apps
+        .into_iter()
+        .filter(|app| !app.name.trim().is_empty())
+        .collect())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
+    Ok(Vec::new())
+}
+
+#[tauri::command]
+fn restart_application(app: AppHandle) -> Result<(), String> {
+    let current_exe = std::env::current_exe().map_err(|error| format!("Не удалось определить путь приложения: {error}"))?;
+    Command::new(current_exe)
+        .spawn()
+        .map_err(|error| format!("Не удалось перезапустить приложение: {error}"))?;
+    app.exit(0);
+    Ok(())
+}
+
 #[tauri::command]
 fn read_runtime_log(app: AppHandle, lines: Option<usize>) -> Result<Vec<String>, String> {
     tail_runtime_log(&app, lines.unwrap_or(20).clamp(1, 200))
@@ -1885,6 +2165,8 @@ pub fn run() {
             let _ = interface_logs_dir(&app.handle());
             let _ = routing_logs_dir(&app.handle());
             let _ = ensure_log_tree(&app.handle());
+            let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, None);
+            let _ = cleanup_runtime_config_files(&app.handle());
             let _ = append_interface_event(&app.handle(), "Приложение запущено. Структура логов проверена.");
             let _ = append_runtime_event(&app.handle(), "Routing/runtime лог инициализирован. Ожидание действий пользователя.");
             let show_item = MenuItem::with_id(app, "show", "Открыть VKarmani", true, None::<&str>)?;
@@ -1892,11 +2174,18 @@ pub fn run() {
                 MenuItem::with_id(app, "connect", "Быстрое подключение", true, None::<&str>)?;
             let disconnect_item =
                 MenuItem::with_id(app, "disconnect", "Отключиться", true, None::<&str>)?;
+            let restart_app_item = MenuItem::with_id(app, "restart_app", "Перезапустить программу", true, None::<&str>)?;
+            let restart_proxy_item = MenuItem::with_id(app, "restart_proxy", "Перезапустить прокси", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
 
-            let menu = Menu::with_items(app, &[&show_item, &connect_item, &disconnect_item, &quit_item])?;
+            let menu = Menu::with_items(app, &[&show_item, &connect_item, &disconnect_item, &restart_app_item, &restart_proxy_item, &quit_item])?;
 
-            TrayIconBuilder::new()
+            let mut tray_builder = TrayIconBuilder::new();
+            if let Some(icon) = app.default_window_icon() {
+                tray_builder = tray_builder.icon(icon.clone());
+            }
+
+            tray_builder
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -1914,6 +2203,15 @@ pub fn run() {
                         let _ = append_interface_event(app, "Tray: отключение.");
                         reveal_main_window(app);
                         let _ = app.emit("vkarmani://tray-action", "disconnect");
+                    }
+                    "restart_app" => {
+                        let _ = append_interface_event(app, "Tray: перезапуск приложения.");
+                        let _ = restart_application(app.clone());
+                    }
+                    "restart_proxy" => {
+                        let _ = append_interface_event(app, "Tray: перезапуск proxy.");
+                        reveal_main_window(app);
+                        let _ = app.emit("vkarmani://tray-action", "restart_proxy");
                     }
                     "quit" => {
                         let _ = append_interface_event(app, "Tray: выход из приложения.");
@@ -1938,6 +2236,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             bootstrap_info,
+            save_access_key_secure,
+            load_access_key_secure,
+            clear_access_key_secure,
             runtime_status,
             request_connect,
             request_disconnect,
@@ -1957,7 +2258,9 @@ pub fn run() {
             fetch_remote_text,
             public_ip_snapshot,
             connectivity_probe,
-            read_runtime_log
+            read_runtime_log,
+            list_running_apps,
+            restart_application
         ])
         .run(tauri::generate_context!())
         .expect("error while running VKarmani Desktop");

@@ -3,6 +3,7 @@ import type {
   ConnectivityProbe,
   ProxyStatus,
   RuntimeStatus,
+  RunningAppInfo,
   SplitTunnelEntry,
   TunnelMode,
   VpnServer,
@@ -136,6 +137,23 @@ export async function requestNativeConnect(
     networkMode,
     splitTunnelEntries
   });
+}
+
+export async function listNativeRunningApps(): Promise<RunningAppInfo[]> {
+  if (!isTauriRuntime) {
+    return [];
+  }
+
+  return invokeTauri<RunningAppInfo[]>('list_running_apps');
+}
+
+export async function restartNativeApplication(): Promise<void> {
+  if (!isTauriRuntime) {
+    window.location.reload();
+    return;
+  }
+
+  await invokeTauri('restart_application');
 }
 
 export async function requestNativeDisconnect() {

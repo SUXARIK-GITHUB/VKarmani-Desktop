@@ -24,6 +24,19 @@ export const defaultSettings: AppSettings = {
   language: 'ru'
 };
 
+const tauriWindow = typeof window !== 'undefined'
+  ? (window as Window & { __TAURI_INTERNALS__?: unknown; __TAURI__?: unknown })
+  : undefined;
+
+const canUseTauriSecureStorage = Boolean(
+  tauriWindow && (tauriWindow.__TAURI_INTERNALS__ || tauriWindow.__TAURI__)
+);
+
+async function invokeTauri<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<T>(command, args);
+}
+
 function parseStoredAccessKey(value: string | null) {
   if (!value) {
     return '';
@@ -37,7 +50,7 @@ function parseStoredAccessKey(value: string | null) {
   }
 }
 
-export function loadStoredAccessKey() {
+function loadLegacyAccessKeyFromLocalStorage() {
   if (typeof window === 'undefined') {
     return '';
   }
@@ -45,22 +58,66 @@ export function loadStoredAccessKey() {
   return parseStoredAccessKey(window.localStorage.getItem(ACCESS_KEY_FORM_STORAGE)) || parseStoredAccessKey(window.localStorage.getItem(ACCESS_KEY_STORAGE));
 }
 
-export function saveStoredAccessKey(value: string) {
-  if (typeof window === 'undefined') {
-    return;
-  }
-
-  window.localStorage.setItem(ACCESS_KEY_STORAGE, value);
-  window.localStorage.setItem(ACCESS_KEY_FORM_STORAGE, JSON.stringify(value));
-}
-
-export function clearStoredAccessKey() {
+function clearLegacyAccessKeyFromLocalStorage() {
   if (typeof window === 'undefined') {
     return;
   }
 
   window.localStorage.removeItem(ACCESS_KEY_STORAGE);
   window.localStorage.removeItem(ACCESS_KEY_FORM_STORAGE);
+}
+
+export function loadStoredAccessKey() {
+  return canUseTauriSecureStorage ? '' : loadLegacyAccessKeyFromLocalStorage();
+}
+
+export async function loadStoredAccessKeySecure() {
+  if (!canUseTauriSecureStorage) {
+    return loadLegacyAccessKeyFromLocalStorage();
+  }
+
+  const stored = await invokeTauri<string | null>('load_access_key_secure');
+  if (stored?.trim()) {
+    clearLegacyAccessKeyFromLocalStorage();
+    return stored;
+  }
+
+  const legacy = loadLegacyAccessKeyFromLocalStorage();
+  if (legacy.trim()) {
+    await saveStoredAccessKey(legacy);
+    clearLegacyAccessKeyFromLocalStorage();
+    return legacy;
+  }
+
+  clearLegacyAccessKeyFromLocalStorage();
+  return '';
+}
+
+export async function saveStoredAccessKey(value: string) {
+  const normalized = value.trim();
+  if (!normalized) {
+    await clearStoredAccessKey();
+    return;
+  }
+
+  if (canUseTauriSecureStorage) {
+    await invokeTauri('save_access_key_secure', { value: normalized });
+    clearLegacyAccessKeyFromLocalStorage();
+    return;
+  }
+
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(ACCESS_KEY_STORAGE, normalized);
+    window.localStorage.setItem(ACCESS_KEY_FORM_STORAGE, JSON.stringify(normalized));
+  }
+}
+
+export async function clearStoredAccessKey() {
+  if (canUseTauriSecureStorage) {
+    await invokeTauri('clear_access_key_secure');
+  }
+
+  clearLegacyAccessKeyFromLocalStorage();
 }
 
 export function loadSettings() {

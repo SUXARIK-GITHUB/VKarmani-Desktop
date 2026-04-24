@@ -53,6 +53,8 @@ if not exist "%XRAY_PATH%" (
     exit /b 1
 )
 set "VKARMANI_XRAY_PATH=%XRAY_PATH%"
+set "NPM_CONFIG_AUDIT=false"
+set "NPM_CONFIG_FUND=false"
 
 if not exist "%PROJECT_DIR%\resources\core\windows\geoip.dat" (
     echo [WARN] geoip.dat not found: %PROJECT_DIR%\resources\core\windows\geoip.dat
@@ -73,24 +75,24 @@ if not exist ".env" if exist ".env.example" (
 set "REPAIRED=0"
 if not exist "node_modules" (
     echo [INFO] Installing npm dependencies...
-    call npm install --include=dev --registry=https://registry.npmjs.org/
+    call npm install --include=dev --no-audit --fund=false --registry=https://registry.npmjs.org/
     if errorlevel 1 goto :npm_failed
     set "REPAIRED=1"
 )
 
-call :ensure_pkg "@vitejs/plugin-react/package.json" "npm install -D @vitejs/plugin-react@4.3.1" "@vitejs/plugin-react"
+call :ensure_pkg "@vitejs/plugin-react/package.json" "npm install -D @vitejs/plugin-react@4.3.1 --no-audit --fund=false" "@vitejs/plugin-react"
 if errorlevel 1 goto :npm_failed
-call :ensure_pkg "vite/package.json" "npm install -D vite@5.4.10" "vite"
+call :ensure_pkg "vite/package.json" "npm install -D vite@5.4.21 --no-audit --fund=false" "vite"
 if errorlevel 1 goto :npm_failed
-call :ensure_pkg "typescript/package.json" "npm install -D typescript@5.6.3" "typescript"
+call :ensure_pkg "typescript/package.json" "npm install -D typescript@5.6.3 --no-audit --fund=false" "typescript"
 if errorlevel 1 goto :npm_failed
-call :ensure_pkg "lucide-react/package.json" "npm install lucide-react@0.511.0" "lucide-react"
+call :ensure_pkg "lucide-react/package.json" "npm install lucide-react@0.511.0 --no-audit --fund=false" "lucide-react"
 if errorlevel 1 goto :npm_failed
-call :ensure_pkg "react/jsx-runtime" "npm install react@18.3.1 react-dom@18.3.1" "react/react-dom"
+call :ensure_pkg "react/jsx-runtime" "npm install react@18.3.1 react-dom@18.3.1 --no-audit --fund=false" "react/react-dom"
 if errorlevel 1 goto :npm_failed
-call :ensure_pkg "caniuse-lite/dist/unpacker/agents" "npm install caniuse-lite browserslist" "caniuse-lite/browserslist"
+call :ensure_pkg "caniuse-lite/dist/unpacker/agents" "npm install caniuse-lite browserslist --no-audit --fund=false" "caniuse-lite/browserslist"
 if errorlevel 1 goto :npm_failed
-call :ensure_pkg "@tauri-apps/cli/package.json" "npm install -D @tauri-apps/cli@2.10.1" "@tauri-apps/cli"
+call :ensure_pkg "@tauri-apps/cli/package.json" "npm install -D @tauri-apps/cli@2.10.1 --no-audit --fund=false" "@tauri-apps/cli"
 if errorlevel 1 goto :npm_failed
 
 if "%REPAIRED%"=="1" (
