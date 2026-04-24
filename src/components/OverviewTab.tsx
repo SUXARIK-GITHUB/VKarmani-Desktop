@@ -83,6 +83,7 @@ export function OverviewTab({
   const [runningApps, setRunningApps] = useState<RunningAppInfo[]>([]);
   const [isRunningAppsOpen, setIsRunningAppsOpen] = useState(false);
   const [isLoadingRunningApps, setIsLoadingRunningApps] = useState(false);
+  const [runningAppsQuery, setRunningAppsQuery] = useState('');
 
   useEffect(() => {
     if (isSplitTunnelEditorOpen) {
@@ -126,6 +127,13 @@ export function OverviewTab({
   const routingReadiness = runtimeStatus.coreInstalled
     ? tr(language, 'готов к подключению', 'ready to connect')
     : tr(language, 'конфиг ещё не собран', 'runtime not ready yet');
+  const normalizedRunningAppsQuery = runningAppsQuery.trim().toLowerCase();
+  const filteredRunningApps = normalizedRunningAppsQuery
+    ? runningApps.filter((app: RunningAppInfo) => {
+      const haystack = [app.name, app.title ?? '', app.path ?? ''].join(' ').toLowerCase();
+      return haystack.includes(normalizedRunningAppsQuery);
+    })
+    : runningApps;
 
   function handleProgramSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -137,6 +145,7 @@ export function OverviewTab({
   async function handleOpenRunningApps() {
     setIsLoadingRunningApps(true);
     setIsRunningAppsOpen(true);
+    setRunningAppsQuery('');
     try {
       const apps = await listNativeRunningApps();
       setRunningApps(apps);
@@ -358,7 +367,7 @@ export function OverviewTab({
 
               <div className="split-tunnel-form compact-split-tunnel-form split-running-apps-form">
                 <label>
-                  <strong><MousePointer2 size={15} /> {tr(language, 'Запущенные', 'Running')}</strong>
+                  <strong><MousePointer2 size={15} /> {tr(language, 'Запущенные приложения', 'Running apps')}</strong>
                 </label>
                 <button
                   type="button"
@@ -366,9 +375,8 @@ export function OverviewTab({
                   onClick={handleOpenRunningApps}
                   disabled={isLoadingRunningApps}
                 >
-                  {isLoadingRunningApps
-                    ? tr(language, 'Загрузка…', 'Loading…')
-                    : tr(language, 'Выбрать запущенное приложение', 'Choose running app')}
+                  <span>{isLoadingRunningApps ? tr(language, 'Ищу…', 'Loading…') : tr(language, 'Выбрать', 'Choose')}</span>
+                  <small>{tr(language, 'из активных .exe', 'from active .exe')}</small>
                 </button>
               </div>
             </div>
@@ -376,25 +384,40 @@ export function OverviewTab({
             {isRunningAppsOpen ? (
               <div className="split-running-apps-panel">
                 <div className="split-running-apps-panel-header">
-                  <strong>{tr(language, 'Запущенные приложения', 'Running apps')}</strong>
+                  <div>
+                    <strong>{tr(language, 'Выбор запущенного приложения', 'Choose a running app')}</strong>
+                    <span>{tr(language, 'Нажми на строку, чтобы добавить программу в TUN', 'Click a row to add the app to TUN')}</span>
+                  </div>
                   <button type="button" className="ghost-button split-modal-close" onClick={() => setIsRunningAppsOpen(false)}>
                     <X size={14} />
                   </button>
+                </div>
+                <div className="split-running-apps-toolbar">
+                  <input
+                    value={runningAppsQuery}
+                    onChange={(event) => setRunningAppsQuery(event.target.value)}
+                    placeholder={tr(language, 'Поиск: chrome, telegram, путь...', 'Search: chrome, telegram, path...')}
+                  />
+                  <span>{isLoadingRunningApps ? tr(language, 'Загрузка…', 'Loading…') : tr(language, 'Найдено:', 'Found:')} {filteredRunningApps.length}</span>
                 </div>
                 <div className="split-running-apps-list">
                   {isLoadingRunningApps ? (
                     <div className="split-tunnel-empty compact">
                       <span>{tr(language, 'Получаю список процессов…', 'Loading process list…')}</span>
                     </div>
-                  ) : runningApps.length ? runningApps.map((app: RunningAppInfo) => (
+                  ) : filteredRunningApps.length ? filteredRunningApps.map((app: RunningAppInfo) => (
                     <button
                       type="button"
                       key={`${app.pid}-${app.path ?? app.name}`}
                       className="split-running-app-item"
                       onClick={() => handleSelectRunningApp(app)}
+                      title={app.path || app.title || app.name}
                     >
-                      <strong>{app.name}</strong>
-                      <span>{app.title || app.path || `PID ${app.pid}`}</span>
+                      <div className="split-running-app-main">
+                        <strong>{app.name}</strong>
+                        <span>{app.path || app.title || `PID ${app.pid}`}</span>
+                      </div>
+                      <span className="split-running-app-add">{tr(language, 'Добавить', 'Add')}</span>
                     </button>
                   )) : (
                     <div className="split-tunnel-empty compact">

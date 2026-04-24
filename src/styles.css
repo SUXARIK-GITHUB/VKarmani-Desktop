@@ -4609,3 +4609,134 @@ textarea,
     grid-template-columns: 1fr;
   }
 }
+
+/* Split tunnel picker v2: compact and clearer running-app selector */
+.split-tunnel-form-grid.compact-split-tunnel-form-grid {
+  grid-template-columns: minmax(0, 1.08fr) minmax(0, 1.08fr) minmax(150px, 0.72fr);
+  gap: 12px;
+  align-items: end;
+}
+
+.split-running-apps-form label strong {
+  white-space: nowrap;
+  font-size: 14px;
+}
+
+.split-running-apps-button {
+  min-height: 44px;
+  padding: 7px 12px;
+  flex-direction: column;
+  gap: 1px;
+  white-space: nowrap;
+  line-height: 1.05;
+}
+
+.split-running-apps-button span {
+  font-size: 14px;
+  font-weight: 850;
+}
+
+.split-running-apps-button small {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.split-running-apps-panel {
+  padding: 10px;
+  margin-bottom: 10px;
+}
+
+.split-running-apps-panel-header {
+  margin-bottom: 8px;
+}
+
+.split-running-apps-panel-header > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.split-running-apps-panel-header strong {
+  font-size: 15px;
+}
+
+.split-running-apps-panel-header span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.split-running-apps-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.split-running-apps-toolbar input {
+  width: 100%;
+  height: 38px;
+  border: 1px solid rgba(96, 132, 255, 0.22);
+  border-radius: 12px;
+  background: rgba(7, 13, 29, 0.72);
+  color: var(--text-primary);
+  padding: 0 12px;
+  outline: none;
+}
+
+.split-running-apps-toolbar input:focus {
+  border-color: rgba(119, 152, 255, 0.58);
+  box-shadow: 0 0 0 3px rgba(88, 119, 255, 0.12);
+}
+
+.split-running-apps-toolbar > span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.split-running-apps-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  max-height: 170px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.split-running-app-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 54px;
+  padding: 8px 10px;
+}
+
+.split-running-app-main {
+  min-width: 0;
+}
+
+.split-running-app-item strong {
+  font-size: 14px;
+}
+
+.split-running-app-item span {
+  margin-top: 2px;
+}
+
+.split-running-app-add {
+  border-radius: 999px;
+  border: 1px solid rgba(114, 151, 255, 0.26);
+  background: rgba(96, 132, 255, 0.12);
+  color: var(--text-primary) !important;
+  font-size: 11px !important;
+  font-weight: 800;
+  padding: 6px 9px;
+  margin-top: 0 !important;
+  white-space: nowrap !important;
+}
