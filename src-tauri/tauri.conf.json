@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VKarmani",
-  "version": "0.13.18",
+  "version": "0.13.19",
   "identifier": "com.vkarmani.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -21,7 +21,8 @@
         "resizable": true,
         "decorations": false,
         "transparent": false,
-        "maximizable": true
+        "maximizable": true,
+        "visible": false
       }
     ],
     "security": {
@@ -48,6 +49,7 @@
       "../resources/core/windows/geoip.dat",
       "../resources/core/windows/geosite.dat",
       "../resources/core/windows/wintun.dll",
+      "../resources/core/windows/core-manifest.json",
       "../public/assets/logo-vkarmani.png"
     ],
     "createUpdaterArtifacts": true,

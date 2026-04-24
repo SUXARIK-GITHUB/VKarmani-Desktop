@@ -315,6 +315,14 @@ export async function ensureAdminLaunch(enabled: boolean) {
   return invokeTauri<boolean>('ensure_admin_launch');
 }
 
+export async function setNativeRunAsAdminPreference(enabled: boolean) {
+  if (!isTauriRuntime) {
+    return enabled;
+  }
+
+  return invokeTauri<boolean>('set_run_as_admin_preference', { enabled });
+}
+
 export async function setNativeLaunchOnStartup(enabled: boolean) {
   if (!isTauriRuntime) {
     return false;
