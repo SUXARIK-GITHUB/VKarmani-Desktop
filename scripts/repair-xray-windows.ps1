@@ -131,5 +131,5 @@ if ($git -and (Test-Path -LiteralPath $gitDir)) {
 Write-ErrLine 'Xray-core files are still missing, corrupted, or not launchable.'
 Write-ErrLine "Expected directory: $coreDir"
 Write-ErrLine 'Required files: xray.exe, geoip.dat, geosite.dat, wintun.dll'
-Write-ErrLine 'Fix: run scripts/fetch-xray-windows.ps1 or use the GitHub Actions release artifact built from v0.13.26 or newer.'
+Write-ErrLine 'Fix: run scripts/fetch-xray-windows.ps1 or use the GitHub Actions release artifact built from v0.13.27 or newer.'
 exit 1

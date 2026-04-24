@@ -1,7 +1,7 @@
 param(
   [string]$ProjectDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
   [string]$XrayVersion = 'v26.3.27',
-  [string]$ExpectedZipSha256 = 'd004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad',
+  [string]$ExpectedZipSha256 = '',
   [switch]$Force
 )
 
@@ -29,12 +29,19 @@ function Get-PackageVersion {
 function Test-XrayLaunch([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
 
+  $stdout = $null
+  $stderr = $null
   try {
+    $stdout = [System.IO.Path]::GetTempFileName()
+    $stderr = [System.IO.Path]::GetTempFileName()
     $coreWorkDir = Split-Path -Parent $Path
-    $process = Start-Process -FilePath $Path -ArgumentList @('version') -WorkingDirectory $coreWorkDir -NoNewWindow -Wait -PassThru -RedirectStandardOutput ([System.IO.Path]::GetTempFileName()) -RedirectStandardError ([System.IO.Path]::GetTempFileName())
+    $process = Start-Process -FilePath $Path -ArgumentList @('version') -WorkingDirectory $coreWorkDir -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     return $process.ExitCode -eq 0
   } catch {
     return $false
+  } finally {
+    if ($stdout) { Remove-Item -LiteralPath $stdout -Force -ErrorAction SilentlyContinue }
+    if ($stderr) { Remove-Item -LiteralPath $stderr -Force -ErrorAction SilentlyContinue }
   }
 }
 
@@ -52,13 +59,40 @@ function Get-FileEntry([string]$FileName) {
   }
 }
 
+function Get-Sha256FromDigestFile([string]$DigestPath) {
+  if (-not (Test-Path -LiteralPath $DigestPath -PathType Leaf)) {
+    throw "Digest file is missing: $DigestPath"
+  }
+
+  $digestText = Get-Content -LiteralPath $DigestPath -Raw -Encoding UTF8
+  $sha256Line = [regex]::Match($digestText, '(?im)^\s*SHA256\s*\([^)]*\)\s*=\s*([a-f0-9]{64})\s*$')
+  if ($sha256Line.Success) {
+    return $sha256Line.Groups[1].Value.ToLowerInvariant()
+  }
+
+  $anySha256 = [regex]::Match($digestText, '(?i)\b([a-f0-9]{64})\b')
+  if ($anySha256.Success) {
+    return $anySha256.Groups[1].Value.ToLowerInvariant()
+  }
+
+  throw "Digest file does not contain a SHA256 hash: $DigestPath"
+}
+
+function Invoke-Download([string]$Url, [string]$Destination) {
+  Write-Info "Downloading ${Url}"
+  Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing -MaximumRedirection 10
+  if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
+    throw "Download did not create file: $Destination"
+  }
+}
+
 if (-not (Test-Path -LiteralPath $coreDir)) {
   New-Item -ItemType Directory -Force -Path $coreDir | Out-Null
 }
 
 $xrayPath = Join-Path $coreDir 'xray.exe'
 if (-not $Force -and (Test-XrayLaunch $xrayPath)) {
-  Write-Info "Existing xray.exe launches successfully; keeping bundled file."
+  Write-Info 'Existing xray.exe launches successfully; keeping bundled file.'
   exit 0
 }
 
@@ -67,38 +101,61 @@ Write-Info "Downloading official Xray-core Windows x64 $XrayVersion because bund
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("vkarmani-xray-" + [System.Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $zipPath = Join-Path $tmp 'Xray-windows-64.zip'
+$dgstPath = Join-Path $tmp 'Xray-windows-64.zip.dgst'
 
-$urls = @(
-  "https://github.com/XTLS/Xray-core/releases/download/$XrayVersion/Xray-windows-64.zip",
-  "https://downloads.sourceforge.net/project/xray-core.mirror/$XrayVersion/Xray-windows-64.zip"
+$sources = @(
+  [ordered]@{
+    Name = 'GitHub Releases'
+    Zip = "https://github.com/XTLS/Xray-core/releases/download/$XrayVersion/Xray-windows-64.zip"
+    Digest = "https://github.com/XTLS/Xray-core/releases/download/$XrayVersion/Xray-windows-64.zip.dgst"
+  },
+  [ordered]@{
+    Name = 'SourceForge mirror'
+    Zip = "https://downloads.sourceforge.net/project/xray-core.mirror/$XrayVersion/Xray-windows-64.zip"
+    Digest = "https://downloads.sourceforge.net/project/xray-core.mirror/$XrayVersion/Xray-windows-64.zip.dgst"
+  }
 )
 
 try {
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
   $downloaded = $false
-  foreach ($url in $urls) {
+  $errors = New-Object System.Collections.Generic.List[string]
+
+  foreach ($source in $sources) {
     try {
-      Write-Info "Trying $url"
-      Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing -MaximumRedirection 10
-      if ((Test-Path -LiteralPath $zipPath) -and ((Get-Item -LiteralPath $zipPath).Length -gt 1000000)) {
-        $downloaded = $true
-        break
+      Remove-Item -LiteralPath $zipPath, $dgstPath -Force -ErrorAction SilentlyContinue
+      Write-Info "Trying $($source.Name)"
+
+      Invoke-Download -Url $source.Zip -Destination $zipPath
+      if ((Get-Item -LiteralPath $zipPath).Length -le 1000000) {
+        throw 'Downloaded ZIP is suspiciously small.'
       }
+
+      $expectedHash = $ExpectedZipSha256.Trim().ToLowerInvariant()
+      if (-not $expectedHash) {
+        Invoke-Download -Url $source.Digest -Destination $dgstPath
+        $expectedHash = Get-Sha256FromDigestFile $dgstPath
+      }
+
+      $actualZipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+      if ($actualZipHash -ne $expectedHash) {
+        throw "Downloaded Xray ZIP sha256 mismatch. Expected=$expectedHash Actual=$actualZipHash"
+      }
+
+      Write-Info "Xray ZIP sha256 verified: $actualZipHash"
+      $downloaded = $true
+      break
     } catch {
-      Write-WarnLine "Download failed from $url: $($_.Exception.Message)"
+      $message = "$($source.Name) failed: $($_.Exception.Message)"
+      $errors.Add($message) | Out-Null
+      Write-WarnLine $message
     }
   }
 
   if (-not $downloaded) {
-    throw 'Cannot download Xray-windows-64.zip from GitHub or SourceForge mirror.'
+    throw "Cannot download and verify Xray-windows-64.zip. $($errors -join ' | ')"
   }
-
-  $actualZipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-  if ($ExpectedZipSha256 -and $actualZipHash -ne $ExpectedZipSha256.ToLowerInvariant()) {
-    throw "Downloaded Xray ZIP sha256 mismatch. Expected=$ExpectedZipSha256 Actual=$actualZipHash"
-  }
-  Write-Info "Xray ZIP sha256 verified: $actualZipHash"
 
   $extractDir = Join-Path $tmp 'extract'
   New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
@@ -113,7 +170,7 @@ try {
   }
 
   if (-not (Test-XrayLaunch $xrayPath)) {
-    throw "Downloaded xray.exe still cannot run. Check Windows architecture, antivirus quarantine, or corrupted download."
+    throw 'Downloaded xray.exe still cannot run. Check Windows architecture, antivirus quarantine, or corrupted download.'
   }
 
   $files = @()

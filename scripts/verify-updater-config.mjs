@@ -58,6 +58,22 @@ if (!fs.existsSync(gitattributesPath)) {
     ok('.gitattributes does not force Git LFS for runtime binaries');
   }
 }
+
+const scriptsDir = path.join(root, 'scripts');
+if (fs.existsSync(scriptsDir)) {
+  for (const scriptName of fs.readdirSync(scriptsDir).filter((name) => name.endsWith('.ps1')).sort()) {
+    const scriptPath = path.join(scriptsDir, scriptName);
+    const script = fs.readFileSync(scriptPath, 'utf8');
+    const ambiguousRefs = [...script.matchAll(/\$(?!env:|Env:|script:|Script:|global:|Global:|local:|Local:|private:|Private:|using:|Using:)([A-Za-z_][A-Za-z0-9_]*):/g)];
+    if (ambiguousRefs.length > 0) {
+      const refs = ambiguousRefs.map((match) => match[0]).join(', ');
+      fail(`${scriptName} contains ambiguous PowerShell variable reference before colon: ${refs}. Use braced variables before ':' to avoid parser errors.`);
+    } else {
+      ok(`${scriptName} has no ambiguous PowerShell variable references before colon`);
+    }
+  }
+}
+
 const pkg = readJson('package.json');
 const tauri = readJson('src-tauri/tauri.conf.json');
 const cargo = fs.readFileSync(path.join(root, 'src-tauri/Cargo.toml'), 'utf8');
@@ -247,6 +263,11 @@ if (!fs.existsSync(workflowPath)) {
     fail('release workflow must use windows-2022 for a deterministic x64 Windows runner');
   } else {
     ok('release workflow uses windows-2022 x64 runner');
+  }
+  if (!/Validate PowerShell scripts/.test(workflow)) {
+    fail('release workflow must validate PowerShell scripts before running fetch-xray-windows.ps1');
+  } else {
+    ok('release workflow validates PowerShell script syntax before fetch');
   }
   if (!/fetch-xray-windows\.ps1/.test(workflow)) {
     fail('release workflow must run scripts/fetch-xray-windows.ps1 before verify/build so CI bundles an official launch-tested Xray binary');

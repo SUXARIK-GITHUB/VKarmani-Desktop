@@ -20,6 +20,20 @@ jobs:
         with:
           lfs: true
 
+      - name: Validate PowerShell scripts
+        shell: pwsh
+        run: |
+          $tokens = $null
+          foreach ($file in Get-ChildItem .\scripts -Filter *.ps1) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | Format-List | Out-String | Write-Error
+              throw "PowerShell syntax check failed for $($file.FullName)"
+            }
+            Write-Host "[ps-check] OK: $($file.Name)"
+          }
+
       - name: Download official Xray Windows x64 runtime
         shell: pwsh
         run: .\scripts\fetch-xray-windows.ps1 -Force
