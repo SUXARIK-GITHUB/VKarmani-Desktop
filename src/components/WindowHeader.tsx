@@ -1,3 +1,4 @@
+import { useRef } from 'react';
 import { Download, Globe2, Minus, RefreshCw, ShieldCheck, Square, X } from 'lucide-react';
 import { tr, type UiLanguage } from '../i18n';
 import { performWindowAction, startWindowDrag } from '../services/runtime';
@@ -48,17 +49,26 @@ export function WindowHeader({
   onInstallUpdate,
   onRequestHideToTray
 }: WindowHeaderProps) {
-  const beginDrag = (event: React.MouseEvent<HTMLElement>) => {
-    if (event.button !== 0) {
+  const dragInProgress = useRef(false);
+
+  const releaseDragGuard = () => {
+    dragInProgress.current = false;
+  };
+
+  const beginDrag = (event: React.PointerEvent<HTMLElement>) => {
+    if (event.button !== 0 || dragInProgress.current) {
       return;
     }
 
     const target = event.target as HTMLElement | null;
-    if (target?.closest('[data-no-drag="true"]')) {
+    if (target?.closest('[data-no-drag="true"], button, a, input, textarea, select, [role="button"]')) {
       return;
     }
 
-    void startWindowDrag();
+    event.preventDefault();
+    dragInProgress.current = true;
+    window.setTimeout(releaseDragGuard, 900);
+    void startWindowDrag().finally(releaseDragGuard);
   };
 
   const toggleMaximize = (event?: React.MouseEvent<HTMLElement>) => {
@@ -95,8 +105,8 @@ export function WindowHeader({
   const updateActionable = updateInfo.available || updateInfo.status === 'idle' || updateInfo.status === 'error' || updateInfo.status === 'updated';
   return (
     <header className="titlebar">
-      <div className="brand titlebar-drag-area" data-tauri-drag-region onMouseDown={beginDrag} onDoubleClick={toggleMaximize}>
-        <img src="/assets/logo-dark.jpg" alt="VKarmani" className="brand-logo" />
+      <div className="brand titlebar-drag-area" onPointerDown={beginDrag} onPointerUp={releaseDragGuard} onPointerCancel={releaseDragGuard} onLostPointerCapture={releaseDragGuard} onDoubleClick={toggleMaximize}>
+        <img src="/assets/logo-dark.jpg" alt="VKarmani" className="brand-logo" draggable={false} />
         <div>
           <strong>VKarmani Desktop</strong>
           <span>{tr(language, 'Безопасный VPN-клиент для ПК', 'Secure VPN client for desktop')}</span>
@@ -104,7 +114,7 @@ export function WindowHeader({
       </div>
 
       <div className="window-tools">
-        <div className="titlebar-spacer titlebar-drag-area" data-tauri-drag-region onMouseDown={beginDrag} onDoubleClick={toggleMaximize} aria-hidden="true" />
+        <div className="titlebar-spacer titlebar-drag-area" onPointerDown={beginDrag} onPointerUp={releaseDragGuard} onPointerCancel={releaseDragGuard} onLostPointerCapture={releaseDragGuard} onDoubleClick={toggleMaximize} aria-hidden="true" />
         <span className="app-pill">
           <ShieldCheck size={14} />
           v{currentVersion}

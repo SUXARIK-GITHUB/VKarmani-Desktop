@@ -2,17 +2,19 @@ import type { AppSettings, SplitTunnelEntry } from '../types/vpn';
 
 const ACCESS_KEY_STORAGE = 'vkarmani.access-key';
 const ACCESS_KEY_FORM_STORAGE = 'vkarmani.form.access-key';
+const ACCESS_KEY_FALLBACK_STORAGE = 'vkarmani.access-key.fallback-v1';
 const SETTINGS_STORAGE = 'vkarmani.settings';
 const SPLIT_TUNNEL_STORAGE = 'vkarmani.split-tunnel.entries';
 
 export const defaultSettings: AppSettings = {
-  launchOnStartup: true,
+  launchOnStartup: false,
   runAsAdmin: false,
   showDiagnostics: false,
   autoConnect: false,
   minimizeToTray: true,
   notifications: true,
   autoUpdate: true,
+  autoInstallUpdates: false,
   themeGlow: true,
   releaseChannel: 'stable',
   protocolStrategy: 'auto',
@@ -23,6 +25,55 @@ export const defaultSettings: AppSettings = {
   tunnelMode: 'proxy',
   language: 'ru'
 };
+
+function normalizeStoredSettings(value: unknown): AppSettings {
+  if (!value || typeof value !== 'object') {
+    return defaultSettings;
+  }
+
+  const candidate = value as Partial<AppSettings>;
+  const booleanKeys: Array<keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'tunnelMode'>> = [
+    'launchOnStartup',
+    'runAsAdmin',
+    'showDiagnostics',
+    'autoConnect',
+    'minimizeToTray',
+    'notifications',
+    'autoUpdate',
+    'autoInstallUpdates',
+    'themeGlow',
+    'profileSyncOnLogin',
+    'allowDemoFallback',
+    'useSystemProxy',
+    'probeOnConnect'
+  ];
+
+  const next: AppSettings = { ...defaultSettings };
+
+  for (const key of booleanKeys) {
+    if (typeof candidate[key] === 'boolean') {
+      (next as unknown as Record<string, unknown>)[key] = candidate[key];
+    }
+  }
+
+  if (candidate.releaseChannel === 'stable' || candidate.releaseChannel === 'beta') {
+    next.releaseChannel = candidate.releaseChannel;
+  }
+
+  if (candidate.protocolStrategy === 'auto' || candidate.protocolStrategy === 'reality-first' || candidate.protocolStrategy === 'xray-only') {
+    next.protocolStrategy = candidate.protocolStrategy;
+  }
+
+  if (candidate.tunnelMode === 'proxy' || candidate.tunnelMode === 'tun') {
+    next.tunnelMode = candidate.tunnelMode;
+  }
+
+  if (candidate.language === 'ru' || candidate.language === 'en') {
+    next.language = candidate.language;
+  }
+
+  return next;
+}
 
 const tauriWindow = typeof window !== 'undefined'
   ? (window as Window & { __TAURI_INTERNALS__?: unknown; __TAURI__?: unknown })
@@ -44,10 +95,28 @@ function parseStoredAccessKey(value: string | null) {
 
   try {
     const parsed = JSON.parse(value) as unknown;
-    return typeof parsed === 'string' ? parsed : value;
+    return typeof parsed === 'string' ? parsed.trim() : value.trim();
   } catch {
-    return value;
+    return value.trim();
   }
+}
+
+function readFallbackAccessKeyPayload(value: string | null) {
+  if (!value) {
+    return '';
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (parsed && typeof parsed === 'object' && 'value' in parsed) {
+      const candidate = (parsed as { value?: unknown }).value;
+      return typeof candidate === 'string' ? candidate.trim() : '';
+    }
+  } catch {
+    return parseStoredAccessKey(value);
+  }
+
+  return parseStoredAccessKey(value);
 }
 
 function loadLegacyAccessKeyFromLocalStorage() {
@@ -55,7 +124,37 @@ function loadLegacyAccessKeyFromLocalStorage() {
     return '';
   }
 
-  return parseStoredAccessKey(window.localStorage.getItem(ACCESS_KEY_FORM_STORAGE)) || parseStoredAccessKey(window.localStorage.getItem(ACCESS_KEY_STORAGE));
+  const values = [
+    readFallbackAccessKeyPayload(window.localStorage.getItem(ACCESS_KEY_FALLBACK_STORAGE)),
+    parseStoredAccessKey(window.localStorage.getItem(ACCESS_KEY_FORM_STORAGE)),
+    parseStoredAccessKey(window.localStorage.getItem(ACCESS_KEY_STORAGE))
+  ];
+
+  return values.find((value) => value.trim()) ?? '';
+}
+
+function saveLegacyAccessKeyToLocalStorage(value: string) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  const normalized = value.trim();
+  if (!normalized) {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(ACCESS_KEY_STORAGE, normalized);
+    window.localStorage.setItem(ACCESS_KEY_FORM_STORAGE, JSON.stringify(normalized));
+    window.localStorage.setItem(ACCESS_KEY_FALLBACK_STORAGE, JSON.stringify({
+      version: 1,
+      value: normalized,
+      savedAt: new Date().toISOString(),
+      reason: canUseTauriSecureStorage ? 'secure-storage-backup' : 'web-storage'
+    }));
+  } catch {
+    // localStorage can be unavailable in rare locked-down WebView profiles.
+  }
 }
 
 function clearLegacyAccessKeyFromLocalStorage() {
@@ -63,33 +162,50 @@ function clearLegacyAccessKeyFromLocalStorage() {
     return;
   }
 
-  window.localStorage.removeItem(ACCESS_KEY_STORAGE);
-  window.localStorage.removeItem(ACCESS_KEY_FORM_STORAGE);
+  try {
+    window.localStorage.removeItem(ACCESS_KEY_STORAGE);
+    window.localStorage.removeItem(ACCESS_KEY_FORM_STORAGE);
+    window.localStorage.removeItem(ACCESS_KEY_FALLBACK_STORAGE);
+  } catch {
+    // ignore localStorage cleanup errors
+  }
 }
 
 export function loadStoredAccessKey() {
-  return canUseTauriSecureStorage ? '' : loadLegacyAccessKeyFromLocalStorage();
+  return loadLegacyAccessKeyFromLocalStorage();
 }
 
 export async function loadStoredAccessKeySecure() {
+  const fallback = loadLegacyAccessKeyFromLocalStorage();
+
   if (!canUseTauriSecureStorage) {
-    return loadLegacyAccessKeyFromLocalStorage();
+    return fallback;
   }
 
-  const stored = await invokeTauri<string | null>('load_access_key_secure');
-  if (stored?.trim()) {
-    clearLegacyAccessKeyFromLocalStorage();
-    return stored;
+  try {
+    const stored = await invokeTauri<string | null>('load_access_key_secure');
+    if (stored?.trim()) {
+      saveLegacyAccessKeyToLocalStorage(stored);
+      return stored.trim();
+    }
+  } catch (error) {
+    if (fallback.trim()) {
+      return fallback.trim();
+    }
+
+    throw error;
   }
 
-  const legacy = loadLegacyAccessKeyFromLocalStorage();
-  if (legacy.trim()) {
-    await saveStoredAccessKey(legacy);
-    clearLegacyAccessKeyFromLocalStorage();
-    return legacy;
+  if (fallback.trim()) {
+    try {
+      await invokeTauri('save_access_key_secure', { value: fallback.trim() });
+    } catch {
+      // The local fallback is intentionally kept so the user is not forced to paste the key again.
+    }
+
+    return fallback.trim();
   }
 
-  clearLegacyAccessKeyFromLocalStorage();
   return '';
 }
 
@@ -100,21 +216,26 @@ export async function saveStoredAccessKey(value: string) {
     return;
   }
 
-  if (canUseTauriSecureStorage) {
-    await invokeTauri('save_access_key_secure', { value: normalized });
-    clearLegacyAccessKeyFromLocalStorage();
-    return;
-  }
+  // Save the fallback first. If DPAPI or the native bridge fails on a user's PC,
+  // the key still survives restart and can be migrated back into secure storage later.
+  saveLegacyAccessKeyToLocalStorage(normalized);
 
-  if (typeof window !== 'undefined') {
-    window.localStorage.setItem(ACCESS_KEY_STORAGE, normalized);
-    window.localStorage.setItem(ACCESS_KEY_FORM_STORAGE, JSON.stringify(normalized));
+  if (canUseTauriSecureStorage) {
+    try {
+      await invokeTauri('save_access_key_secure', { value: normalized });
+    } catch {
+      // Do not break login because of secure-storage problems. The fallback above is enough to restore the session.
+    }
   }
 }
 
 export async function clearStoredAccessKey() {
   if (canUseTauriSecureStorage) {
-    await invokeTauri('clear_access_key_secure');
+    try {
+      await invokeTauri('clear_access_key_secure');
+    } catch {
+      // Clear local fallback anyway; secure storage can be repaired on next save.
+    }
   }
 
   clearLegacyAccessKeyFromLocalStorage();
@@ -131,7 +252,7 @@ export function loadSettings() {
       return defaultSettings;
     }
 
-    return { ...defaultSettings, ...(JSON.parse(rawValue) as Partial<AppSettings>) };
+    return normalizeStoredSettings(JSON.parse(rawValue) as unknown);
   } catch {
     return defaultSettings;
   }

@@ -30,6 +30,9 @@ export function DevicesTab({ devices, language, onRevokeDevice }: DevicesTabProp
     lastSeen: device?.lastSeen?.trim?.() || tr(language, 'Нет данных', 'No data'),
     status: device?.status === 'online' ? 'online' : 'offline',
     isCurrent: Boolean(device?.isCurrent),
+    reportedByPanel: Boolean(device?.reportedByPanel),
+    remoteUuid: device?.remoteUuid?.trim?.() || '',
+    hwid: device?.hwid?.trim?.() || '',
     note: device?.note?.trim?.() || ''
   }));
 
@@ -80,10 +83,14 @@ export function DevicesTab({ devices, language, onRevokeDevice }: DevicesTabProp
                     <ShieldCheck size={13} />
                     {tr(language, 'Это устройство', 'This device')}
                   </span>
-                ) : (
+                ) : device.reportedByPanel && (device.remoteUuid || device.hwid) ? (
                   <button className="ghost-button danger-button" onClick={() => onRevokeDevice(device.id)}>
                     {tr(language, 'Отключить', 'Revoke')}
                   </button>
+                ) : (
+                  <span className="runtime-badge waiting" title={tr(language, 'Для отзыва нужен UUID/HWID устройства из панели Remnawave.', 'Device UUID/HWID from Remnawave panel is required to revoke.')}>
+                    {tr(language, 'Локально', 'Local')}
+                  </span>
                 )}
               </div>
             </article>

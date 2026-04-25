@@ -22,6 +22,7 @@ export const appVersion = String(import.meta.env.VITE_APP_VERSION ?? packageJson
 export const remnawavePanelUrl = import.meta.env.VITE_REMNAWAVE_PANEL_URL ?? '';
 export const remnawaveSubscriptionUrl = import.meta.env.VITE_REMNAWAVE_SUBSCRIPTION_URL ?? '';
 const envFlag = import.meta.env.VITE_ALLOW_DEMO_FALLBACK;
+const WEB_FETCH_BODY_LIMIT_BYTES = 2 * 1024 * 1024;
 export const allowDemoFallbackByEnv = String(envFlag ?? '').trim().toLowerCase() === 'true';
 
 async function invokeTauri<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
@@ -244,16 +245,34 @@ export async function fetchRemoteText(url: string, accept = 'text/plain, applica
     return invokeTauri<string>('fetch_remote_text', { url, accept });
   }
 
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: { Accept: accept }
-  });
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 8000);
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { Accept: accept },
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const contentLength = Number(response.headers.get('content-length') ?? 0);
+    if (contentLength > WEB_FETCH_BODY_LIMIT_BYTES) {
+      throw new Error(`Ответ remote subscription слишком большой: ${contentLength} байт.`);
+    }
+
+    const text = await response.text();
+    if (text.length > WEB_FETCH_BODY_LIMIT_BYTES) {
+      throw new Error(`Ответ remote subscription слишком большой. Лимит: ${WEB_FETCH_BODY_LIMIT_BYTES} байт.`);
+    }
+
+    return text;
+  } finally {
+    window.clearTimeout(timeout);
   }
-
-  return response.text();
 }
 
 export async function fetchRemoteJson<T = unknown>(url: string, accept = 'application/json, text/plain, text/html') {
@@ -262,6 +281,22 @@ export async function fetchRemoteJson<T = unknown>(url: string, accept = 'applic
 }
 
 
+
+export async function revokeNativeHwidDevice(
+  panelUrl: string,
+  payload: { uuid?: string; hwid?: string; userUuid?: string }
+): Promise<unknown> {
+  if (!isTauriRuntime) {
+    throw new Error('Удалённый отзыв HWID доступен только в нативной Tauri-сборке.');
+  }
+
+  return invokeTauri('revoke_hwid_device', {
+    panelUrl,
+    uuid: payload.uuid,
+    hwid: payload.hwid,
+    userUuid: payload.userUuid
+  });
+}
 
 export async function fetchPublicIpSnapshot(mode: 'direct' | 'runtime' = 'direct'): Promise<string> {
   if (isTauriRuntime) {
@@ -368,4 +403,16 @@ export function getIntegrationMeta() {
         ? 'Panel API'
         : 'Интеграция не настроена'
   };
+}
+
+export async function setNativeSessionAuthorized(authorized: boolean) {
+  if (!isTauriRuntime) {
+    return false;
+  }
+
+  try {
+    return await invokeTauri<boolean>('set_session_authorized', { authorized });
+  } catch {
+    return false;
+  }
 }

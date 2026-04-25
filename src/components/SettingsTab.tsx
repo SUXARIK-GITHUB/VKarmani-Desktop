@@ -80,8 +80,13 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
       items: [
         {
           key: 'autoUpdate',
-          title: tr(language, 'Автообновления', 'Auto-updates'),
-          description: tr(language, 'Проверять релизы и предлагать установку новой версии', 'Check releases and offer a new version when available')
+          title: tr(language, 'Автопроверка обновлений', 'Auto-check updates'),
+          description: tr(language, 'Проверять релизы в фоне и показывать предложение установить новую версию', 'Check releases in the background and offer a new version when available')
+        },
+        {
+          key: 'autoInstallUpdates',
+          title: tr(language, 'Автоустановка обновлений', 'Auto-install updates'),
+          description: tr(language, 'Скачивать и устанавливать найденное обновление автоматически. По умолчанию выключено, чтобы VPN не прерывался без согласия.', 'Download and install found updates automatically. Disabled by default so the VPN is not interrupted without consent.')
         },
         {
           key: 'notifications',

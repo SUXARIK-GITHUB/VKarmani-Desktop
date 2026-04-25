@@ -136,9 +136,9 @@ export function AuthScreen({
   };
 
   return (
-    <div className="auth-grid compact-auth-grid auth-grid-v2 auth-grid-v3 auth-grid-v4 auth-grid-v5">
-      <section className="auth-panel hero-panel compact-hero-panel auth-hero-v2 auth-hero-v3 auth-hero-v4 auth-hero-v5">
-        <div className="auth-brand-lockup auth-brand-lockup-v4 auth-brand-lockup-v5">
+    <div className="auth-grid compact-auth-grid auth-grid-v5">
+      <section className="auth-panel hero-panel compact-hero-panel auth-hero-v5">
+        <div className="auth-brand-lockup auth-brand-lockup-v5">
           <img src="/assets/logo-dark.jpg" alt="VKarmani" className="auth-brand-logo" />
           <div>
             <strong>VKarmani Desktop</strong>
@@ -146,7 +146,7 @@ export function AuthScreen({
           </div>
         </div>
 
-        <div className="auth-hero-copy-v2 auth-hero-copy-v3 auth-hero-copy-v4 auth-hero-copy-v5">
+        <div className="auth-hero-copy-v5">
           <span className="chip auth-hero-chip">{tr(language, 'Вход по ключу доступа', 'Access key sign-in')}</span>
           <h1>{tr(language, 'Вставьте ключ и подключайтесь без лишних шагов.', 'Paste the key and connect without extra steps.')}</h1>
           <p>
@@ -164,7 +164,7 @@ export function AuthScreen({
           <span><CheckCircle2 size={15} />{tr(language, 'Proxy и TUN доступны после входа', 'Proxy and TUN after sign-in')}</span>
         </div>
 
-        <div className="auth-hero-actions auth-hero-actions-v4 auth-hero-actions-v5 auth-hero-actions-compact">
+        <div className="auth-hero-actions auth-hero-actions-v5 auth-hero-actions-compact">
           <a
             className="primary-button auth-link-button"
             href="https://t.me/VKarmani_VPN_bot"
@@ -186,9 +186,9 @@ export function AuthScreen({
         </div>
       </section>
 
-      <section className="auth-panel form-panel compact-form-panel auth-form-v2 auth-form-v3 auth-form-v4 auth-form-v5">
-        <div className="auth-form-shell auth-form-shell-v3 auth-form-shell-v4 auth-form-shell-v5">
-          <div className="form-header auth-form-header-v2 auth-form-header-v3 auth-form-header-v4 auth-form-header-v5">
+      <section className="auth-panel form-panel compact-form-panel auth-form-v5">
+        <div className="auth-form-shell auth-form-shell-v5">
+          <div className="form-header auth-form-header-v5">
             <span className="chip subdued">{tr(language, 'Вход по ключу', 'Key sign-in')}</span>
             <h2>{tr(language, 'Подключение к VKarmani', 'Connect to VKarmani')}</h2>
           </div>
@@ -205,7 +205,7 @@ export function AuthScreen({
             <label className="field-label" htmlFor="access-key">
               {tr(language, 'Ключ доступа', 'Access key')}
             </label>
-            <div className={`key-input-row auth-key-row-v2 auth-key-row-v4 auth-key-row-v5 ${normalizedKey ? 'is-filled' : ''}`}>
+            <div className={`key-input-row auth-key-row-v5 ${normalizedKey ? 'is-filled' : ''}`}>
               <KeyRound size={18} />
               <input
                 id="access-key"
@@ -224,7 +224,7 @@ export function AuthScreen({
             ) : null}
           </div>
 
-          <div className="auth-input-actions auth-input-actions-v4 auth-input-actions-v5 auth-input-actions-compact">
+          <div className="auth-input-actions auth-input-actions-v5 auth-input-actions-compact">
             <div className="auth-input-tools">
               {hasClipboard ? (
                 <button type="button" className="ghost-button auth-inline-button" onClick={() => void handlePasteFromClipboard()}>
@@ -242,8 +242,8 @@ export function AuthScreen({
             <span className="auth-input-hint">{tr(language, 'Можно вставить ключ и нажать Enter.', 'Paste the key and press Enter.')}</span>
           </div>
 
-          <div className="auth-submit-row auth-submit-row-v3 auth-submit-row-v4 auth-submit-row-v5 auth-submit-row-compact">
-            <button className="primary-button auth-submit-button auth-submit-button-v4 auth-submit-button-compact" onClick={onAuthorize} disabled={!canSubmit}>
+          <div className="auth-submit-row auth-submit-row-v5 auth-submit-row-compact">
+            <button className="primary-button auth-submit-button auth-submit-button-compact" onClick={onAuthorize} disabled={!canSubmit}>
               {authLoading ? tr(language, 'Проверяем ключ…', 'Checking key…') : tr(language, 'Подключиться', 'Connect')}
             </button>
           </div>

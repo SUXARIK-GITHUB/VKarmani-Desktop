@@ -85,6 +85,9 @@ export interface DeviceRecord {
   status: 'online' | 'offline';
   isCurrent: boolean;
   reportedByPanel?: boolean;
+  remoteUuid?: string;
+  hwid?: string;
+  userUuid?: string;
   note?: string;
 }
 
@@ -176,6 +179,7 @@ export interface AppSettings {
   minimizeToTray: boolean;
   notifications: boolean;
   autoUpdate: boolean;
+  autoInstallUpdates: boolean;
   themeGlow: boolean;
   releaseChannel: ReleaseChannel;
   protocolStrategy: 'auto' | 'reality-first' | 'xray-only';

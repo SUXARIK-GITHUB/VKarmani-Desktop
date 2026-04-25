@@ -52,6 +52,7 @@ interface OverviewTabProps {
   profileSyncMessage?: string;
   isBusy: boolean;
   canConnect: boolean;
+  connectDisabledReason?: string;
   isSyncingProfile?: boolean;
 }
 
@@ -75,7 +76,8 @@ export function OverviewTab({
   onToggleSplitTunnelEntry,
   onRemoveSplitTunnelEntry,
   isBusy,
-  canConnect
+  canConnect,
+  connectDisabledReason = ''
 }: OverviewTabProps) {
   const [isSplitTunnelEditorOpen, setIsSplitTunnelEditorOpen] = useState(false);
   const [programValue, setProgramValue] = useState('');
@@ -220,6 +222,9 @@ export function OverviewTab({
             <div className="connection-text">
               <h2>{connectLabel}</h2>
               <p>{connectionLocation}</p>
+              {!canConnect && connectDisabledReason ? (
+                <p className="connection-disabled-note">{connectDisabledReason}</p>
+              ) : null}
 
               <div className="inline-stats wrap-inline-stats">
                 <span>

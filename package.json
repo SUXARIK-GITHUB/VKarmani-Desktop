@@ -1,7 +1,7 @@
 {
   "name": "vkarmani-desktop",
   "private": true,
-  "version": "0.13.27",
+  "version": "0.13.30",
   "type": "module",
   "scripts": {
     "dev": "node ./node_modules/vite/bin/vite.js",
@@ -11,6 +11,7 @@
     "tauri:build": "npx tauri build",
     "tauri": "npx tauri",
     "verify:updater": "node scripts/verify-updater-config.mjs",
+    "test:parsers": "node ./node_modules/vitest/vitest.mjs run tests/remnawave.test.ts --pool=threads --poolOptions.threads.singleThread=true",
     "release:version": "node scripts/set-version.mjs",
     "prepare:xray:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-xray-windows.ps1 -Force"
   },
@@ -27,6 +28,7 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "4.3.4",
     "typescript": "^5.6.3",
-    "vite": "^5.4.21"
+    "vite": "^5.4.21",
+    "vitest": "2.1.9"
   }
 }

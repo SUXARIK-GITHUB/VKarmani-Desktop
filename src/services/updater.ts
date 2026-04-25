@@ -67,20 +67,14 @@ export async function checkForUpdates(channel: ReleaseChannel): Promise<UpdateIn
     }
   }
 
-  await wait(850);
+  await wait(450);
 
   return {
-    available: true,
+    available: false,
     currentVersion: appVersion,
-    version: channel === 'beta' ? '0.13.9-beta.1' : '0.13.9',
-    notes:
-      channel === 'beta'
-        ? 'Бета-канал: улучшено окно диагностики, доработана проверка обновлений и подготовлены tray-события.'
-        : 'Стабильный канал: улучшена надёжность подключения, добавлены быстрые действия и подготовка к автообновлениям.',
-    publishedAt: '2026-03-10T10:30:00Z',
     source: 'mock',
-    status: 'available',
-    message: 'Демо-проверка обновлений завершена.'
+    status: 'idle',
+    message: `Проверка обновлений доступна только в Tauri-сборке. Канал: ${channel}.`
   };
 }
 
