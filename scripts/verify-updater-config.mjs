@@ -284,6 +284,18 @@ if (!fs.existsSync(workflowPath)) {
   } else {
     ok('release workflow verifies xray.exe on Windows before build');
   }
+  if (!/Refresh patched Rust transitive dependencies/.test(workflow) || !/rustls-webpki\s+--precise\s+0\.103\.13/.test(workflow) || !/tar\s+--precise\s+0\.4\.45/.test(workflow)) {
+    fail('release workflow must refresh patched Rust transitive dependencies before cargo audit: rustls-webpki 0.103.13 and tar 0.4.45');
+  } else {
+    ok('release workflow refreshes patched Rust transitive dependencies before audit');
+  }
+  if (/cargo\s+audit\s+--deny\s+warnings/.test(workflow)) {
+    fail('release workflow must not use cargo audit --deny warnings because Tauri transitive GTK/WebKit warnings block Windows releases');
+  } else if (!/cargo\s+audit(\s|$)/.test(workflow)) {
+    fail('release workflow must run cargo audit');
+  } else {
+    ok('release workflow runs cargo audit without denying transitive warnings');
+  }
   if (!/tauri-apps\/tauri-action@v0(\.\d+\.\d+)?/.test(workflow)) {
     fail('release workflow must use available tauri-apps/tauri-action@v0 or @v0.x.x');
   } else {
