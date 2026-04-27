@@ -474,6 +474,34 @@ function buildUrlDerivedCandidates(rawUrl: string, shortUuid?: string) {
   return candidates;
 }
 
+function buildUrlInfoCandidates(rawUrl: string, shortUuid?: string) {
+  const candidates: string[] = [];
+
+  try {
+    const url = new URL(rawUrl);
+    const base = `${url.origin}${url.pathname.replace(/\/+$/g, '')}`;
+    const origin = url.origin;
+    const encodedShortUuid = shortUuid ? encodeURIComponent(shortUuid) : '';
+
+    // Для подтверждения ключа сначала проверяем именно info/profile endpoint.
+    // Raw subscription обычно является text/plain/base64 и не должен ломать JSON-проверку входа.
+    if (!base.endsWith('/info')) {
+      candidates.push(`${base}/info`);
+    }
+
+    if (encodedShortUuid) {
+      candidates.push(`${origin}/api/sub/${encodedShortUuid}/info`);
+    }
+
+    // Оставляем исходную ссылку последней: у некоторых установок VKarmani она может сразу отдавать JSON-профиль.
+    candidates.push(base);
+  } catch {
+    // ignore malformed URL here; resolver handles validation separately.
+  }
+
+  return candidates;
+}
+
 function buildInfoCandidates(key: ResolvedAccessKey) {
   const panel = normalizeBaseUrl(remnawavePanelUrl);
   const subscription = normalizeBaseUrl(remnawaveSubscriptionUrl);
@@ -481,7 +509,7 @@ function buildInfoCandidates(key: ResolvedAccessKey) {
   const shortUuid = key.shortUuid ?? key.identifier;
 
   if (key.kind === 'url') {
-    candidates.push(...buildUrlDerivedCandidates(key.normalized, shortUuid));
+    candidates.push(...buildUrlInfoCandidates(key.normalized, shortUuid));
   }
 
   if (subscription && shortUuid) {
@@ -784,15 +812,43 @@ export class RemnawaveClient {
       }
       return session;
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Не удалось получить профиль из Remnawave.';
+      const infoError = error instanceof Error ? error.message : 'Не удалось получить профиль из Remnawave.';
 
-      if (!allowDemoFallback) {
-        throw new Error(message);
+      // У части подписок VKarmani/Remnawave доступен только raw subscription без отдельного JSON info endpoint.
+      // В таком случае ключ всё равно считается рабочим, если raw-профиль скачался и в нём есть серверы.
+      try {
+        const rawResult = await fetchTextCandidates(buildRawCandidates(key, provisionalSession));
+        const importedServers = parseSubscriptionToServers(rawResult.value);
+
+        if (!importedServers.length) {
+          throw new Error('Raw subscription получен, но серверы в нём не распознаны.');
+        }
+
+        this.cachedSession = provisionalSession;
+        this.cachedDevices = [buildLocalDeviceRecord()];
+        this.cachedServers = importedServers;
+        this.profileSyncInfo = {
+          status: 'ready',
+          source: rawResult.url.includes('/api/sub/') || rawResult.url.endsWith('/raw') ? 'public-api' : 'panel-api',
+          sourceLabel: rawResult.url.includes('/api/sub/') || rawResult.url.endsWith('/raw') ? 'Публичная подписка' : 'Panel API',
+          configCount: importedServers.length,
+          readyCount: importedServers.filter((item) => item.runtimeTemplate).length,
+          updatedAt: new Date().toISOString(),
+          accessKeyKind: key.kind,
+          message: 'Ключ подтверждён через raw subscription.'
+        };
+        return provisionalSession;
+      } catch (rawError) {
+        const rawMessage = rawError instanceof Error ? rawError.message : 'Не удалось получить raw subscription.';
+
+        if (!allowDemoFallback) {
+          throw new Error(`${infoError} Raw-проверка тоже не прошла: ${rawMessage}`);
+        }
+
+        this.cachedSession = provisionalSession;
+        this.cachedDevices = [buildLocalDeviceRecord()];
+        return provisionalSession;
       }
-
-      this.cachedSession = provisionalSession;
-      this.cachedDevices = [buildLocalDeviceRecord()];
-      return provisionalSession;
     }
   }
 
