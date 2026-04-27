@@ -15,7 +15,10 @@ import { tr } from './i18n';
 import { useOperationManager } from './hooks/useOperationManager';
 import { buildDiagnosticsFilename, createSafeDiagnosticsPayload, downloadTextFile } from './utils/diagnosticsExport';
 import { redactSensitiveText } from './utils/redaction';
+import { sleep } from './utils/async';
+import { createToast } from './utils/toast';
 import { buildTrafficBars, formatTrafficBytes } from './utils/traffic';
+import { pickPreferredServer, rankServers } from './utils/serverSorting';
 import { remnawaveClient } from './services/remnawave';
 import {
   appVersion,
@@ -55,6 +58,8 @@ import {
   saveStoredAccessKey
 } from './services/storage';
 import { checkForUpdates, installAvailableUpdate } from './services/updater';
+import type { PendingServerSwitch, PingProgressState } from './types/appState';
+import { EMPTY_PING_PROGRESS } from './types/appState';
 import type {
   AppSettings,
   AppTab,
@@ -77,71 +82,9 @@ import type {
   VpnServer
 } from './types/vpn';
 
-function createToast(title: string, tone: ToastItem['tone']): ToastItem {
-  return {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    title: redactSensitiveText(title),
-    tone
-  };
-}
-
 const integrationMeta = getIntegrationMeta();
-const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
-
-type PendingServerSwitch = {
-  nextServerId: string;
-  previousServerId: string;
-};
-
-type PingProgressState = {
-  active: boolean;
-  total: number;
-  completed: number;
-  success: number;
-  failed: number;
-};
-
-const EMPTY_PING_PROGRESS: PingProgressState = {
-  active: false,
-  total: 0,
-  completed: 0,
-  success: 0,
-  failed: 0
-};
 
 
-function isRealityPreferredServer(server: VpnServer) {
-  const haystack = [server.protocol, server.transportLabel, ...(server.tags ?? []), server.rawLabel]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase();
-
-  return haystack.includes('reality');
-}
-
-function rankServers(servers: VpnServer[], strategy: AppSettings['protocolStrategy']) {
-  const scopedServers = strategy === 'xray-only'
-    ? (() => {
-      const runtimeReady = servers.filter((server: VpnServer) => Boolean(server.runtimeTemplate));
-      return runtimeReady.length ? runtimeReady : servers;
-    })()
-    : servers;
-
-  return [...scopedServers].sort((left: VpnServer, right: VpnServer) => {
-    const leftScore = Number(Boolean(left.runtimeTemplate)) * 100 + Number(Boolean(left.isRecommended)) * 10 + (strategy === 'reality-first' && isRealityPreferredServer(left) ? 30 : 0);
-    const rightScore = Number(Boolean(right.runtimeTemplate)) * 100 + Number(Boolean(right.isRecommended)) * 10 + (strategy === 'reality-first' && isRealityPreferredServer(right) ? 30 : 0);
-
-    if (rightScore !== leftScore) {
-      return rightScore - leftScore;
-    }
-
-    return `${left.country} ${left.city}`.localeCompare(`${right.country} ${right.city}`, 'ru');
-  });
-}
-
-function pickPreferredServer(servers: VpnServer[], strategy: AppSettings['protocolStrategy']) {
-  return rankServers(servers, strategy)[0] ?? null;
-}
 
 export default function App() {
   const [accessKey, setAccessKey] = useState(() => loadStoredAccessKey());
@@ -154,6 +97,7 @@ export default function App() {
   const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
   const [servers, setServers] = useState<VpnServer[]>([]);
   const [selectedServerId, setSelectedServerId] = useState(() => loadSelectedServerId());
+  const [connectedServerId, setConnectedServerId] = useState('');
   const [favoriteServerIds, setFavoriteServerIds] = useState<string[]>(() => loadFavoriteServerIds());
   const [session, setSession] = useState<RemnawaveSession | null>(null);
   const [devices, setDevices] = useState<DeviceRecord[]>([]);
@@ -216,6 +160,9 @@ export default function App() {
   const updaterActionLock = useRef(false);
   const connectionStateRef = useRef<ConnectionState>(connectionState);
   const selectedServerIdRef = useRef(selectedServerId);
+  const connectedServerIdRef = useRef('');
+  const autoPingRunIdRef = useRef(0);
+  const overviewAutoRefreshAtRef = useRef(0);
   const serversRef = useRef<VpnServer[]>(servers);
   const settingsRef = useRef<AppSettings>(settings);
   const splitTunnelEntriesRef = useRef<SplitTunnelEntry[]>(splitTunnelEntries);
@@ -232,6 +179,7 @@ export default function App() {
   const runtimePollInFlight = useRef(false);
   const postConnectProbeInFlight = useRef(false);
   const manualRefreshInFlight = useRef(false);
+  const profileSyncInFlightRef = useRef(false);
   const snapshotRefreshQueued = useRef(false);
   const connectionActionStartedAt = useRef<number | null>(null);
   const lastToastSignatureRef = useRef<{ title: string; tone: ToastItem['tone']; at: number } | null>(null);
@@ -319,6 +267,10 @@ export default function App() {
   useEffect(() => {
     selectedServerIdRef.current = selectedServerId;
   }, [selectedServerId]);
+
+  useEffect(() => {
+    connectedServerIdRef.current = connectedServerId;
+  }, [connectedServerId]);
 
   useEffect(() => {
     serversRef.current = servers;
@@ -421,6 +373,20 @@ export default function App() {
   useEffect(() => {
     void setNativeSessionAuthorized(Boolean(isAuthorized && session));
   }, [isAuthorized, session]);
+
+  useEffect(() => {
+    if (!isAuthorized || activeTab !== 'overview' || !accessKey.trim()) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - overviewAutoRefreshAtRef.current < 120_000) {
+      return;
+    }
+
+    overviewAutoRefreshAtRef.current = now;
+    void handleSyncProfile(true);
+  }, [accessKey, activeTab, isAuthorized]);
 
   useEffect(() => {
     if (persistentStateReady) {
@@ -687,6 +653,8 @@ export default function App() {
 
           lastRuntimeTunnelActive.current = false;
           lostRuntimePollCount.current = 0;
+          setConnectedServerId('');
+          connectedServerIdRef.current = '';
           setConnectionStateSafe('idle');
           setVpnExternalIp('—');
           setConnectivityProbe(null);
@@ -751,6 +719,9 @@ export default function App() {
         if (nextRuntime.tunnelActive) {
           lostRuntimePollCount.current = 0;
           lastRuntimeTunnelActive.current = true;
+          const runtimeServerId = nextRuntime.lastPreparedServerId || connectedServerIdRef.current || selectedServerIdRef.current;
+          setConnectedServerId(runtimeServerId);
+          connectedServerIdRef.current = runtimeServerId;
           setConnectionStateSafe((current: ConnectionState) => current === 'disconnecting' ? current : 'connected');
           return;
         }
@@ -766,6 +737,8 @@ export default function App() {
         }
 
         lastRuntimeTunnelActive.current = false;
+        setConnectedServerId('');
+        connectedServerIdRef.current = '';
         setConnectionStateSafe((current: ConnectionState) => current === 'connecting' || current === 'disconnecting' ? current : 'idle');
 
         if (!lostTunnel || connectionStateRef.current === 'disconnecting') {
@@ -843,6 +816,17 @@ export default function App() {
     [servers, selectedServerId]
   );
 
+  const activeConnectionServerId = connectionState === 'connected'
+    ? connectedServerId || runtimeStatus.lastPreparedServerId || selectedServerId
+    : selectedServerId;
+
+
+  const visibleSelectedServer = useMemo(
+    () => (connectionState === 'connected'
+      ? servers.find((server: VpnServer) => server.id === activeConnectionServerId) ?? selectedServer
+      : selectedServer),
+    [activeConnectionServerId, connectionState, selectedServer, servers]
+  );
   const splitTunnelSignature = useMemo(
     () => JSON.stringify(splitTunnelEntries.map((entry: SplitTunnelEntry) => ({
       id: entry.id,
@@ -1152,6 +1136,8 @@ export default function App() {
             setVpnExternalIp('—');
             setConnectivityProbe(null);
             setSessionDuration(0);
+            setConnectedServerId('');
+            connectedServerIdRef.current = '';
             setConnectionStateSafe('idle');
             await refreshDiagnosticsAndRuntime();
             await refreshPrimaryExternalIp();
@@ -1475,15 +1461,33 @@ export default function App() {
     setServers((current) => updatePingState(current));
   }
 
-  async function handleRefreshPing() {
+  function scheduleAutoPing(reason = 'auto-main-refresh', delayMs = 450) {
+    const runId = autoPingRunIdRef.current + 1;
+    autoPingRunIdRef.current = runId;
+
+    window.setTimeout(() => {
+      if (autoPingRunIdRef.current !== runId || pingCheckInFlightRef.current || !serversRef.current.length) {
+        return;
+      }
+
+      void writeNativeInterfaceLog('Автоматическая проверка пинга запланирована.', reason);
+      void handleRefreshPing({ silent: true, reason });
+    }, delayMs);
+  }
+
+  async function handleRefreshPing(options: { silent?: boolean; reason?: string } = {}) {
     if (pingCheckInFlightRef.current || isCheckingPing) {
-      pushToast(tr(language, 'Проверка пинга уже идёт. Остальные кнопки можно использовать.', 'Ping check is already running. Other buttons remain available.'), 'info');
+      if (!options.silent) {
+        pushToast(tr(language, 'Проверка пинга уже идёт. Остальные кнопки можно использовать.', 'Ping check is already running. Other buttons remain available.'), 'info');
+      }
       return;
     }
 
     const targets = getPingableServers();
     if (!targets.length) {
-      pushToast(tr(language, 'Нет серверов с host/port для проверки пинга. Обновите серверы.', 'No servers with host/port are available for ping check. Refresh servers.'), 'info');
+      if (!options.silent) {
+        pushToast(tr(language, 'Нет серверов с host/port для проверки пинга. Обновите серверы.', 'No servers with host/port are available for ping check. Refresh servers.'), 'info');
+      }
       return;
     }
 
@@ -1515,13 +1519,16 @@ export default function App() {
       success: 0,
       failed: 0
     });
-    void writeNativeInterfaceLog(`Запущена проверка пинга всех серверов: ${targets.length}.`);
+    void writeNativeInterfaceLog(`Запущена проверка пинга всех серверов: ${targets.length}.`, options.reason ?? 'manual');
 
     let cursor = 0;
     let completed = 0;
     let success = 0;
     let failed = 0;
-    const concurrency = Math.min(4, Math.max(1, targets.length));
+    const concurrency = Math.min(connectionStateRef.current === 'connected' ? 2 : 4, Math.max(1, targets.length));
+    const probeTargetServerId = connectionStateRef.current === 'connected'
+      ? connectedServerIdRef.current || runtimeStatus.lastPreparedServerId || selectedServerIdRef.current
+      : selectedServerIdRef.current;
 
     const updateProgress = () => {
       setPingProgress({
@@ -1574,7 +1581,7 @@ export default function App() {
             });
           }
 
-          if (targetServer.id === selectedServerIdRef.current) {
+          if (targetServer.id === probeTargetServerId) {
             setConnectivityProbe({
               ...probe,
               packetLossPct: packetLoss
@@ -1607,7 +1614,7 @@ export default function App() {
             updateProgress();
           }
 
-          await sleep(0);
+          await sleep(connectionStateRef.current === 'connected' ? 70 : 0);
         }
       }
     };
@@ -1620,15 +1627,20 @@ export default function App() {
       }
 
       void refreshDiagnosticsAndRuntime();
-      pushToast(
-        tr(
-          language,
-          `Пинг проверен: ${success}/${targets.length} серверов ответили, ${failed} без ответа.`,
-          `Ping checked: ${success}/${targets.length} servers responded, ${failed} did not respond.`
-        ),
-        success > 0 ? 'success' : 'info'
-      );
+      if (!options.silent) {
+        pushToast(
+          tr(
+            language,
+            `Пинг проверен: ${success}/${targets.length} серверов ответили, ${failed} без ответа.`,
+            `Ping checked: ${success}/${targets.length} servers responded, ${failed} did not respond.`
+          ),
+          success > 0 ? 'success' : 'info'
+        );
+      }
     } catch (error) {
+      if (options.silent) {
+        return;
+      }
       pushToast(
         error instanceof Error
           ? error.message
@@ -1746,12 +1758,14 @@ export default function App() {
 
       try {
         setConnectionStateSafe('disconnecting');
+        await sleep(30);
         await remnawaveClient.disconnect({ useSystemProxy: proxyStatusRef.current.enabled || (previousMode !== 'tun' && previousUseSystemProxy) });
         setVpnExternalIp('—');
         setConnectivityProbe(null);
         setSessionDuration(0);
 
         setConnectionStateSafe('connecting');
+        await sleep(30);
         const response = await remnawaveClient.connect(serverForReconnect, {
           useSystemProxy: shouldUseSystemProxy(nextMode, previousUseSystemProxy),
           probeAfterConnect: false,
@@ -1763,6 +1777,8 @@ export default function App() {
           setProxyStatus(response.proxy);
         }
         setSessionDuration(0);
+        setConnectedServerId(serverForReconnect.id);
+        connectedServerIdRef.current = serverForReconnect.id;
         setConnectionStateSafe('connected');
         runPostConnectProbe(serverForReconnect);
         void refreshDiagnosticsAndRuntime();
@@ -1818,6 +1834,12 @@ export default function App() {
       return null;
     }
 
+    if (profileSyncInFlightRef.current) {
+      return null;
+    }
+
+    profileSyncInFlightRef.current = true;
+
     try {
       void writeNativeInterfaceLog('Запущена синхронизация профиля Remnawave.');
       setIsSyncingProfile(true);
@@ -1854,6 +1876,8 @@ export default function App() {
         `${result.profile.configCount} конфигов | источник: ${result.profile.sourceLabel}`
       );
 
+      scheduleAutoPing(silent ? 'silent-profile-sync' : 'manual-profile-sync');
+
       if (!silent) {
         pushToast(result.profile.message ?? tr(language, 'Профиль синхронизирован.', 'Profile synced.'), 'success');
       }
@@ -1872,6 +1896,7 @@ export default function App() {
       }
       return null;
     } finally {
+      profileSyncInFlightRef.current = false;
       setIsSyncingProfile(false);
     }
   }
@@ -1900,6 +1925,7 @@ export default function App() {
       const nextDevices = await remnawaveClient.loadDevices();
       setDevices(nextDevices);
       setIsAuthorized(true);
+      await setNativeSessionAuthorized(true);
       const keyPersisted = await saveStoredAccessKey(normalizedAccessKey);
 
       if (!connectFavoriteAfterLaunch) {
@@ -1913,15 +1939,14 @@ export default function App() {
       }
       void writeNativeInterfaceLog('Авторизация по ключу доступа завершена успешно.');
 
+      overviewAutoRefreshAtRef.current = Date.now();
       let serverPool = serversRef.current;
       let preferredServerForAutoConnect = selectedServer;
 
-      if (currentSettings.profileSyncOnLogin) {
-        const syncResult = await handleSyncProfile(true, normalizedAccessKey);
-        if (syncResult?.servers) {
-          serverPool = syncResult.servers;
-          preferredServerForAutoConnect = pickPreferredServer(syncResult.servers, currentSettings.protocolStrategy);
-        }
+      const syncResult = await handleSyncProfile(true, normalizedAccessKey);
+      if (syncResult?.servers) {
+        serverPool = syncResult.servers;
+        preferredServerForAutoConnect = pickPreferredServer(syncResult.servers, currentSettings.protocolStrategy);
       }
 
       if (connectFavoriteAfterLaunch) {
@@ -1974,6 +1999,7 @@ export default function App() {
       const currentSettings = settingsRef.current;
       const currentSplitTunnelEntries = splitTunnelEntriesRef.current;
       setConnectionStateSafe('connecting');
+      await sleep(30);
       if (currentSettings.tunnelMode === 'tun' && getActiveSplitTunnelEntries(currentSplitTunnelEntries).length === 0) {
         if (previousServer?.id) {
           selectedServerIdRef.current = previousServer.id;
@@ -1998,6 +2024,8 @@ export default function App() {
         setProxyStatus(response.proxy);
       }
       setSessionDuration(0);
+      setConnectedServerId(nextServer.id);
+      connectedServerIdRef.current = nextServer.id;
       setConnectionStateSafe('connected');
       runPostConnectProbe(nextServer);
       void refreshDiagnosticsAndRuntime();
@@ -2184,10 +2212,13 @@ export default function App() {
         if (currentState === 'connected') {
           void writeNativeRoutingLog('Пользователь отключает VPN.', `${targetServer.country}, ${targetServer.city}`);
           setConnectionStateSafe('disconnecting');
+          await sleep(30);
           await remnawaveClient.disconnect({ useSystemProxy: proxyStatusRef.current.enabled || shouldUseSystemProxy(currentMode, currentSettings.useSystemProxy) });
           setVpnExternalIp('—');
           setSessionDuration(0);
           setConnectivityProbe(null);
+          setConnectedServerId('');
+          connectedServerIdRef.current = '';
           setConnectionStateSafe('idle');
           await refreshDiagnosticsAndRuntime();
           await refreshPrimaryExternalIp();
@@ -2209,6 +2240,7 @@ export default function App() {
           `${targetServer.country}, ${targetServer.city} | mode=${currentMode}`
         );
         setConnectionStateSafe('connecting');
+        await sleep(30);
         let response: ConnectResult;
         try {
           response = await remnawaveClient.connect(targetServer, {
@@ -2249,6 +2281,8 @@ export default function App() {
           setProxyStatus(response.proxy);
         }
         setSessionDuration(0);
+        setConnectedServerId(targetServer.id);
+        connectedServerIdRef.current = targetServer.id;
         setConnectionStateSafe('connected');
         runPostConnectProbe(targetServer);
         void refreshDiagnosticsAndRuntime();
@@ -2276,6 +2310,8 @@ export default function App() {
         setVpnExternalIp('—');
         setConnectivityProbe(null);
         setSessionDuration(0);
+        setConnectedServerId('');
+        connectedServerIdRef.current = '';
         setConnectionStateSafe('idle');
         await refreshDiagnosticsAndRuntime();
         await refreshPrimaryExternalIp();
@@ -2581,8 +2617,9 @@ export default function App() {
               <OverviewTab
                 connectionState={connectionState}
                 connectLabel={connectLabel}
-                selectedServer={selectedServer}
+                selectedServer={visibleSelectedServer}
                 selectedServerId={selectedServerId}
+                activeServerId={activeConnectionServerId}
                 servers={filteredServers}
                 allServerCount={servers.length}
                 searchValue={searchValue}

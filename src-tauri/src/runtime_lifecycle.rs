@@ -1,13 +1,33 @@
-fn stop_existing_runtime(app: &AppHandle, state: &tauri::State<AppState>) -> Result<(), String> {
-    let mut runtime_guard = state
-        .runtime
-        .lock()
-        .map_err(|_| "Не удалось получить доступ к runtime состоянию.".to_string())?;
+fn terminate_child_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let _ = child.kill();
+    let started_at = Instant::now();
 
-    if let Some(mut runtime) = runtime_guard.take() {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if started_at.elapsed() >= timeout {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(35));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn stop_existing_runtime(app: &AppHandle, state: &tauri::State<AppState>) -> Result<(), String> {
+    let runtime_to_stop = {
+        let mut runtime_guard = state
+            .runtime
+            .lock()
+            .map_err(|_| "Не удалось получить доступ к runtime состоянию.".to_string())?;
+        runtime_guard.take()
+    };
+
+    if let Some(mut runtime) = runtime_to_stop {
         let _ = append_runtime_event(app, "Останавливаем предыдущий Xray runtime.");
-        let _ = runtime.child.kill();
-        let status = runtime.child.wait().ok();
+        let status = terminate_child_with_timeout(&mut runtime.child, Duration::from_secs(3));
 
         if runtime.network_mode == "tun" {
             let _ = cleanup_tun_routes(
@@ -36,6 +56,44 @@ fn stop_existing_runtime(app: &AppHandle, state: &tauri::State<AppState>) -> Res
 
     Ok(())
 }
+
+#[cfg(target_os = "windows")]
+fn escape_powershell_single_quoted(value: &str) -> String {
+    value.replace("'", "''")
+}
+
+#[cfg(target_os = "windows")]
+fn stop_orphan_xray_processes(app: &AppHandle, core_path: &Path) {
+    let target = escape_powershell_single_quoted(&core_path.to_string_lossy());
+    let script = format!(
+        r#"& {{ $target = '{}'; Get-CimInstance Win32_Process -Filter "name = 'xray.exe'" | Where-Object {{ $_.ExecutablePath -and ($_.ExecutablePath -ieq $target) }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output $_.ProcessId }} }}"#,
+        target
+    );
+
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script]);
+
+    match run_command_with_timeout(command, Duration::from_secs(4), "stop orphan xray") {
+        Ok(output) => {
+            let cleaned = output.trim();
+            if !cleaned.is_empty() {
+                let _ = append_runtime_event(
+                    app,
+                    &format!("Перед новым стартом остановлены старые процессы xray.exe: {cleaned}."),
+                );
+            }
+        }
+        Err(error) => {
+            let _ = append_runtime_event(
+                app,
+                &format!("Не удалось проверить/остановить старые процессы xray.exe: {error}"),
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn stop_orphan_xray_processes(_app: &AppHandle, _core_path: &Path) {}
 
 
 fn cleanup_application(app: &AppHandle, reason: &str) {
@@ -305,7 +363,29 @@ fn write_reg_string(value_name: &str, value: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn notify_wininet_proxy_changed() {}
+fn notify_wininet_proxy_changed() {
+    use windows_sys::Win32::Networking::WinInet::{
+        InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+    };
+
+    // Registry writes alone are not enough: many Windows apps cache WinINet
+    // proxy settings. Notify the OS immediately so browsers/launchers pick up
+    // Xray proxy enable/restore without requiring an app restart.
+    unsafe {
+        let _ = InternetSetOptionW(
+            std::ptr::null_mut(),
+            INTERNET_OPTION_SETTINGS_CHANGED,
+            std::ptr::null_mut(),
+            0,
+        );
+        let _ = InternetSetOptionW(
+            std::ptr::null_mut(),
+            INTERNET_OPTION_REFRESH,
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+}
 
 #[cfg(target_os = "windows")]
 fn current_proxy_snapshot() -> Result<ProxyStatus, String> {
@@ -546,21 +626,14 @@ fn ps_quote(value: &str) -> String {
 
 fn sync_runtime_liveness(app: &AppHandle, state: &tauri::State<AppState>) {
     let mut exit_code: Option<Option<i32>> = None;
+    let mut finished_runtime: Option<ManagedCore> = None;
 
     if let Ok(mut runtime_guard) = state.runtime.lock() {
         if let Some(runtime) = runtime_guard.as_mut() {
             match runtime.child.try_wait() {
                 Ok(Some(status)) => {
                     exit_code = Some(status.code());
-                    let finished_runtime = runtime_guard.take();
-                    if let Some(runtime) = finished_runtime {
-                        if runtime.network_mode == "tun" {
-                            let _ = cleanup_tun_routes(
-                                runtime.tun_interface_name.as_deref().unwrap_or(TUN_INTERFACE_NAME),
-                                runtime.tun_server_ip.as_deref(),
-                            );
-                        }
-                    }
+                    finished_runtime = runtime_guard.take();
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -571,6 +644,16 @@ fn sync_runtime_liveness(app: &AppHandle, state: &tauri::State<AppState>) {
                 }
             }
         }
+    }
+
+    if let Some(runtime) = finished_runtime {
+        if runtime.network_mode == "tun" {
+            let _ = cleanup_tun_routes(
+                runtime.tun_interface_name.as_deref().unwrap_or(TUN_INTERFACE_NAME),
+                runtime.tun_server_ip.as_deref(),
+            );
+        }
+        let _ = fs::remove_file(Path::new(&runtime.config_path));
     }
 
     if let Some(code) = exit_code {

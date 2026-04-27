@@ -95,6 +95,24 @@ function maybeNumber(value: unknown): number | undefined {
   return undefined;
 }
 
+function maybeBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'number') {
+    return value === 1 ? true : value === 0 ? false : undefined;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['true', '1', 'yes', 'active', 'enabled'].includes(normalized)) return true;
+    if (['false', '0', 'no', 'inactive', 'disabled', 'blocked', 'expired'].includes(normalized)) return false;
+  }
+
+  return undefined;
+}
+
 function readPath(source: unknown, path: string): unknown {
   const parts = path.split('.');
   let current: unknown = source;
@@ -117,6 +135,104 @@ function pickValue(source: unknown, paths: string[]) {
     }
   }
   return undefined;
+}
+
+function parseExpiryTimestamp(value: unknown): number | null {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const millis = value > 10_000_000_000 ? value : value * 1000;
+    return Number.isFinite(millis) ? millis : null;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) {
+      return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+    }
+    const date = new Date(trimmed);
+    return Number.isNaN(date.getTime()) ? null : date.getTime();
+  }
+
+  return null;
+}
+
+function assertUsableSubscriptionPayload(payload: unknown) {
+  const status = maybeString(pickValue(payload, [
+    'response.status',
+    'response.user.status',
+    'response.subscription.status',
+    'status',
+    'user.status'
+  ]))?.toLowerCase();
+
+  if (status && ['disabled', 'blocked', 'expired', 'limited', 'inactive'].some((item) => status.includes(item))) {
+    throw new Error('Ключ найден, но подписка не активна. Проверьте оплату/статус в личном кабинете.');
+  }
+
+  const disabled = maybeBoolean(pickValue(payload, [
+    'response.disabled',
+    'response.isDisabled',
+    'response.user.disabled',
+    'response.user.isDisabled',
+    'response.subscription.disabled',
+    'disabled',
+    'isDisabled'
+  ]));
+  if (disabled === true) {
+    throw new Error('Ключ найден, но подписка отключена в Remnawave.');
+  }
+
+  const active = maybeBoolean(pickValue(payload, [
+    'response.active',
+    'response.isActive',
+    'response.user.active',
+    'response.user.isActive',
+    'response.subscription.active',
+    'active',
+    'isActive'
+  ]));
+  if (active === false) {
+    throw new Error('Ключ найден, но профиль Remnawave не активен.');
+  }
+
+  const expiryMs = parseExpiryTimestamp(pickValue(payload, [
+    'response.expireAt',
+    'response.expiresAt',
+    'response.expiryAt',
+    'response.expiryDate',
+    'response.expire',
+    'response.expiredAt',
+    'response.expirationDate',
+    'response.subscription.expireAt',
+    'response.subscription.expiresAt',
+    'response.subscription.expiryAt',
+    'response.subscription.expiryDate',
+    'response.subscription.expire',
+    'response.subscription.expiredAt',
+    'response.subscription.expirationDate',
+    'response.user.expireAt',
+    'response.user.expiresAt',
+    'response.user.expiryAt',
+    'response.user.expiryDate',
+    'response.user.expire',
+    'response.user.expiredAt',
+    'response.user.expirationDate',
+    'expireAt',
+    'expiresAt',
+    'expiryAt',
+    'expiryDate',
+    'expiredAt',
+    'expirationDate'
+  ]));
+
+  if (expiryMs !== null && expiryMs <= Date.now()) {
+    throw new Error('Срок действия ключа истёк. Обновите подписку и войдите снова.');
+  }
 }
 
 function formatDate(value: unknown) {
@@ -456,6 +572,8 @@ function mapSessionFromPayload(
   source: RemnawaveSource,
   infoUrl: string
 ): RemnawaveSession {
+  assertUsableSubscriptionPayload(payload);
+
   const displayName = maybeString(pickValue(payload, [
     'response.user.username',
     'response.username',
@@ -652,23 +770,11 @@ export class RemnawaveClient {
       return demoSession;
     }
 
-    if (key.kind === 'url') {
-      try {
-        const rawProbe = await fetchTextCandidates(buildRawCandidates(key, provisionalSession));
-        const importedServers = parseSubscriptionToServers(rawProbe.value);
-        if (importedServers.length) {
-          this.cachedServers = importedServers;
-          this.cachedSession = provisionalSession;
-          this.cachedDevices = [buildLocalDeviceRecord()];
-          return provisionalSession;
-        }
-      } catch {
-        // Fallback to JSON-based profile resolution below.
-      }
-    }
+    // Авторизация больше не считается успешной только по raw subscription.
+    // Raw-профиль используется ниже только для синхронизации серверов после проверки info/profile endpoint.
 
     try {
-      const result = await fetchJsonCandidates(candidates.slice(0, 4));
+      const result = await fetchJsonCandidates(candidates);
       const source: RemnawaveSource = result.url.includes('/api/sub/') ? 'public-api' : 'panel-api';
       const session = mapSessionFromPayload(accessKey, key, result.value, source, result.url);
       this.cachedSession = session;
@@ -845,6 +951,16 @@ export class RemnawaveClient {
           proxy
         };
       } catch (error) {
+        // Даже если native connect завис/упал до ответа, пробуем остановить Xray,
+        // чтобы не оставить сиротский процесс и включённый proxy/TUN после ошибки.
+        try {
+          await requestNativeDisconnect();
+        } catch {
+          window.setTimeout(() => {
+            void requestNativeDisconnect().catch(() => undefined);
+          }, 1200);
+        }
+
         if (systemProxyEnabled) {
           try {
             await setNativeSystemProxy(false);

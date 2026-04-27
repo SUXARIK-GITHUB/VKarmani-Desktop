@@ -98,7 +98,8 @@ fn build_xray_config(
             },
             "sniffing": {
                 "enabled": true,
-                "destOverride": ["http", "tls", "quic"]
+                "destOverride": ["http", "tls", "quic"],
+                "routeOnly": true
             }
         }),
         json!({
@@ -109,7 +110,8 @@ fn build_xray_config(
             "settings": {},
             "sniffing": {
                 "enabled": true,
-                "destOverride": ["http", "tls"]
+                "destOverride": ["http", "tls"],
+                "routeOnly": true
             }
         }),
         json!({
@@ -136,12 +138,13 @@ fn build_xray_config(
             "protocol": "tun",
             "settings": {
                 "name": TUN_INTERFACE_NAME,
-                "MTU": 1500,
+                "MTU": 1400,
                 "userLevel": 0
             },
             "sniffing": {
                 "enabled": true,
-                "destOverride": ["http", "tls", "quic"]
+                "destOverride": ["http", "tls", "quic"],
+                "routeOnly": true
             }
         }));
 

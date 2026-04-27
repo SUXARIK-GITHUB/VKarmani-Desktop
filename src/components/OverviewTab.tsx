@@ -16,13 +16,15 @@ import {
 } from 'lucide-react';
 import { tr, type UiLanguage } from '../i18n';
 import type { ConnectionState, TunnelMode, VpnServer } from '../types/vpn';
-import { getServerPrimaryLabel, getServerSecondaryLabel, resolveServerFlag } from '../utils/serverDisplay';
+import { ServerFlag } from './ServerFlag';
+import { getServerPrimaryLabel, getServerSecondaryLabel } from '../utils/serverDisplay';
 
 interface OverviewTabProps {
   connectionState: ConnectionState;
   connectLabel: string;
   selectedServer: VpnServer | null;
   selectedServerId: string;
+  activeServerId?: string;
   servers: VpnServer[];
   allServerCount: number;
   searchValue: string;
@@ -104,6 +106,7 @@ export function OverviewTab({
   connectLabel,
   selectedServer,
   selectedServerId,
+  activeServerId,
   servers,
   allServerCount,
   searchValue,
@@ -134,7 +137,6 @@ export function OverviewTab({
   onOpenSplitTunnel
 }: OverviewTabProps) {
   const isConnected = connectionState === 'connected';
-  const flag = selectedServer ? resolveServerFlag(selectedServer) : '🌐';
   const selectedName = selectedServer ? getServerPrimaryLabel(selectedServer) : tr(language, 'Сервер не выбран', 'No server selected');
   const selectedMeta = selectedServer
     ? getServerSecondaryLabel(selectedServer, showDiagnostics)
@@ -163,7 +165,7 @@ export function OverviewTab({
         </div>
 
         <div className="vk-hero-server">
-          <span className="vk-flag-large">{flag}</span>
+          <span className="vk-flag-large"><ServerFlag server={selectedServer} size="large" /></span>
           <div className="vk-hero-server-copy">
             <strong>{selectedName}</strong>
             <span>{selectedMeta} · {selectedProtocol}</span>
@@ -192,21 +194,26 @@ export function OverviewTab({
 
         <div className="vk-server-list">
           {servers.map((server) => {
-            const active = server.id === selectedServerId;
+            const active = server.id === (activeServerId || selectedServerId);
             const isFavorite = favoriteServerIdSet.has(server.id);
             const serverPingChecking = checkingPingServerIdSet.has(server.id);
             return (
               <div
                 key={server.id}
                 className={`vk-server-row ${active ? 'active' : ''}`}
+                role="button"
+                tabIndex={0}
+                aria-pressed={active}
+                onClick={() => onSelectServer(server.id)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    onSelectServer(server.id);
+                  }
+                }}
               >
-                <button
-                  type="button"
-                  className="vk-server-select-button"
-                  onClick={() => onSelectServer(server.id)}
-                  aria-pressed={active}
-                >
-                  <span className="vk-server-flag">{resolveServerFlag(server)}</span>
+                <span className="vk-server-select-button">
+                  <span className="vk-server-flag"><ServerFlag server={server} /></span>
                   <span className="vk-server-copy">
                     <strong>{getServerPrimaryLabel(server)}</strong>
                     <small>{getProtocolLabel(server)}</small>
@@ -216,13 +223,16 @@ export function OverviewTab({
                     <Signal size={20} />
                     <strong className={latencyTone(server, serverPingChecking)}>{formatLatency(server, language, serverPingChecking)}</strong>
                   </span>
-                </button>
+                </span>
                 <button
                   type="button"
                   className={`vk-favorite-star ${isFavorite ? 'active' : ''}`}
                   aria-label={isFavorite ? tr(language, 'Убрать из избранного', 'Remove from favorites') : tr(language, 'Добавить в избранное', 'Add to favorites')}
                   title={isFavorite ? tr(language, 'Убрать из избранного', 'Remove from favorites') : tr(language, 'Добавить в избранное', 'Add to favorites')}
-                  onClick={() => onToggleFavoriteServer(server.id)}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onToggleFavoriteServer(server.id);
+                  }}
                 >
                   <Star size={21} fill={isFavorite ? 'currentColor' : 'none'} />
                 </button>
@@ -270,8 +280,16 @@ export function OverviewTab({
             ))}
           </div>
           <div className="vk-traffic-stats">
-            <span><ArrowDown size={20} />{tr(language, 'Получено', 'Received')}<strong>{trafficReceivedText}</strong></span>
-            <span><ArrowUp size={20} />{tr(language, 'Отправлено', 'Sent')}<strong>{trafficSentText}</strong></span>
+            <div className="vk-traffic-stat">
+              <ArrowDown size={18} />
+              <span className="vk-traffic-stat-label">{tr(language, 'Получено', 'Received')}</span>
+              <strong className="vk-traffic-stat-value">{trafficReceivedText}</strong>
+            </div>
+            <div className="vk-traffic-stat">
+              <ArrowUp size={18} />
+              <span className="vk-traffic-stat-label">{tr(language, 'Отправлено', 'Sent')}</span>
+              <strong className="vk-traffic-stat-value">{trafficSentText}</strong>
+            </div>
           </div>
         </article>
 

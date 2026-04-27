@@ -144,4 +144,33 @@ describe('Remnawave subscription parser', () => {
     expect(__remnawaveTest.parseSubscriptionToServers('not-a-link')).toHaveLength(0);
     expect(__remnawaveTest.parsePort('70000', 443)).toBe(443);
   });
+
+  it('keeps server ids stable when subscription order changes', () => {
+    const first = `vless://${uuid}@first.example.com:443?security=tls&sni=first.example.com&type=tcp#NL%20First`;
+    const second = `trojan://secret@second.example.com:443?security=tls&sni=second.example.com&type=tcp#US%20Second`;
+
+    const original = __remnawaveTest.parseSubscriptionToServers(`${first}\n${second}`);
+    const reordered = __remnawaveTest.parseSubscriptionToServers(`${second}\n${first}`);
+
+    expect(original.find((server) => server.host === 'first.example.com')?.id)
+      .toBe(reordered.find((server) => server.host === 'first.example.com')?.id);
+    expect(original.find((server) => server.host === 'second.example.com')?.id)
+      .toBe(reordered.find((server) => server.host === 'second.example.com')?.id);
+  });
+
+  it('rejects incomplete VLESS, Reality, VMess, Trojan, Shadowsocks and Hysteria2 links', () => {
+    const invalidLinks = [
+      'vless://not-a-uuid@broken.example.com:443?security=tls#Broken',
+      `vless://${uuid}@reality-broken.example.com:443?security=reality&sni=reality-broken.example.com#RealityNoPublicKey`,
+      `vless://${uuid}@bad-port.example.com:70000?security=tls#BadPort`,
+      `vmess://${base64Url(JSON.stringify({ v: '2', ps: 'No host', port: 443, id: uuid, net: 'tcp' }))}`,
+      `vmess://${base64Url(JSON.stringify({ v: '2', ps: 'Bad UUID', add: 'vmess.example.com', port: 443, id: 'bad', net: 'tcp' }))}`,
+      'trojan://@trojan.example.com:443?security=tls#NoPassword',
+      'ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNQ@ss.example.com:8388#NoPassword',
+      'hy2://@hy2.example.com:443?sni=hy2.example.com#NoPassword'
+    ];
+
+    expect(__remnawaveTest.parseSubscriptionToServers(invalidLinks.join('\n'))).toHaveLength(0);
+  });
+
 });

@@ -106,6 +106,52 @@ const COUNTRY_NAME_TO_CODE: Record<string, string> = {
   belgium: 'BE'
 };
 
+const COUNTRY_CODE_TO_NAME: Record<string, string> = {
+  NL: 'Netherlands',
+  DE: 'Germany',
+  RU: 'Russia',
+  US: 'United States',
+  GB: 'United Kingdom',
+  FR: 'France',
+  ES: 'Spain',
+  IT: 'Italy',
+  PL: 'Poland',
+  CH: 'Switzerland',
+  AT: 'Austria',
+  SE: 'Sweden',
+  NO: 'Norway',
+  FI: 'Finland',
+  DK: 'Denmark',
+  CZ: 'Czechia',
+  SK: 'Slovakia',
+  RO: 'Romania',
+  BG: 'Bulgaria',
+  HU: 'Hungary',
+  TR: 'Turkey',
+  UA: 'Ukraine',
+  LT: 'Lithuania',
+  LV: 'Latvia',
+  EE: 'Estonia',
+  CA: 'Canada',
+  BR: 'Brazil',
+  AR: 'Argentina',
+  JP: 'Japan',
+  KR: 'South Korea',
+  SG: 'Singapore',
+  HK: 'Hong Kong',
+  IN: 'India',
+  AE: 'United Arab Emirates',
+  IL: 'Israel',
+  AU: 'Australia',
+  NZ: 'New Zealand',
+  CN: 'China',
+  KZ: 'Kazakhstan',
+  GE: 'Georgia',
+  MD: 'Moldova',
+  PT: 'Portugal',
+  BE: 'Belgium'
+};
+
 function normalizeCountryKey(value: string) {
   return value
     .normalize('NFKD')
@@ -207,37 +253,88 @@ export function inferCountryCode({
   return undefined;
 }
 
+export function getServerCountryCode(server: {
+  country?: string | null;
+  countryCode?: string | null;
+  rawLabel?: string | null;
+  host?: string | null;
+  flag?: string | null;
+}) {
+  const normalizedFlag = server.flag?.trim();
+
+  if (normalizedFlag && /^[A-Z]{2}$/i.test(normalizedFlag)) {
+    return normalizedFlag.toUpperCase();
+  }
+
+  const flagCode = normalizedFlag?.match(FLAG_RE)?.[0];
+  const codeFromFlag = flagCode ? flagEmojiToCountryCode(flagCode) : undefined;
+  if (codeFromFlag) {
+    return codeFromFlag;
+  }
+
+  return inferCountryCode({
+    country: server.country,
+    rawLabel: server.rawLabel,
+    host: server.host,
+    explicitCode: server.countryCode
+  });
+}
+
 export function resolveServerFlag({
   flag,
   country,
+  countryCode,
   rawLabel,
   host,
   explicitCode
 }: {
   flag?: string | null;
   country?: string | null;
+  countryCode?: string | null;
   rawLabel?: string | null;
   host?: string | null;
   explicitCode?: string | null;
 }) {
   const normalizedFlag = flag?.trim();
+
   if (normalizedFlag && normalizedFlag !== '🌐') {
-    return normalizedFlag;
+    if (/^[A-Z]{2}$/i.test(normalizedFlag)) {
+      return flagEmojiFromCountryCode(normalizedFlag.toUpperCase());
+    }
+
+    const flagCode = normalizedFlag.match(FLAG_RE)?.[0];
+    if (flagCode) {
+      return flagCode;
+    }
   }
 
-  const countryCode = inferCountryCode({ country, rawLabel, host, explicitCode });
-  return flagEmojiFromCountryCode(countryCode);
+  const code = countryCode || explicitCode;
+  const countryCodeResolved = inferCountryCode({ country, rawLabel, host, explicitCode: code });
+  return flagEmojiFromCountryCode(countryCodeResolved);
 }
 
 export function getServerPrimaryLabel(server: {
   flag?: string | null;
   country?: string | null;
+  countryCode?: string | null;
   rawLabel?: string | null;
   host?: string | null;
 }) {
-  const resolvedFlag = resolveServerFlag(server);
   const country = server.country?.trim() || 'VKarmani';
-  return `${resolvedFlag} ${country}`.trim();
+  const countryCode = getServerCountryCode(server);
+
+  if (/^[A-Z]{2}$/i.test(country)) {
+    return COUNTRY_CODE_TO_NAME[country.toUpperCase()] || country.toUpperCase();
+  }
+
+  if (countryCode) {
+    const withoutPrefix = country.replace(new RegExp(`^${countryCode}\\s+`, 'i'), '').trim();
+    if (withoutPrefix) {
+      return withoutPrefix;
+    }
+  }
+
+  return country;
 }
 
 export function getServerSecondaryLabel(
@@ -267,6 +364,7 @@ export function getServerDisplayLabel(
   server: {
     flag?: string | null;
     country?: string | null;
+    countryCode?: string | null;
     city?: string | null;
     rawLabel?: string | null;
     host?: string | null;

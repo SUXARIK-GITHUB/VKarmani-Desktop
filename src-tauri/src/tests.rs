@@ -74,5 +74,20 @@ mod tests {
         assert_eq!(status.bypass.as_deref(), Some("<local>"));
         assert!(proxy_snapshot_points_to_runtime(&status));
     }
-}
+    #[test]
+    fn split_tunnel_path_rule_expands_to_process_name_candidates() {
+        let candidates = process_match_candidates(r#"C:\Program Files\Telegram Desktop\Telegram.exe"#);
+        assert!(candidates.iter().any(|item| item.ends_with("Telegram.exe")));
+        assert!(candidates.iter().any(|item| item.eq_ignore_ascii_case("Telegram.exe")));
+        assert!(candidates.iter().any(|item| item.eq_ignore_ascii_case("Telegram")));
+    }
 
+    #[test]
+    fn split_tunnel_quoted_command_keeps_only_executable() {
+        let candidates = process_match_candidates(r#""C:\Program Files\App\app.exe" --flag --profile test"#);
+        assert!(candidates.iter().any(|item| item.eq_ignore_ascii_case("app.exe")));
+        assert!(candidates.iter().any(|item| item.eq_ignore_ascii_case("app")));
+        assert!(!candidates.iter().any(|item| item.contains("--flag")));
+    }
+
+}

@@ -50,6 +50,7 @@ export interface VpnServer {
   id: string;
   country: string;
   city: string;
+  countryCode?: string;
   flag: string;
   latency?: number | null;
   latencyCheckedAt?: string;

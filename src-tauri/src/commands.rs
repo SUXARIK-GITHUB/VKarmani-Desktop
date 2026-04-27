@@ -17,7 +17,13 @@ fn write_routing_log(message: String, details: Option<String>, app: AppHandle) -
 }
 
 #[tauri::command]
-fn public_ip_snapshot(mode: Option<String>) -> Result<String, String> {
+async fn public_ip_snapshot(mode: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || public_ip_snapshot_blocking(mode))
+        .await
+        .map_err(|error| format!("Проверка внешнего IP была прервана: {error}"))?
+}
+
+fn public_ip_snapshot_blocking(mode: Option<String>) -> Result<String, String> {
     let normalized_mode = mode.unwrap_or_else(|| "direct".to_string()).to_lowercase();
 
     if normalized_mode == "runtime" {
@@ -235,20 +241,141 @@ fn set_session_authorized(authorized: bool, state: tauri::State<AppState>, app: 
 }
 
 #[tauri::command]
-fn runtime_status(app: AppHandle, state: tauri::State<AppState>) -> RuntimeStatus {
-    build_runtime_status(&app, state)
+async fn runtime_status(app: AppHandle) -> RuntimeStatus {
+    let app_for_task = app.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_task.state::<AppState>();
+        build_runtime_status(&app_for_task, state)
+    })
+    .await
+    {
+        Ok(status) => status,
+        Err(_) => {
+            let state = app.state::<AppState>();
+            build_runtime_status(&app, state)
+        }
+    }
+}
+
+fn wait_for_xray_runtime_ready(
+    app: &AppHandle,
+    state: &tauri::State<AppState>,
+    child: &mut Child,
+    log_path: &Path,
+    core_working_dir: &Path,
+    network_mode: &str,
+) -> Result<(), String> {
+    let timeout = if network_mode == "tun" {
+        Duration::from_millis(6500)
+    } else {
+        Duration::from_millis(4500)
+    };
+    let started_at = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("Не удалось проверить статус Xray-core: {error}"))?
+        {
+            let code = status.code();
+            if let Ok(mut exit_guard) = state.last_exit_code.lock() {
+                *exit_guard = code;
+            }
+            let log_excerpt = read_runtime_log_excerpt(log_path, 8);
+            let joined_excerpt = log_excerpt.join(" | ");
+            let _ = append_runtime_event(
+                app,
+                &format!("Xray-core завершился сразу после старта. Exit code: {:?}", code),
+            );
+
+            if joined_excerpt.to_ascii_lowercase().contains("wintun.dll") {
+                return Err(format!(
+                    "Xray-core не смог запустить TUN: отсутствует или не загружается wintun.dll рядом с xray.exe. Проверьте {}.",
+                    core_working_dir.display()
+                ));
+            }
+
+            if !joined_excerpt.is_empty() {
+                return Err(format!(
+                    "Xray-core завершился сразу после запуска. Exit code: {:?}. Последние строки xray-runtime.log: {}",
+                    code,
+                    joined_excerpt
+                ));
+            }
+
+            return Err(format!(
+                "Xray-core завершился сразу после запуска. Exit code: {:?}. Проверьте xray-runtime.log.",
+                code
+            ));
+        }
+
+        let http_ready = tcp_port_open("127.0.0.1", HTTP_PORT, 80);
+        let socks_ready = tcp_port_open("127.0.0.1", SOCKS_PORT, 80);
+        let api_ready = tcp_port_open("127.0.0.1", XRAY_API_PORT, 80);
+        let ports_state = format!("http={http_ready} socks={socks_ready} api={api_ready}");
+
+        if http_ready && socks_ready && api_ready {
+            let _ = append_runtime_event(app, &format!("Xray локальные порты готовы: {ports_state}."));
+            return Ok(());
+        }
+
+        if started_at.elapsed() >= timeout {
+            let log_excerpt = read_runtime_log_excerpt(log_path, 8).join(" | ");
+            let details = if log_excerpt.is_empty() {
+                "Лог Xray пока пуст.".to_string()
+            } else {
+                format!("Последние строки xray-runtime.log: {log_excerpt}")
+            };
+            return Err(format!(
+                "Xray запущен, но локальные порты не стали готовы за {} мс ({ports_state}). {details}",
+                timeout.as_millis()
+            ));
+        }
+
+        std::thread::sleep(Duration::from_millis(90));
+    }
 }
 
 #[tauri::command]
-fn request_connect(
+async fn request_connect(
     server_id: String,
     server_label: String,
     runtime_template: RuntimeTemplate,
     network_mode: Option<String>,
     split_tunnel_entries: Option<Vec<SplitTunnelEntryPayload>>,
-    state: tauri::State<AppState>,
     app: AppHandle,
 ) -> Result<RuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        request_connect_blocking(
+            server_id,
+            server_label,
+            runtime_template,
+            network_mode,
+            split_tunnel_entries,
+            app,
+        )
+    })
+    .await
+    .map_err(|error| format!("Подключение Xray было прервано: {error}"))?
+}
+
+fn request_connect_blocking(
+    server_id: String,
+    server_label: String,
+    runtime_template: RuntimeTemplate,
+    network_mode: Option<String>,
+    split_tunnel_entries: Option<Vec<SplitTunnelEntryPayload>>,
+    app: AppHandle,
+) -> Result<RuntimeStatus, String> {
+    let state = app.state::<AppState>();
+    let authorized = state
+        .session_authorized
+        .lock()
+        .map_err(|_| "Не удалось проверить состояние авторизации.".to_string())
+        .map(|guard| *guard)?;
+    if !authorized {
+        return Err("Сначала войдите по ключу VKarmani, затем запускайте подключение.".into());
+    }
+
     if runtime_template.family.to_lowercase() != "xray" {
         return Err("Сейчас поддерживается только Xray runtime family.".into());
     }
@@ -291,6 +418,7 @@ fn request_connect(
     }
 
     stop_existing_runtime(&app, &state)?;
+    stop_orphan_xray_processes(&app, &core_path);
     ensure_runtime_ports_available()?;
 
     let output_dir = runtime_output_dir(&app)?;
@@ -410,6 +538,8 @@ fn request_connect(
     let mut command = Command::new(&core_path);
     command
         .current_dir(core_working_dir)
+        .env("XRAY_LOCATION_ASSET", core_working_dir)
+        .env("XRAY_LOCATION_CONFIG", &output_dir)
         .arg("run")
         .arg("-config")
         .arg(&config_path)
@@ -422,48 +552,19 @@ fn request_connect(
         .spawn()
         .map_err(|error| format_xray_spawn_error(&error, &core_path))?;
 
-    std::thread::sleep(Duration::from_millis(350));
-    if let Some(status) = child
-        .try_wait()
-        .map_err(|error| format!("Не удалось проверить статус Xray-core: {error}"))?
-    {
-        let code = status.code();
-        if let Ok(mut exit_guard) = state.last_exit_code.lock() {
-            *exit_guard = code;
-        }
-        let log_excerpt = read_runtime_log_excerpt(&log_path, 8);
-        let joined_excerpt = log_excerpt.join(" | ");
-        let _ = append_runtime_event(
-            &app,
-            &format!("Xray-core завершился сразу после старта. Exit code: {:?}", code),
-        );
-
-        if joined_excerpt.to_ascii_lowercase().contains("wintun.dll") {
-            return Err(format!(
-                "Xray-core не смог запустить TUN: отсутствует или не загружается wintun.dll рядом с xray.exe. Проверьте {}.",
-                core_working_dir.display()
-            ));
-        }
-
-        if !joined_excerpt.is_empty() {
-            return Err(format!(
-                "Xray-core завершился сразу после запуска. Exit code: {:?}. Последние строки xray-runtime.log: {}",
-                code,
-                joined_excerpt
-            ));
-        }
-
-        return Err(format!(
-            "Xray-core завершился сразу после запуска. Exit code: {:?}. Проверьте xray-runtime.log.",
-            code
-        ));
-    }
+    wait_for_xray_runtime_ready(
+        &app,
+        &state,
+        &mut child,
+        &log_path,
+        core_working_dir,
+        &normalized_network_mode,
+    )?;
 
     if normalized_network_mode == "tun" {
         configure_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref()).map_err(|error| {
             let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref());
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
             format!("Не удалось подготовить Windows-маршруты для TUN режима: {error}")
         })?;
         let _ = append_runtime_event(&app, "TUN маршруты применены для текущего сеанса.");
@@ -512,7 +613,14 @@ fn request_connect(
 }
 
 #[tauri::command]
-fn request_disconnect(state: tauri::State<AppState>, app: AppHandle) -> Result<RuntimeStatus, String> {
+async fn request_disconnect(app: AppHandle) -> Result<RuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || request_disconnect_blocking(app))
+        .await
+        .map_err(|error| format!("Отключение Xray было прервано: {error}"))?
+}
+
+fn request_disconnect_blocking(app: AppHandle) -> Result<RuntimeStatus, String> {
+    let state = app.state::<AppState>();
     let _operation_guard = state
         .operation_lock
         .try_lock()
@@ -668,12 +776,21 @@ fn set_launch_on_startup(enabled: bool, app: AppHandle) -> Result<bool, String> 
     }
 }
 #[tauri::command]
-fn proxy_status() -> Result<ProxyStatus, String> {
-    current_proxy_snapshot()
+async fn proxy_status() -> Result<ProxyStatus, String> {
+    tauri::async_runtime::spawn_blocking(current_proxy_snapshot)
+        .await
+        .map_err(|error| format!("Проверка Windows proxy была прервана: {error}"))?
 }
 
 #[tauri::command]
-fn set_system_proxy(enabled: bool, app: AppHandle, state: tauri::State<AppState>) -> Result<ProxyStatus, String> {
+async fn set_system_proxy(enabled: bool, app: AppHandle) -> Result<ProxyStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || set_system_proxy_blocking(enabled, app))
+        .await
+        .map_err(|error| format!("Изменение Windows proxy было прервано: {error}"))?
+}
+
+fn set_system_proxy_blocking(enabled: bool, app: AppHandle) -> Result<ProxyStatus, String> {
+    let state = app.state::<AppState>();
     let _operation_guard = state
         .operation_lock
         .try_lock()
@@ -714,7 +831,13 @@ fn set_system_proxy(enabled: bool, app: AppHandle, state: tauri::State<AppState>
 
 
 #[tauri::command]
-fn connectivity_probe() -> Result<ConnectivityProbe, String> {
+async fn connectivity_probe() -> Result<ConnectivityProbe, String> {
+    tauri::async_runtime::spawn_blocking(connectivity_probe_blocking)
+        .await
+        .map_err(|error| format!("Проверка маршрута была прервана: {error}"))?
+}
+
+fn connectivity_probe_blocking() -> Result<ConnectivityProbe, String> {
     let checked_at = unix_now_string();
     let http_port_open = tcp_port_open("127.0.0.1", HTTP_PORT, 1200);
     let socks_port_open = tcp_port_open("127.0.0.1", SOCKS_PORT, 1200);
@@ -995,7 +1118,7 @@ fn query_xray_stat(core_path: &str, stat_name: &str) -> Result<u64, String> {
         .arg("-name")
         .arg(stat_name);
 
-    let output = run_command_with_timeout(command, Duration::from_secs(3), "xray api statsquery")?;
+    let output = run_command_with_timeout(command, Duration::from_millis(1400), "xray api statsquery")?;
     // Xray can omit a stat until the first bytes pass through it. Treat a missing
     // value as zero instead of falling back to "unavailable", otherwise the UI
     // never starts showing proxy traffic on fresh connections.
@@ -1003,6 +1126,10 @@ fn query_xray_stat(core_path: &str, stat_name: &str) -> Result<u64, String> {
 }
 
 fn runtime_xray_stats_snapshot(state: &tauri::State<AppState>) -> Option<TrafficSnapshot> {
+    if !tcp_port_open("127.0.0.1", XRAY_API_PORT, 120) {
+        return None;
+    }
+
     let core_path = state
         .runtime
         .lock()
@@ -1052,7 +1179,14 @@ fn windows_tun_traffic_snapshot() -> Option<TrafficSnapshot> {
 }
 
 #[tauri::command]
-fn traffic_snapshot(state: tauri::State<AppState>) -> Result<TrafficSnapshot, String> {
+async fn traffic_snapshot(app: AppHandle) -> Result<TrafficSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || traffic_snapshot_blocking(app))
+        .await
+        .map_err(|error| format!("Получение статистики трафика было прервано: {error}"))?
+}
+
+fn traffic_snapshot_blocking(app: AppHandle) -> Result<TrafficSnapshot, String> {
+    let state = app.state::<AppState>();
     if let Some(snapshot) = runtime_xray_stats_snapshot(&state) {
         return Ok(snapshot);
     }
@@ -1117,8 +1251,135 @@ fn parse_tasklist_process_list(raw: &str) -> Vec<RunningAppInfo> {
 }
 
 #[cfg(target_os = "windows")]
-#[tauri::command]
-fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
+fn parse_powershell_process_list(raw: &str) -> Vec<RunningAppInfo> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let parsed: Value = match serde_json::from_str(trimmed) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+
+    let rows = match parsed {
+        Value::Array(items) => items,
+        other @ Value::Object(_) => vec![other],
+        _ => Vec::new(),
+    };
+
+    rows.into_iter()
+        .filter_map(|item| {
+            let pid = item.get("pid").and_then(Value::as_u64)? as u32;
+            let name = item.get("name").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+            if name.is_empty() || !name.to_lowercase().ends_with(".exe") {
+                return None;
+            }
+
+            let path = item
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+
+            Some(RunningAppInfo { pid, name, path, title })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn dedupe_and_limit_running_apps(apps: Vec<RunningAppInfo>, limit: usize) -> Vec<RunningAppInfo> {
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut unique = apps
+        .into_iter()
+        .filter(|app| !app.name.trim().is_empty())
+        .filter(|app| {
+            let key = app
+                .path
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.to_lowercase())
+                .unwrap_or_else(|| format!("{}:{}", app.name.to_lowercase(), app.pid));
+            seen.insert(key)
+        })
+        .collect::<Vec<_>>();
+
+    unique.sort_by(|left, right| {
+        let left_has_path = left.path.as_ref().map(|value| !value.is_empty()).unwrap_or(false);
+        let right_has_path = right.path.as_ref().map(|value| !value.is_empty()).unwrap_or(false);
+        let left_has_title = left.title.as_ref().map(|value| !value.is_empty()).unwrap_or(false);
+        let right_has_title = right.title.as_ref().map(|value| !value.is_empty()).unwrap_or(false);
+
+        right_has_title
+            .cmp(&left_has_title)
+            .then_with(|| right_has_path.cmp(&left_has_path))
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+
+    unique.truncate(limit);
+    unique
+}
+
+#[cfg(target_os = "windows")]
+fn list_running_apps_blocking() -> Result<Vec<RunningAppInfo>, String> {
+    let powershell_script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$currentUser = $currentIdentity
+if ($currentIdentity.Contains('\')) { $currentUser = $currentIdentity.Split('\', 2)[1] }
+$currentSession = (Get-Process -Id $PID).SessionId
+$seen = @{}
+$items = New-Object System.Collections.Generic.List[object]
+Get-CimInstance Win32_Process | ForEach-Object {
+  $name = [string]$_.Name
+  $isExe = -not [string]::IsNullOrWhiteSpace($name) -and $name.ToLowerInvariant().EndsWith('.exe')
+  if ($isExe) {
+    $ownerUser = ''
+    try {
+      $owner = $_ | Invoke-CimMethod -MethodName GetOwner
+      if ($owner -and $owner.User) { $ownerUser = [string]$owner.User }
+    } catch {}
+
+    $sameUser = -not [string]::IsNullOrWhiteSpace($ownerUser) -and ($ownerUser -ieq $currentUser)
+    $sameSession = $_.SessionId -eq $currentSession
+    if ($sameUser -or $sameSession) {
+      $path = [string]$_.ExecutablePath
+      $title = ''
+      try { $title = [string](Get-Process -Id $_.ProcessId -ErrorAction Stop).MainWindowTitle } catch {}
+
+      $key = "$($_.ProcessId)|$name|$path"
+      if (-not $seen.ContainsKey($key)) {
+        $seen[$key] = $true
+        $items.Add([PSCustomObject]@{
+          pid = [UInt32]$_.ProcessId
+          name = $name
+          path = $path
+          title = $title
+        }) | Out-Null
+      }
+    }
+  }
+}
+$items | Sort-Object @{Expression={ if ([string]::IsNullOrWhiteSpace($_.title)) { 1 } else { 0 } }}, name, pid | ConvertTo-Json -Compress -Depth 3
+"#;
+
+    let mut powershell = Command::new("powershell");
+    powershell.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", powershell_script]);
+    if let Ok(raw) = run_command_with_timeout(powershell, Duration::from_secs(7), "powershell user process list") {
+        let apps = parse_powershell_process_list(&raw);
+        if !apps.is_empty() {
+            return Ok(dedupe_and_limit_running_apps(apps, 200));
+        }
+    }
+
     let mut wmic = Command::new("wmic");
     wmic.args(["process", "where", "ExecutablePath is not null", "get", "ProcessId,Name,ExecutablePath", "/FORMAT:CSV"]);
     let raw = run_command_with_timeout(wmic, Duration::from_secs(5), "wmic process list");
@@ -1133,11 +1394,20 @@ fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
         }
     };
 
-    Ok(apps.into_iter().filter(|app| !app.name.trim().is_empty()).take(80).collect())
+    Ok(dedupe_and_limit_running_apps(apps, 200))
 }
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
+    tauri::async_runtime::spawn_blocking(list_running_apps_blocking)
+        .await
+        .map_err(|error| format!("Получение списка приложений было прервано: {error}"))?
+}
+
 #[cfg(not(target_os = "windows"))]
 #[tauri::command]
-fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
+async fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
     Ok(Vec::new())
 }
 

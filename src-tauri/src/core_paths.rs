@@ -621,8 +621,34 @@ fn strip_windows_exe_suffix(value: &str) -> String {
     }
 }
 
-fn normalize_process_match(value: &str) -> Option<String> {
+fn extract_executable_value(value: &str) -> String {
     let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Users can paste either a plain exe name, a full path, or a quoted command
+    // like "C:\\Program Files\\App\\app.exe" --flag. Xray process rules must not
+    // receive command-line arguments, so keep only the executable part.
+    let unwrapped = if let Some(rest) = trimmed.strip_prefix('"') {
+        rest.find('"')
+            .map(|end| rest[..end].to_string())
+            .unwrap_or_else(|| rest.trim_end_matches('"').to_string())
+    } else {
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(index) = lower.find(".exe") {
+            trimmed[..index + 4].to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+
+    unwrapped.trim().trim_matches('"').to_string()
+}
+
+fn normalize_process_match(value: &str) -> Option<String> {
+    let executable = extract_executable_value(value);
+    let trimmed = executable.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -633,6 +659,58 @@ fn normalize_process_match(value: &str) -> Option<String> {
     } else {
         Some(strip_windows_exe_suffix(&normalized))
     }
+}
+
+fn push_unique_process_match(matches: &mut Vec<String>, candidate: String) -> bool {
+    let candidate = candidate.trim().trim_matches('"').to_string();
+    if candidate.is_empty() {
+        return false;
+    }
+
+    if matches.iter().any(|item| item.eq_ignore_ascii_case(&candidate)) {
+        return false;
+    }
+
+    matches.push(candidate);
+    true
+}
+
+fn process_match_candidates(value: &str) -> Vec<String> {
+    let Some(normalized) = normalize_process_match(value) else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    let has_path = normalized.contains('/');
+
+    if has_path {
+        // Keep the full path for Xray builds that support process path matching.
+        push_unique_process_match(&mut candidates, normalized.clone());
+
+        // Some Windows process APIs return paths with backslashes. Add this variant
+        // too so a manually selected C:\\...\\app.exe is not silently missed.
+        push_unique_process_match(&mut candidates, normalized.replace('/', "\\"));
+    }
+
+    let file_name = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(normalized.as_str())
+        .trim();
+
+    if !file_name.is_empty() {
+        // Xray process routing on Windows is more reliable by executable name than
+        // by full path. This fixes the case when a user chooses an .exe file but
+        // traffic is not tunneled because the runtime only sees the process name.
+        push_unique_process_match(&mut candidates, file_name.to_string());
+        push_unique_process_match(&mut candidates, strip_windows_exe_suffix(file_name));
+    }
+
+    if !has_path {
+        push_unique_process_match(&mut candidates, normalized.clone());
+    }
+
+    candidates
 }
 
 #[cfg(target_os = "windows")]
@@ -717,8 +795,11 @@ fn build_split_tunnel_rule_plan(entries: &[SplitTunnelEntryPayload]) -> SplitTun
         match entry.kind.to_ascii_lowercase().as_str() {
             "service" => match resolve_service_process_match(raw_value) {
                 Ok(Some((resolved, _label))) => {
-                    if !process_matches.contains(&resolved) {
-                        process_matches.push(resolved);
+                    let mut added_any = false;
+                    for candidate in process_match_candidates(&resolved) {
+                        added_any |= push_unique_process_match(&mut process_matches, candidate);
+                    }
+                    if added_any {
                         resolved_services += 1;
                     }
                 }
@@ -729,11 +810,12 @@ fn build_split_tunnel_rule_plan(entries: &[SplitTunnelEntryPayload]) -> SplitTun
                 Err(error) => skipped_notes.push(error),
             },
             _ => {
-                if let Some(normalized) = normalize_process_match(raw_value) {
-                    if !process_matches.contains(&normalized) {
-                        process_matches.push(normalized);
-                        resolved_apps += 1;
-                    }
+                let mut added_any = false;
+                for candidate in process_match_candidates(raw_value) {
+                    added_any |= push_unique_process_match(&mut process_matches, candidate);
+                }
+                if added_any {
+                    resolved_apps += 1;
                 }
             }
         }

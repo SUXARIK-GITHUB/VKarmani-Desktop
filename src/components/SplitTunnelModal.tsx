@@ -1,5 +1,5 @@
 import { FolderOpen, Plus, RefreshCw, Trash2, X } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { tr, type UiLanguage } from '../i18n';
 import type { RunningAppInfo, SplitTunnelEntry } from '../types/vpn';
 
@@ -38,15 +38,44 @@ export function SplitTunnelModal({
 }: SplitTunnelModalProps) {
   const [appValue, setAppValue] = useState('');
   const [serviceValue, setServiceValue] = useState('');
+  const [appSearch, setAppSearch] = useState('');
   const activeCount = useMemo(() => entries.filter((entry) => entry.enabled && entry.value.trim()).length, [entries]);
+  const filteredRunningApps = useMemo(() => {
+    const query = appSearch.trim().toLowerCase();
+    if (!query) {
+      return runningApps;
+    }
+
+    return runningApps.filter((app) => [app.name, app.path, app.title, String(app.pid)]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(query)));
+  }, [appSearch, runningApps]);
+
+  const stopModalEvent = useCallback((event: React.SyntheticEvent) => {
+    event.stopPropagation();
+  }, []);
+
+  const closeOnBackdrop = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (event.target === event.currentTarget) {
+      onClose();
+    }
+  }, [onClose]);
 
   if (!open) {
     return null;
   }
 
   return (
-    <div className="vk-modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="vk-modal-card split-tunnel-modal" role="dialog" aria-modal="true" aria-label={tr(language, 'Приложения TUN', 'TUN applications')} onMouseDown={(event) => event.stopPropagation()}>
+    <div className="vk-modal-backdrop" role="presentation" onMouseDown={closeOnBackdrop}>
+      <section
+        className="vk-modal-card split-tunnel-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={tr(language, 'Приложения TUN', 'TUN applications')}
+        onMouseDown={stopModalEvent}
+        onClick={stopModalEvent}
+        onKeyDown={stopModalEvent}
+      >
         <header className="vk-modal-header">
           <div>
             <span className="section-kicker">TUN</span>
@@ -65,7 +94,16 @@ export function SplitTunnelModal({
           <div className="split-tunnel-add-grid">
             <label className="split-field">
               <span>{tr(language, 'Приложение или путь', 'Application or path')}</span>
-              <input value={appValue} onChange={(event) => setAppValue(event.target.value)} placeholder="chrome.exe или C:\Program Files\..." />
+              <input
+                value={appValue}
+                onChange={(event) => setAppValue(event.target.value)}
+                onMouseDown={stopModalEvent}
+                onClick={stopModalEvent}
+                onKeyDown={stopModalEvent}
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="chrome.exe или C:\Program Files\..."
+              />
             </label>
             <button type="button" className="vk-secondary-action" onClick={() => { if (onAddEntry('app', appValue)) setAppValue(''); }}>
               <Plus size={17} /> {tr(language, 'Добавить', 'Add')}
@@ -78,7 +116,16 @@ export function SplitTunnelModal({
           <div className="split-tunnel-add-grid service">
             <label className="split-field">
               <span>{tr(language, 'Служба Windows', 'Windows service')}</span>
-              <input value={serviceValue} onChange={(event) => setServiceValue(event.target.value)} placeholder="Dnscache, WinHttpAutoProxySvc…" />
+              <input
+                value={serviceValue}
+                onChange={(event) => setServiceValue(event.target.value)}
+                onMouseDown={stopModalEvent}
+                onClick={stopModalEvent}
+                onKeyDown={stopModalEvent}
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="Dnscache, WinHttpAutoProxySvc…"
+              />
             </label>
             <button type="button" className="vk-secondary-action" onClick={() => { if (onAddEntry('service', serviceValue)) setServiceValue(''); }}>
               <Plus size={17} /> {tr(language, 'Добавить службу', 'Add service')}
@@ -116,8 +163,21 @@ export function SplitTunnelModal({
                 {tr(language, 'Обновить', 'Refresh')}
               </button>
             </div>
+            <label className="split-field running-app-search">
+              <span>{tr(language, 'Поиск по приложениям', 'Search applications')}</span>
+              <input
+                value={appSearch}
+                onChange={(event) => setAppSearch(event.target.value)}
+                onMouseDown={stopModalEvent}
+                onClick={stopModalEvent}
+                onKeyDown={stopModalEvent}
+                autoComplete="off"
+                spellCheck={false}
+                placeholder={tr(language, 'Например: chrome, telegram, discord…', 'For example: chrome, telegram, discord…')}
+              />
+            </label>
             <div className="running-app-list">
-              {runningApps.slice(0, 80).map((app) => {
+              {filteredRunningApps.slice(0, 160).map((app) => {
                 const value = getAppValue(app);
                 return (
                   <button type="button" className="running-app-row" key={`${app.pid}-${value}`} onClick={() => onAddEntry('app', value)}>
@@ -127,6 +187,7 @@ export function SplitTunnelModal({
                 );
               })}
               {!runningApps.length ? <div className="split-empty">{isLoadingApps ? tr(language, 'Загружаем список приложений…', 'Loading application list…') : tr(language, 'Список приложений пуст.', 'The application list is empty.')}</div> : null}
+              {runningApps.length > 0 && !filteredRunningApps.length ? <div className="split-empty">{tr(language, 'По этому поиску приложений не найдено.', 'No applications found for this search.')}</div> : null}
             </div>
           </section>
         </div>

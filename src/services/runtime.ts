@@ -67,7 +67,7 @@ const NATIVE_COMMAND_TIMEOUTS_MS: Record<string, number> = {
   fetch_remote_text: 20000,
   revoke_hwid_device: 20000,
   connectivity_probe: 12000,
-  server_ping: 4500,
+  server_ping: 9000,
   traffic_snapshot: 7000,
   runtime_status: 9000,
   proxy_status: 9000,
@@ -78,7 +78,8 @@ const NATIVE_COMMAND_TIMEOUTS_MS: Record<string, number> = {
   save_access_key_secure: 12000,
   clear_access_key_secure: 9000,
   native_app_info: 12000,
-  pick_executable_path: 120000
+  pick_executable_path: 120000,
+  list_running_apps: 14000
 };
 
 function commandTimeoutMessage(command: string, timeoutMs: number) {
