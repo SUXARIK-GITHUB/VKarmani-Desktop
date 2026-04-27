@@ -15,14 +15,37 @@ function Write-ErrLine([string]$Message) { Write-Host "[ERROR] $Message" -Foregr
 function Test-XrayLaunch([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
 
+  $stdout = $null
+  $stderr = $null
   try {
     $stdout = [System.IO.Path]::GetTempFileName()
     $stderr = [System.IO.Path]::GetTempFileName()
     $process = Start-Process -FilePath $Path -ArgumentList @('version') -WorkingDirectory (Split-Path -Parent $Path) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
     return $process.ExitCode -eq 0
   } catch {
-    Write-WarnLine "xray.exe cannot launch: $($_.Exception.Message)"
+    # Do not print a scary startup warning here. A bundled core can fail to launch
+    # after unzip/quarantine/AV interference; the caller will repair it automatically.
+    return $false
+  } finally {
+    if ($stdout) { Remove-Item -LiteralPath $stdout -Force -ErrorAction SilentlyContinue }
+    if ($stderr) { Remove-Item -LiteralPath $stderr -Force -ErrorAction SilentlyContinue }
+  }
+}
+
+function Test-WindowsX64Pe([string]$Path, [string]$Label) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+  try {
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 1024) { return $false }
+    if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { return $false }
+    $peOffset = [BitConverter]::ToUInt32($bytes, 0x3C)
+    if ($peOffset -lt 64 -or $peOffset + 26 -ge $bytes.Length) { return $false }
+    if ($bytes[$peOffset] -ne 0x50 -or $bytes[$peOffset + 1] -ne 0x45 -or $bytes[$peOffset + 2] -ne 0 -or $bytes[$peOffset + 3] -ne 0) { return $false }
+    $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+    $magic = [BitConverter]::ToUInt16($bytes, $peOffset + 24)
+    return ($machine -eq 0x8664 -and $magic -eq 0x20B)
+  } catch {
+    Write-WarnLine "$Label PE validation failed: $($_.Exception.Message)"
     return $false
   }
 }
@@ -80,11 +103,53 @@ function Test-CoreFiles {
   }
 
   $xrayPath = Join-Path $coreDir 'xray.exe'
-  if (-not (Test-XrayLaunch $xrayPath)) {
-    $problems.Add('xray.exe exists but does not launch as a valid Windows x64 application')
+  if (-not (Test-WindowsX64Pe $xrayPath 'xray.exe')) {
+    $problems.Add('xray.exe is not a valid Windows x64 PE file')
+  }
+
+  $wintunPath = Join-Path $coreDir 'wintun.dll'
+  if (-not (Test-WindowsX64Pe $wintunPath 'wintun.dll')) {
+    $problems.Add('wintun.dll is not a valid Windows x64 PE file')
+  }
+
+  if ((Test-Path -LiteralPath $xrayPath -PathType Leaf) -and -not (Test-XrayLaunch $xrayPath)) {
+    $problems.Add('xray.exe cannot launch on this Windows installation')
   }
 
   return $problems
+}
+
+function Try-AutomaticFetchRepair {
+  if (-not (Test-Path -LiteralPath $fetchScript -PathType Leaf)) { return $false }
+
+  Write-Info 'Xray-core needs automatic repair; trying to download official Windows x64 Xray-core...'
+  try {
+    & $fetchScript -ProjectDir $ProjectDir -Force
+    return $true
+  } catch {
+    Write-WarnLine "Xray automatic repair failed: $($_.Exception.Message)"
+    return $false
+  }
+}
+
+function Try-GitRestoreRepair {
+  $git = Get-Command git -ErrorAction SilentlyContinue
+  $gitDir = Join-Path $ProjectDir '.git'
+  if (-not $git -or -not (Test-Path -LiteralPath $gitDir)) { return $false }
+
+  Write-Info 'Trying to restore bundled core files from git...'
+  try {
+    & git -C $ProjectDir checkout -- `
+      resources/core/windows/xray.exe `
+      resources/core/windows/geoip.dat `
+      resources/core/windows/geosite.dat `
+      resources/core/windows/wintun.dll `
+      resources/core/windows/core-manifest.json | Out-Host
+    return $LASTEXITCODE -eq 0
+  } catch {
+    Write-WarnLine "Git restore failed: $($_.Exception.Message)"
+    return $false
+  }
 }
 
 if (-not (Test-Path -LiteralPath $coreDir)) {
@@ -93,16 +158,16 @@ if (-not (Test-Path -LiteralPath $coreDir)) {
 
 $problems = Test-CoreFiles
 if ($problems.Count -eq 0) {
-  Write-Info 'Xray-core files are present and launchable.'
+  Write-Info 'Xray-core files are present and pass manifest/PE/launch validation.'
   exit 0
 }
 
-Write-WarnLine 'Xray-core validation found problems:'
-$problems | ForEach-Object { Write-WarnLine " - $_" }
+Write-Info 'Preparing Xray-core runtime files; automatic repair will be attempted if needed.'
+if ($env:VKARMANI_VERBOSE_REPAIR -eq '1') {
+  $problems | ForEach-Object { Write-Info " - $_" }
+}
 
-if (Test-Path -LiteralPath $fetchScript -PathType Leaf) {
-  Write-Info 'Trying to download official Windows x64 Xray-core...'
-  & $fetchScript -ProjectDir $ProjectDir -Force
+if (Try-AutomaticFetchRepair) {
   $problems = Test-CoreFiles
   if ($problems.Count -eq 0) {
     Write-Info 'Xray-core files repaired successfully.'
@@ -110,17 +175,7 @@ if (Test-Path -LiteralPath $fetchScript -PathType Leaf) {
   }
 }
 
-$git = Get-Command git -ErrorAction SilentlyContinue
-$gitDir = Join-Path $ProjectDir '.git'
-if ($git -and (Test-Path -LiteralPath $gitDir)) {
-  Write-Info 'Trying to restore bundled core files from git...'
-  & git -C $ProjectDir checkout -- `
-    resources/core/windows/xray.exe `
-    resources/core/windows/geoip.dat `
-    resources/core/windows/geosite.dat `
-    resources/core/windows/wintun.dll `
-    resources/core/windows/core-manifest.json | Out-Host
-
+if (Try-GitRestoreRepair) {
   $problems = Test-CoreFiles
   if ($problems.Count -eq 0) {
     Write-Info 'Xray-core files restored successfully.'
@@ -128,7 +183,10 @@ if ($git -and (Test-Path -LiteralPath $gitDir)) {
   }
 }
 
-Write-ErrLine 'Xray-core files are still missing, corrupted, or not launchable.'
+Write-WarnLine 'Xray-core validation still found problems after automatic repair:'
+$problems | ForEach-Object { Write-WarnLine " - $_" }
+
+Write-ErrLine 'Xray-core files are still missing, corrupted, or not valid Windows x64 files.'
 Write-ErrLine "Expected directory: $coreDir"
 Write-ErrLine 'Required files: xray.exe, geoip.dat, geosite.dat, wintun.dll'
 Write-ErrLine 'Fix: run scripts/fetch-xray-windows.ps1 or use the GitHub Actions release artifact built from v0.13.30 or newer.'

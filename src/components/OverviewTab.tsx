@@ -1,467 +1,336 @@
-import { useEffect, useState, type FormEvent } from 'react';
 import {
-  Activity,
-  ArrowRightLeft,
+  ArrowDown,
+  ArrowUp,
+  BarChart3,
+  Check,
   Clock3,
-  Cpu,
   Globe2,
-  MapPin,
-  MonitorCog,
-  MousePointer2,
-  Plus,
   Power,
+  RefreshCw,
+  SlidersHorizontal,
+  Search,
   ShieldCheck,
   Signal,
-  Sparkles,
-  Trash2,
-  Waypoints,
-  Wifi,
-  X
+  Star,
+  Waypoints
 } from 'lucide-react';
 import { tr, type UiLanguage } from '../i18n';
-import { listNativeRunningApps, writeNativeInterfaceLog } from '../services/runtime';
-import type {
-  ConnectionState,
-  RuntimeStatus,
-  RunningAppInfo,
-  SplitTunnelEntry,
-  TunnelMode,
-  VpnServer
-} from '../types/vpn';
-import { getServerDisplayLabel, getServerPrimaryLabel, getServerSecondaryLabel } from '../utils/serverDisplay';
+import type { ConnectionState, TunnelMode, VpnServer } from '../types/vpn';
+import { getServerPrimaryLabel, getServerSecondaryLabel, resolveServerFlag } from '../utils/serverDisplay';
 
 interface OverviewTabProps {
   connectionState: ConnectionState;
   connectLabel: string;
-  statusText: string;
   selectedServer: VpnServer | null;
-  primaryExternalIp: string;
-  vpnExternalIp: string;
+  selectedServerId: string;
+  servers: VpnServer[];
+  allServerCount: number;
+  searchValue: string;
   sessionDurationText: string;
-  diagnosticsStatus: string;
-  runtimeStatus: RuntimeStatus;
   language: UiLanguage;
   showDiagnostics: boolean;
   tunnelMode: TunnelMode;
-  splitTunnelEntries: SplitTunnelEntry[];
   onToggleConnection: () => void;
   onTunnelModeChange: (value: TunnelMode) => void;
-  onAddSplitTunnelEntry: (kind: SplitTunnelEntry['kind'], value: string) => boolean;
-  onToggleSplitTunnelEntry: (entryId: string) => void;
-  onRemoveSplitTunnelEntry: (entryId: string) => void;
-  profileSyncMessage?: string;
-  isBusy: boolean;
+  onSelectServer: (serverId: string) => void;
+  onSearchChange: (value: string) => void;
+  onRefreshServers: () => void;
+  onRefreshPing: () => void;
+  onToggleFavoriteServer: (serverId: string) => void;
+  favoriteServerIds: string[];
+  trafficReceivedText: string;
+  trafficSentText: string;
+  trafficChartBars: number[];
+  vpnExternalIp: string;
+  packetLossText: string;
+  isCheckingPing?: boolean;
+  pingProgressText?: string;
+  checkingPingServerIds?: string[];
   canConnect: boolean;
   connectDisabledReason?: string;
   isSyncingProfile?: boolean;
+  activeSplitTunnelCount: number;
+  onOpenSplitTunnel: () => void;
+}
+
+function getProtocolLabel(server: VpnServer | null | undefined) {
+  if (!server) {
+    return 'VLESS | JSON';
+  }
+
+  const protocol = server.protocol === 'Xray' ? server.runtimeTemplate?.protocol?.toUpperCase() || 'XRAY' : server.protocol;
+  const transport = server.transportLabel || server.runtimeTemplate?.transport?.toUpperCase() || 'JSON';
+  return `${protocol} | ${transport}`;
+}
+
+function formatLatency(server: VpnServer | null | undefined, language: UiLanguage, isChecking = false) {
+  if (isChecking || server?.latencyStatus === 'checking') {
+    return tr(language, 'Проверяем…', 'Checking…');
+  }
+
+  if (server?.latencyStatus === 'failed') {
+    return tr(language, 'Нет ответа', 'No response');
+  }
+
+  if (!server || server.latency === null || server.latency === undefined || !Number.isFinite(Number(server.latency))) {
+    return tr(language, 'Не проверено', 'Not checked');
+  }
+
+  return `${Math.max(1, Math.round(Number(server.latency)))} мс`;
+}
+
+function latencyTone(server: VpnServer, isChecking = false) {
+  if (isChecking || server.latencyStatus === 'checking') {
+    return 'checking';
+  }
+
+  if (server.latencyStatus === 'failed') {
+    return 'warn';
+  }
+
+  const latency = Number(server.latency);
+  if (server.latency === null || server.latency === undefined || !Number.isFinite(latency)) {
+    return 'muted';
+  }
+
+  if (latency >= 100) {
+    return 'warn';
+  }
+  return 'good';
 }
 
 export function OverviewTab({
   connectionState,
   connectLabel,
-  statusText,
   selectedServer,
-  primaryExternalIp,
-  vpnExternalIp,
+  selectedServerId,
+  servers,
+  allServerCount,
+  searchValue,
   sessionDurationText,
-  diagnosticsStatus,
-  runtimeStatus,
   language,
   showDiagnostics,
   tunnelMode,
-  splitTunnelEntries,
   onToggleConnection,
   onTunnelModeChange,
-  onAddSplitTunnelEntry,
-  onToggleSplitTunnelEntry,
-  onRemoveSplitTunnelEntry,
-  isBusy,
+  onSelectServer,
+  onSearchChange,
+  onRefreshServers,
+  onRefreshPing,
+  onToggleFavoriteServer,
+  favoriteServerIds,
+  trafficReceivedText,
+  trafficSentText,
+  trafficChartBars,
+  vpnExternalIp,
+  packetLossText,
+  isCheckingPing = false,
+  pingProgressText = '',
+  checkingPingServerIds = [],
   canConnect,
-  connectDisabledReason = ''
+  connectDisabledReason = '',
+  isSyncingProfile,
+  activeSplitTunnelCount,
+  onOpenSplitTunnel
 }: OverviewTabProps) {
-  const [isSplitTunnelEditorOpen, setIsSplitTunnelEditorOpen] = useState(false);
-  const [programValue, setProgramValue] = useState('');
-  const [serviceValue, setServiceValue] = useState('');
-  const [runningApps, setRunningApps] = useState<RunningAppInfo[]>([]);
-  const [isRunningAppsOpen, setIsRunningAppsOpen] = useState(false);
-  const [isLoadingRunningApps, setIsLoadingRunningApps] = useState(false);
-  const [runningAppsQuery, setRunningAppsQuery] = useState('');
-
-  useEffect(() => {
-    if (isSplitTunnelEditorOpen) {
-      void writeNativeInterfaceLog(
-        'Открыт редактор TUN списка.',
-        `Активных правил: ${splitTunnelEntries.filter((entry: SplitTunnelEntry) => entry.enabled).length}`
-      );
-    }
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        setIsSplitTunnelEditorOpen(false);
-      }
-    };
-
-    if (isSplitTunnelEditorOpen) {
-      window.addEventListener('keydown', handleKeyDown);
-      return () => window.removeEventListener('keydown', handleKeyDown);
-    }
-
-    return undefined;
-  }, [isSplitTunnelEditorOpen, splitTunnelEntries]);
-
-  const primaryServerLabel = selectedServer ? getServerPrimaryLabel(selectedServer) : '—';
-  const secondaryServerLabel = selectedServer ? getServerSecondaryLabel(selectedServer, showDiagnostics) : undefined;
-  const connectionLocation = selectedServer
-    ? getServerDisplayLabel(selectedServer, showDiagnostics)
-    : tr(language, 'Список серверов загружается…', 'Loading server list…');
-  const primaryExternalIpLabel = primaryExternalIp && primaryExternalIp !== '—'
-    ? primaryExternalIp
-    : tr(language, 'Определяется…', 'Detecting…');
-  const vpnExternalIpLabel = connectionState === 'connected'
-    ? (vpnExternalIp && vpnExternalIp !== '—' ? vpnExternalIp : tr(language, 'Определяется…', 'Detecting…'))
-    : tr(language, 'Определится после подключения', 'Will be detected after connection');
-  const splitTunnelEnabledCount = splitTunnelEntries.filter((entry: SplitTunnelEntry) => entry.enabled).length;
-  const nextTunnelMode = tunnelMode === 'proxy' ? 'tun' : 'proxy';
-  const currentModeLabel = tunnelMode === 'tun' ? 'TUN' : tr(language, 'Прокси', 'Proxy');
-  const nextModeHint = tunnelMode === 'tun'
-    ? tr(language, 'Переключить на прокси', 'Switch to proxy')
-    : tr(language, 'Переключить на TUN', 'Switch to TUN');
-  const routingReadiness = runtimeStatus.coreInstalled
-    ? tr(language, 'готов к подключению', 'ready to connect')
-    : tr(language, 'конфиг ещё не собран', 'runtime not ready yet');
-  const normalizedRunningAppsQuery = runningAppsQuery.trim().toLowerCase();
-  const filteredRunningApps = normalizedRunningAppsQuery
-    ? runningApps.filter((app: RunningAppInfo) => {
-      const haystack = [app.name, app.title ?? '', app.path ?? ''].join(' ').toLowerCase();
-      return haystack.includes(normalizedRunningAppsQuery);
-    })
-    : runningApps;
-
-  function handleProgramSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (onAddSplitTunnelEntry('app', programValue)) {
-      setProgramValue('');
-    }
-  }
-
-  async function handleOpenRunningApps() {
-    setIsLoadingRunningApps(true);
-    setIsRunningAppsOpen(true);
-    setRunningAppsQuery('');
-    try {
-      const apps = await listNativeRunningApps();
-      setRunningApps(apps);
-      void writeNativeInterfaceLog('Открыт список запущенных приложений для TUN.', `Найдено: ${apps.length}`);
-    } catch (error) {
-      setRunningApps([]);
-      void writeNativeInterfaceLog('Не удалось получить список запущенных приложений.', error instanceof Error ? error.message : String(error));
-    } finally {
-      setIsLoadingRunningApps(false);
-    }
-  }
-
-  function handleSelectRunningApp(app: RunningAppInfo) {
-    const value = app.path?.trim() || (app.name.endsWith('.exe') ? app.name : `${app.name}.exe`);
-    if (onAddSplitTunnelEntry('app', value)) {
-      setProgramValue('');
-    }
-    setIsRunningAppsOpen(false);
-  }
-
-  function handleServiceSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (onAddSplitTunnelEntry('service', serviceValue)) {
-      setServiceValue('');
-    }
-  }
+  const isConnected = connectionState === 'connected';
+  const flag = selectedServer ? resolveServerFlag(selectedServer) : '🌐';
+  const selectedName = selectedServer ? getServerPrimaryLabel(selectedServer) : tr(language, 'Сервер не выбран', 'No server selected');
+  const selectedMeta = selectedServer
+    ? getServerSecondaryLabel(selectedServer, showDiagnostics)
+    : tr(language, 'Выберите сервер из списка', 'Choose a server from the list');
+  const selectedProtocol = getProtocolLabel(selectedServer);
+  const filteredServerCount = servers.length;
+  const favoriteServerIdSet = new Set(favoriteServerIds);
+  const checkingPingServerIdSet = new Set(checkingPingServerIds);
+  const selectedLatency = formatLatency(selectedServer, language, Boolean(selectedServer && checkingPingServerIdSet.has(selectedServer.id)));
 
   return (
-    <div className="tab-stack compact-tab-stack overview-screen">
-      <section className="hero-banner compact-hero-banner">
-        <div className="hero-copy">
-          <span className={`chip status-chip ${connectionState}`}>{statusText}</span>
-          <h1>{tr(language, 'VPN VKarmani - для людей и компаний', 'VPN VKarmani - for people and companies')}</h1>
+    <div className="vk-dashboard">
+      <section className={`vk-hero-card ${connectionState}`}>
+        <div className="vk-hero-status">
+          <div className="vk-shield-ring"><ShieldCheck size={44} /></div>
+          <div>
+            <h1>{isConnected ? tr(language, 'Подключен', 'Connected') : connectLabel}</h1>
+            <p><span className={isConnected ? 'green-dot' : 'blue-dot'} />{isConnected ? tr(language, 'Стабильное соединение', 'Stable connection') : tr(language, 'Готов к безопасному подключению', 'Ready for secure connection')}</p>
+          </div>
         </div>
 
-        <article className="hero-status-card">
-          <div className="hero-status-card-header">
-            <strong>{tr(language, 'Статус соединения', 'Connection status')}</strong>
-          </div>
+        <div className="vk-world-lines" aria-hidden="true">
+          <span />
+          <i />
+          <b />
+        </div>
 
-          <div className="hero-badges compact-hero-badges hero-status-list">
-            <div>
-              <Signal size={15} />
-              <span>{statusText}</span>
-            </div>
-            <div>
-              <Globe2 size={15} />
-              <span>{primaryExternalIpLabel}</span>
-            </div>
-            <div>
-              <Sparkles size={15} />
-              <span>{diagnosticsStatus}</span>
-            </div>
+        <div className="vk-hero-server">
+          <span className="vk-flag-large">{flag}</span>
+          <div className="vk-hero-server-copy">
+            <strong>{selectedName}</strong>
+            <span>{selectedMeta} · {selectedProtocol}</span>
           </div>
-        </article>
+          <div className="vk-hero-latency">
+            <Signal size={26} />
+            <strong>{selectedLatency}</strong>
+          </div>
+        </div>
       </section>
 
-      <div className="overview-grid compact-overview-grid">
-        <div className="overview-main-stack">
-          <article className="connection-card glow-card">
-            <div className="connection-ring-wrap">
-              <button
-                className={`power-button ${connectionState}`}
-                onClick={onToggleConnection}
-                disabled={isBusy || (!canConnect && connectionState === 'idle')}
-                aria-label={connectLabel}
-              >
-                <Power size={34} />
-              </button>
-            </div>
-
-            <div className="connection-text">
-              <h2>{connectLabel}</h2>
-              <p>{connectionLocation}</p>
-              {!canConnect && connectDisabledReason ? (
-                <p className="connection-disabled-note">{connectDisabledReason}</p>
-              ) : null}
-
-              <div className="inline-stats wrap-inline-stats">
-                <span>
-                  <Wifi size={14} /> {selectedServer?.protocol ?? '—'}
-                  {selectedServer?.transportLabel ? ` / ${selectedServer.transportLabel}` : ''}
-                </span>
-                <span>
-                  <Activity size={14} /> {tr(language, 'Нагрузка', 'Load')} {selectedServer?.load ?? 0}%
-                </span>
-                <span className={`mode-status-pill ${tunnelMode}`}>
-                  <Waypoints size={14} /> {tunnelMode === 'tun' ? tr(language, 'TUN активен', 'TUN active') : tr(language, 'Прокси активен', 'Proxy active')}
-                </span>
-                {showDiagnostics ? (
-                  <span>
-                    <MapPin size={14} /> {selectedServer?.host ? `${selectedServer.host}:${selectedServer.port ?? 443}` : tr(language, 'Узел появится после синхронизации', 'Node will appear after sync')}
-                  </span>
-                ) : null}
-              </div>
-
-              <div className="inline-stats wrap-inline-stats">
-                <span>
-                  <ShieldCheck size={14} /> {routingReadiness}
-                </span>
-                {tunnelMode === 'tun' ? (
-                  <span>
-                    <MonitorCog size={14} /> {tr(language, `Правил: ${splitTunnelEnabledCount}`, `Rules: ${splitTunnelEnabledCount}`)}
-                  </span>
-                ) : null}
-              </div>
-
-              <div className="overview-actions tunnel-mode-actions compact-mode-actions">
-                <button
-                  type="button"
-                  className={`ghost-button mode-toggle-button ${tunnelMode}`}
-                  onClick={() => onTunnelModeChange(nextTunnelMode)}
-                  disabled={isBusy}
-                  title={nextModeHint}
-                >
-                  <span className={`mode-toggle-icon-shell ${tunnelMode}`}>
-                    {tunnelMode === 'tun' ? <Waypoints size={17} /> : <Globe2 size={17} />}
-                  </span>
-                  <span className="mode-toggle-copy">
-                    <span className="mode-toggle-kicker">{tr(language, 'Режим маршрутизации', 'Routing mode')}</span>
-                    <strong>{currentModeLabel}</strong>
-                    <span className="mode-toggle-meta">{nextModeHint}</span>
-                  </span>
-                  <span className="mode-toggle-switch-mark" aria-hidden="true">
-                    <ArrowRightLeft size={15} />
-                  </span>
-                </button>
-
-                {tunnelMode === 'tun' ? (
-                  <button
-                    type="button"
-                    className={`ghost-button split-tunnel-launcher-button ${isSplitTunnelEditorOpen ? 'active' : ''}`}
-                    onClick={() => setIsSplitTunnelEditorOpen((current) => !current)}
-                    disabled={isBusy}
-                    title={tr(language, 'Настроить список TUN', 'Configure TUN list')}
-                    aria-label={tr(language, 'Настроить список TUN', 'Configure TUN list')}
-                  >
-                    <MonitorCog size={17} />
-                    <span className={`mode-count-badge ${splitTunnelEnabledCount > 0 ? 'filled' : ''}`}>{splitTunnelEnabledCount}</span>
-                  </button>
-                ) : null}
-              </div>
-            </div>
-          </article>
+      <section className="vk-card vk-server-card">
+        <div className="vk-card-header vk-card-header-row">
+          <h2>{tr(language, 'Серверы', 'Servers')}</h2>
+          <div className="vk-server-tools">
+            <label className="vk-search-box">
+              <Search size={18} />
+              <input
+                value={searchValue}
+                onChange={(event) => onSearchChange(event.target.value)}
+                placeholder={tr(language, 'Поиск серверов', 'Search servers')}
+              />
+            </label>
+          </div>
         </div>
 
-        <article className="metrics-card compact-metrics-card">
-          <div className="metrics-card-header">
-            <strong>{tr(language, 'После подключения', 'After connection')}</strong>
-          </div>
+        <div className="vk-server-list">
+          {servers.map((server) => {
+            const active = server.id === selectedServerId;
+            const isFavorite = favoriteServerIdSet.has(server.id);
+            const serverPingChecking = checkingPingServerIdSet.has(server.id);
+            return (
+              <div
+                key={server.id}
+                className={`vk-server-row ${active ? 'active' : ''}`}
+              >
+                <button
+                  type="button"
+                  className="vk-server-select-button"
+                  onClick={() => onSelectServer(server.id)}
+                  aria-pressed={active}
+                >
+                  <span className="vk-server-flag">{resolveServerFlag(server)}</span>
+                  <span className="vk-server-copy">
+                    <strong>{getServerPrimaryLabel(server)}</strong>
+                    <small>{getProtocolLabel(server)}</small>
+                  </span>
+                  <span className="vk-server-quality">
+                    {active ? <span className="vk-check-badge"><Check size={13} /></span> : null}
+                    <Signal size={20} />
+                    <strong className={latencyTone(server, serverPingChecking)}>{formatLatency(server, language, serverPingChecking)}</strong>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className={`vk-favorite-star ${isFavorite ? 'active' : ''}`}
+                  aria-label={isFavorite ? tr(language, 'Убрать из избранного', 'Remove from favorites') : tr(language, 'Добавить в избранное', 'Add to favorites')}
+                  title={isFavorite ? tr(language, 'Убрать из избранного', 'Remove from favorites') : tr(language, 'Добавить в избранное', 'Add to favorites')}
+                  onClick={() => onToggleFavoriteServer(server.id)}
+                >
+                  <Star size={21} fill={isFavorite ? 'currentColor' : 'none'} />
+                </button>
+              </div>
+            );
+          })}
 
-          <div className="metric-item">
-            <div className="metric-label">
-              <Clock3 size={16} /> {tr(language, 'Сессия', 'Session')}
+          {!servers.length ? (
+            <div className="vk-empty-list">
+              <strong>{tr(language, 'Серверы не найдены', 'No servers found')}</strong>
+              <span>{tr(language, 'Обновите профиль или измените поиск.', 'Refresh the profile or change the search.')}</span>
             </div>
-            <strong>{connectionState === 'connected' ? sessionDurationText : '00:00:00'}</strong>
+          ) : null}
+        </div>
+
+        <div className="vk-server-footer">
+          <span>{tr(language, `Всего серверов: ${allServerCount || filteredServerCount}`, `Total servers: ${allServerCount || filteredServerCount}`)}</span>
+          <div className="vk-server-footer-actions">
+            <button type="button" className="vk-secondary-action" onClick={onRefreshServers} disabled={Boolean(isSyncingProfile)}>
+              <RefreshCw size={18} className={isSyncingProfile ? 'spin-icon' : ''} />
+              {isSyncingProfile ? tr(language, 'Обновляем…', 'Refreshing…') : tr(language, 'Обновить серверы', 'Refresh servers')}
+            </button>
+            <button
+              type="button"
+              className={`vk-secondary-action vk-ping-action ${isCheckingPing ? 'background-running' : ''}`}
+              onClick={onRefreshPing}
+              aria-busy={isCheckingPing}
+              title={isCheckingPing ? tr(language, 'Пинг проверяется в фоне. Остальные кнопки доступны.', 'Ping is checking in the background. Other buttons remain available.') : undefined}
+            >
+              <RefreshCw size={18} className={isCheckingPing ? 'spin-icon' : ''} />
+              {isCheckingPing ? (pingProgressText || tr(language, 'Проверяем…', 'Checking…')) : tr(language, 'Проверить пинг', 'Check ping')}
+            </button>
           </div>
-          <div className="metric-item">
-            <div className="metric-label">
-              <Globe2 size={16} /> {tr(language, 'Внешний IP', 'Public IP')}
-            </div>
-            <strong>{vpnExternalIpLabel}</strong>
+        </div>
+      </section>
+
+      <aside className="vk-dashboard-side">
+        <article className="vk-card vk-traffic-card">
+          <div className="vk-card-header small">
+            <h3><BarChart3 size={19} /> {tr(language, 'Трафик', 'Traffic')}</h3>
           </div>
-          <div className="metric-item">
-            <div className="metric-label">
-              <MapPin size={16} /> {tr(language, 'Текущий узел', 'Current node')}
-            </div>
-            <strong>{primaryServerLabel}</strong>
-            {secondaryServerLabel ? <span className="metric-note">{secondaryServerLabel}</span> : null}
+          <div className="vk-traffic-chart" aria-hidden="true">
+            {trafficChartBars.map((height, index) => (
+              <span key={`${height}-${index}`} style={{ height: `${height}%` }} />
+            ))}
+          </div>
+          <div className="vk-traffic-stats">
+            <span><ArrowDown size={20} />{tr(language, 'Получено', 'Received')}<strong>{trafficReceivedText}</strong></span>
+            <span><ArrowUp size={20} />{tr(language, 'Отправлено', 'Sent')}<strong>{trafficSentText}</strong></span>
           </div>
         </article>
-      </div>
 
-      {tunnelMode === 'tun' && isSplitTunnelEditorOpen ? (
-        <div className="split-tunnel-modal-backdrop" onClick={() => setIsSplitTunnelEditorOpen(false)}>
-          <div className="split-tunnel-modal" onClick={(event) => event.stopPropagation()}>
-            <div className="split-tunnel-modal-header">
-              <div>
-                <strong>{tr(language, 'Приложения и службы', 'Apps and services')}</strong>
-                <span>{tr(language, 'Добавь только то, что должно идти через TUN', 'Add only what should use TUN')}</span>
-              </div>
-              <div className="split-tunnel-modal-actions">
-                <span className={`mode-count-badge ${splitTunnelEnabledCount > 0 ? 'filled' : ''}`}>{splitTunnelEnabledCount}</span>
-                <button type="button" className="ghost-button split-modal-close" onClick={() => setIsSplitTunnelEditorOpen(false)}>
-                  <X size={16} />
-                </button>
-              </div>
-            </div>
-
-            <div className="split-tunnel-form-grid compact-split-tunnel-form-grid">
-              <form className="split-tunnel-form compact-split-tunnel-form" onSubmit={handleProgramSubmit}>
-                <label>
-                  <strong><MonitorCog size={15} /> {tr(language, 'Программа', 'Program')}</strong>
-                </label>
-                <div className="split-tunnel-input-row key-input-row compact-key-input-row">
-                  <input
-                    value={programValue}
-                    onChange={(event) => setProgramValue(event.target.value)}
-                    placeholder={tr(language, 'chrome.exe или путь к .exe', 'chrome.exe or path to .exe')}
-                  />
-                  <button type="submit" className="ghost-button split-inline-button">
-                    <Plus size={15} />
-                  </button>
-                </div>
-              </form>
-
-              <form className="split-tunnel-form compact-split-tunnel-form" onSubmit={handleServiceSubmit}>
-                <label>
-                  <strong><Cpu size={15} /> {tr(language, 'Служба', 'Service')}</strong>
-                </label>
-                <div className="split-tunnel-input-row key-input-row compact-key-input-row">
-                  <input
-                    value={serviceValue}
-                    onChange={(event) => setServiceValue(event.target.value)}
-                    placeholder={tr(language, 'Имя службы Windows', 'Windows service name')}
-                  />
-                  <button type="submit" className="ghost-button split-inline-button">
-                    <Plus size={15} />
-                  </button>
-                </div>
-              </form>
-
-              <div className="split-tunnel-form compact-split-tunnel-form split-running-apps-form">
-                <label>
-                  <strong><MousePointer2 size={15} /> {tr(language, 'Запущенные приложения', 'Running apps')}</strong>
-                </label>
-                <button
-                  type="button"
-                  className="ghost-button split-running-apps-button"
-                  onClick={handleOpenRunningApps}
-                  disabled={isLoadingRunningApps}
-                >
-                  <span>{isLoadingRunningApps ? tr(language, 'Ищу…', 'Loading…') : tr(language, 'Выбрать', 'Choose')}</span>
-                  <small>{tr(language, 'из активных .exe', 'from active .exe')}</small>
-                </button>
-              </div>
-            </div>
-
-            {isRunningAppsOpen ? (
-              <div className="split-running-apps-panel">
-                <div className="split-running-apps-panel-header">
-                  <div>
-                    <strong>{tr(language, 'Выбор запущенного приложения', 'Choose a running app')}</strong>
-                    <span>{tr(language, 'Нажми на строку, чтобы добавить программу в TUN', 'Click a row to add the app to TUN')}</span>
-                  </div>
-                  <button type="button" className="ghost-button split-modal-close" onClick={() => setIsRunningAppsOpen(false)}>
-                    <X size={14} />
-                  </button>
-                </div>
-                <div className="split-running-apps-toolbar">
-                  <input
-                    value={runningAppsQuery}
-                    onChange={(event) => setRunningAppsQuery(event.target.value)}
-                    placeholder={tr(language, 'Поиск: chrome, telegram, путь...', 'Search: chrome, telegram, path...')}
-                  />
-                  <span>{isLoadingRunningApps ? tr(language, 'Загрузка…', 'Loading…') : tr(language, 'Найдено:', 'Found:')} {filteredRunningApps.length}</span>
-                </div>
-                <div className="split-running-apps-list">
-                  {isLoadingRunningApps ? (
-                    <div className="split-tunnel-empty compact">
-                      <span>{tr(language, 'Получаю список процессов…', 'Loading process list…')}</span>
-                    </div>
-                  ) : filteredRunningApps.length ? filteredRunningApps.map((app: RunningAppInfo) => (
-                    <button
-                      type="button"
-                      key={`${app.pid}-${app.path ?? app.name}`}
-                      className="split-running-app-item"
-                      onClick={() => handleSelectRunningApp(app)}
-                      title={app.path || app.title || app.name}
-                    >
-                      <div className="split-running-app-main">
-                        <strong>{app.name}</strong>
-                        <span>{app.path || app.title || `PID ${app.pid}`}</span>
-                      </div>
-                      <span className="split-running-app-add">{tr(language, 'Добавить', 'Add')}</span>
-                    </button>
-                  )) : (
-                    <div className="split-tunnel-empty compact">
-                      <strong>{tr(language, 'Ничего не найдено', 'Nothing found')}</strong>
-                      <span>{tr(language, 'Можно ввести exe вручную.', 'You can enter the exe manually.')}</span>
-                    </div>
-                  )}
-                </div>
-              </div>
-            ) : null}
-
-            <div className="split-tunnel-list compact-split-tunnel-list">
-              {splitTunnelEntries.length ? splitTunnelEntries.map((entry: SplitTunnelEntry) => (
-                <div key={entry.id} className={`split-tunnel-entry ${entry.enabled ? 'enabled' : 'disabled'}`}>
-                  <button
-                    type="button"
-                    className={`ghost-button split-entry-toggle ${entry.enabled ? 'active' : ''}`}
-                    onClick={() => onToggleSplitTunnelEntry(entry.id)}
-                  >
-                    {entry.enabled ? 'TUN' : tr(language, 'Выкл', 'Off')}
-                  </button>
-                  <div className="split-entry-copy">
-                    <strong>{entry.kind === 'app' ? tr(language, 'Программа', 'Program') : tr(language, 'Служба', 'Service')}</strong>
-                    <span>{entry.value}</span>
-                  </div>
-                  <button type="button" className="ghost-button split-entry-remove" onClick={() => onRemoveSplitTunnelEntry(entry.id)}>
-                    <Trash2 size={15} />
-                  </button>
-                </div>
-              )) : (
-                <div className="split-tunnel-empty">
-                  <strong>{tr(language, 'Список пуст', 'List is empty')}</strong>
-                  <span>{tr(language, 'Добавь программу или службу.', 'Add a program or service.')}</span>
-                </div>
-              )}
-            </div>
+        <article className="vk-card vk-session-card">
+          <div className="vk-card-header small">
+            <h3><Clock3 size={19} /> {tr(language, 'Сессия', 'Session')}</h3>
           </div>
+          <strong className="vk-session-time">{isConnected ? sessionDurationText : '00:00:00'}</strong>
+          <div className="vk-session-lines">
+            <span>{tr(language, 'Протокол', 'Protocol')}<strong>{selectedProtocol}</strong></span>
+            <span>{tr(language, 'IP-адрес', 'IP address')}<strong>{vpnExternalIp}</strong></span>
+            <span>{tr(language, 'Потеря пакетов', 'Packet loss')}<strong>{packetLossText}</strong></span>
+          </div>
+        </article>
+
+        <article className="vk-card vk-mode-card">
+          <div className="vk-card-header small">
+            <h3><Globe2 size={19} /> {tr(language, 'Режим подключения', 'Connection mode')}</h3>
+          </div>
+          <div className="vk-mode-options">
+            <button type="button" className={`vk-mode-option ${tunnelMode === 'proxy' ? 'active' : ''}`} onClick={() => onTunnelModeChange('proxy')}>
+              <Globe2 size={26} />
+              <span>Proxy</span>
+              <i />
+            </button>
+            <button type="button" className={`vk-mode-option ${tunnelMode === 'tun' ? 'active' : ''}`} onClick={() => onTunnelModeChange('tun')}>
+              <Waypoints size={26} />
+              <span>TUN</span>
+              <i>{tunnelMode === 'tun' ? <Check size={14} /> : null}</i>
+            </button>
+          </div>
+        </article>
+
+        <div className={`vk-power-actions ${tunnelMode === 'tun' ? 'with-tun-tools' : ''}`}>
+          <button
+            type="button"
+            className={`vk-primary-power ${connectionState}`}
+            onClick={onToggleConnection}
+            disabled={connectionState === 'disconnecting' || (!canConnect && connectionState === 'idle')}
+            title={!canConnect && connectDisabledReason ? connectDisabledReason : undefined}
+          >
+            <Power size={34} />
+            <span>{connectLabel}</span>
+          </button>
+
+          {tunnelMode === 'tun' ? (
+            <button
+              type="button"
+              className="vk-tun-config-button"
+              onClick={onOpenSplitTunnel}
+              title={tr(language, 'Выбрать приложения и службы для TUN', 'Choose apps and services for TUN')}
+            >
+              <SlidersHorizontal size={22} />
+              <span>{tr(language, 'Приложения', 'TUN apps')}</span>
+              <strong>{activeSplitTunnelCount}</strong>
+            </button>
+          ) : null}
         </div>
-      ) : null}
+      </aside>
     </div>
   );
 }

@@ -1,9 +1,12 @@
 import packageJson from '../../package.json';
+import { redactSensitiveText } from '../utils/redaction';
 import type {
   ConnectivityProbe,
   ProxyStatus,
   RuntimeStatus,
+  TrafficSnapshot,
   RunningAppInfo,
+  NativeAppInfo,
   SplitTunnelEntry,
   TunnelMode,
   VpnServer,
@@ -23,12 +26,93 @@ export const remnawavePanelUrl = import.meta.env.VITE_REMNAWAVE_PANEL_URL ?? '';
 export const remnawaveSubscriptionUrl = import.meta.env.VITE_REMNAWAVE_SUBSCRIPTION_URL ?? '';
 const envFlag = import.meta.env.VITE_ALLOW_DEMO_FALLBACK;
 const WEB_FETCH_BODY_LIMIT_BYTES = 2 * 1024 * 1024;
+
+function validateWebRemoteFetchUrl(rawUrl: string) {
+  let parsed: URL;
+
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error('Некорректный URL для удалённого запроса.');
+  }
+
+  if (parsed.protocol !== 'https:') {
+    throw new Error('Удалённые запросы разрешены только по HTTPS.');
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new Error('URL с userinfo запрещены для удалённого fetch.');
+  }
+
+  const host = parsed.hostname.trim().toLowerCase();
+  const forbiddenHosts = new Set(['localhost', 'localhost.', '0.0.0.0', '127.0.0.1', '::1', '[::1]']);
+  if (forbiddenHosts.has(host) || host.endsWith('.localhost')) {
+    throw new Error('Локальные hostnames запрещены для удалённого fetch.');
+  }
+
+  if (/^(10|127)\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) || /^169\.254\./.test(host)) {
+    throw new Error('Локальные, приватные и служебные IP-адреса запрещены для удалённого fetch.');
+  }
+
+  return parsed.toString();
+}
+
 export const allowDemoFallbackByEnv = String(envFlag ?? '').trim().toLowerCase() === 'true';
 
-async function invokeTauri<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
-  const { invoke } = await import('@tauri-apps/api/core');
-  return invoke<T>(command, args);
+const NATIVE_COMMAND_TIMEOUTS_MS: Record<string, number> = {
+  request_connect: 45000,
+  request_disconnect: 25000,
+  set_system_proxy: 18000,
+  public_ip_snapshot: 12000,
+  fetch_remote_text: 20000,
+  revoke_hwid_device: 20000,
+  connectivity_probe: 12000,
+  server_ping: 4500,
+  traffic_snapshot: 7000,
+  runtime_status: 9000,
+  proxy_status: 9000,
+  read_runtime_log: 5000,
+  write_interface_log: 3500,
+  write_routing_log: 3500,
+  load_access_key_secure: 9000,
+  save_access_key_secure: 12000,
+  clear_access_key_secure: 9000,
+  native_app_info: 12000,
+  pick_executable_path: 120000
+};
+
+function commandTimeoutMessage(command: string, timeoutMs: number) {
+  const seconds = Math.round(timeoutMs / 1000);
+  if (command === 'request_connect') {
+    return `Подключение заняло больше ${seconds} секунд. UI разблокирован, состояние runtime будет обновлено автоматически.`;
+  }
+  if (command === 'request_disconnect') {
+    return `Отключение заняло больше ${seconds} секунд. UI разблокирован, состояние runtime будет обновлено автоматически.`;
+  }
+  if (command === 'set_system_proxy') {
+    return `Изменение системного proxy заняло больше ${seconds} секунд. Проверьте состояние proxy в диагностике.`;
+  }
+  return `Нативная команда ${command} не ответила за ${seconds} секунд.`;
 }
+
+function withClientTimeout<T>(operation: Promise<T>, timeoutMs: number, command: string): Promise<T> {
+  let timer: number | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(commandTimeoutMessage(command, timeoutMs))), timeoutMs);
+  });
+
+  return Promise.race([operation, timeoutPromise]).finally(() => {
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+    }
+  }) as Promise<T>;
+}
+
+async function invokeTauri<T>(command: string, args: Record<string, unknown> = {}, timeoutMs = NATIVE_COMMAND_TIMEOUTS_MS[command] ?? 12000): Promise<T> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  return withClientTimeout(invoke<T>(command, args), timeoutMs, command);
+}
+
 
 
 function extractErrorMessage(error: unknown, depth = 0): string {
@@ -87,7 +171,7 @@ function extractErrorMessage(error: unknown, depth = 0): string {
 }
 
 export function normalizeNativeError(error: unknown, fallback: string): Error {
-  const message = extractErrorMessage(error) || fallback;
+  const message = redactSensitiveText(extractErrorMessage(error) || fallback);
   return new Error(message);
 }
 
@@ -148,6 +232,32 @@ export async function listNativeRunningApps(): Promise<RunningAppInfo[]> {
   return invokeTauri<RunningAppInfo[]>('list_running_apps');
 }
 
+
+export async function getNativeAppInfo(): Promise<NativeAppInfo> {
+  if (!isTauriRuntime) {
+    return {
+      appVersion,
+      xrayVersion: 'Web preview',
+      hwid: '—',
+      osName: navigator.platform || 'Web',
+      osVersion: navigator.userAgent,
+      osBuild: '—',
+      osArchitecture: navigator.userAgent.includes('Win64') || navigator.userAgent.includes('x64') ? 'x64' : '—',
+      deviceName: 'Web preview'
+    };
+  }
+
+  return invokeTauri<NativeAppInfo>('native_app_info');
+}
+
+export async function pickNativeExecutablePath(): Promise<string | null> {
+  if (!isTauriRuntime) {
+    return null;
+  }
+
+  return invokeTauri<string | null>('pick_executable_path', {}, NATIVE_COMMAND_TIMEOUTS_MS.pick_executable_path);
+}
+
 export async function restartNativeApplication(): Promise<void> {
   if (!isTauriRuntime) {
     window.location.reload();
@@ -201,6 +311,46 @@ export async function setNativeSystemProxy(enabled: boolean): Promise<ProxyStatu
   return invokeTauri<ProxyStatus>('set_system_proxy', { enabled });
 }
 
+
+
+export async function pingNativeServer(server: VpnServer): Promise<ConnectivityProbe> {
+  const host = server.host?.trim();
+  const port = Number(server.port ?? 443);
+
+  if (!host || !Number.isFinite(port) || port <= 0) {
+    throw new Error('У выбранного сервера нет host/port для проверки пинга. Обновите профиль серверов.');
+  }
+
+  if (!isTauriRuntime) {
+    const started = performance.now();
+    await new Promise((resolve) => window.setTimeout(resolve, 80 + Math.round(Math.random() * 40)));
+    return {
+      success: true,
+      checkedAt: new Date().toLocaleString('ru-RU'),
+      httpPortOpen: false,
+      socksPortOpen: false,
+      latencyMs: Math.max(1, Math.round(performance.now() - started)),
+      packetLossPct: 0,
+      message: 'Web-preview имитирует TCP ping. В нативной сборке используется реальная TCP-проверка host:port.'
+    };
+  }
+
+  return invokeTauri<ConnectivityProbe>('server_ping', { host, port });
+}
+
+export async function getNativeTrafficSnapshot(): Promise<TrafficSnapshot> {
+  if (!isTauriRuntime) {
+    return {
+      receivedBytes: 0,
+      sentBytes: 0,
+      checkedAt: new Date().toLocaleString('ru-RU'),
+      source: 'mock'
+    };
+  }
+
+  return invokeTauri<TrafficSnapshot>('traffic_snapshot');
+}
+
 export async function runNativeConnectivityProbe(): Promise<ConnectivityProbe> {
   if (!isTauriRuntime) {
     return {
@@ -228,7 +378,7 @@ export async function writeNativeInterfaceLog(message: string, details?: string)
     return;
   }
 
-  await invokeTauri('write_interface_log', { message, details });
+  await invokeTauri('write_interface_log', { message: redactSensitiveText(message), details: details ? redactSensitiveText(details) : undefined });
 }
 
 export async function writeNativeRoutingLog(message: string, details?: string) {
@@ -236,7 +386,7 @@ export async function writeNativeRoutingLog(message: string, details?: string) {
     return;
   }
 
-  await invokeTauri('write_routing_log', { message, details });
+  await invokeTauri('write_routing_log', { message: redactSensitiveText(message), details: details ? redactSensitiveText(details) : undefined });
 }
 
 
@@ -245,11 +395,12 @@ export async function fetchRemoteText(url: string, accept = 'text/plain, applica
     return invokeTauri<string>('fetch_remote_text', { url, accept });
   }
 
+  const safeUrl = validateWebRemoteFetchUrl(url);
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 8000);
 
   try {
-    const response = await fetch(url, {
+    const response = await fetch(safeUrl, {
       method: 'GET',
       headers: { Accept: accept },
       signal: controller.signal
@@ -382,14 +533,6 @@ export async function requestWindowHide() {
   }
 
   await invokeTauri('window_hide');
-}
-
-export async function startWindowDrag() {
-  if (!isTauriRuntime) {
-    return;
-  }
-
-  await invokeTauri('window_start_drag');
 }
 
 export function getIntegrationMeta() {

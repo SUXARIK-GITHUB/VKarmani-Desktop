@@ -1,5 +1,5 @@
 export type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnecting';
-export type AppTab = 'overview' | 'servers' | 'devices' | 'diagnostics' | 'settings';
+export type AppTab = 'overview' | 'support' | 'diagnostics' | 'settings';
 export type ReleaseChannel = 'stable' | 'beta';
 export type UiLanguage = 'ru' | 'en';
 export type AccessKeyKind = 'short-uuid' | 'uuid' | 'url' | 'raw';
@@ -19,6 +19,18 @@ export interface RunningAppInfo {
   title?: string;
 }
 
+export interface NativeAppInfo {
+  appVersion: string;
+  xrayVersion: string;
+  hwid: string;
+  osName: string;
+  osVersion: string;
+  osBuild: string;
+  osArchitecture: string;
+  deviceName: string;
+  corePath?: string;
+}
+
 export interface SplitTunnelEntry {
   id: string;
   kind: SplitTunnelEntryKind;
@@ -28,8 +40,8 @@ export interface SplitTunnelEntry {
 
 export interface XrayRuntimeTemplate {
   family: 'xray';
-  protocol: 'vless' | 'vmess' | 'trojan' | 'shadowsocks' | 'unknown';
-  transport?: 'raw' | 'ws' | 'grpc' | 'httpupgrade' | 'xhttp' | 'tcp';
+  protocol: 'vless' | 'vmess' | 'trojan' | 'shadowsocks' | 'hysteria2' | 'unknown';
+  transport?: 'raw' | 'ws' | 'grpc' | 'httpupgrade' | 'xhttp' | 'tcp' | 'udp';
   outbound: Record<string, unknown>;
   remarks?: string;
 }
@@ -39,9 +51,11 @@ export interface VpnServer {
   country: string;
   city: string;
   flag: string;
-  latency: number;
+  latency?: number | null;
+  latencyCheckedAt?: string;
+  latencyStatus?: 'unchecked' | 'checking' | 'ok' | 'failed';
   load: number;
-  protocol: 'Xray' | 'Reality' | 'VLESS' | 'Sing-box';
+  protocol: 'Xray' | 'Reality' | 'VLESS' | 'Sing-box' | 'Hysteria2';
   isRecommended?: boolean;
   tags?: string[];
   ipPool?: string;
@@ -161,7 +175,15 @@ export interface ConnectivityProbe {
   socksPortOpen: boolean;
   publicIp?: string;
   latencyMs?: number;
+  packetLossPct?: number;
   message: string;
+}
+
+export interface TrafficSnapshot {
+  receivedBytes: number;
+  sentBytes: number;
+  checkedAt: string;
+  source: 'xray-stats' | 'windows-tun-adapter' | 'unavailable' | 'session-estimate' | 'mock';
 }
 
 export interface IntegrationMeta {
@@ -176,6 +198,7 @@ export interface AppSettings {
   runAsAdmin: boolean;
   showDiagnostics: boolean;
   autoConnect: boolean;
+  autoConnectFavorite: boolean;
   minimizeToTray: boolean;
   notifications: boolean;
   autoUpdate: boolean;

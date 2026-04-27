@@ -58,7 +58,7 @@ fn build_runtime_status(app: &AppHandle, state: tauri::State<AppState>) -> Runti
         last_sync_source,
         message,
         core_path: runtime_snapshot.as_ref().map(|snapshot| snapshot.0.clone()).or(core_path),
-        config_path: None,
+        config_path: runtime_snapshot.as_ref().map(|snapshot| snapshot.1.clone()),
         log_path: runtime_snapshot.as_ref().map(|snapshot| snapshot.2.clone()),
         launch_mode: if runtime_snapshot.is_some() {
             "xray-sidecar".into()

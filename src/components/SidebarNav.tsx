@@ -1,42 +1,12 @@
-import { Activity, LayoutDashboard, MonitorSmartphone, Server, Settings2 } from 'lucide-react';
+import { BarChart3, CircleAlert, Headphones, Home, LogOut, Settings } from 'lucide-react';
 import { tr, type UiLanguage } from '../i18n';
 import type { AppTab, ConnectionState, DeviceRecord, RemnawaveSession } from '../types/vpn';
-
-function resolveSidebarSubscription(language: UiLanguage, expiresAt: string) {
-  const normalized = expiresAt?.trim();
-  if (!normalized || normalized === '—' || normalized === 'Не ограничен' || normalized === 'Неизвестно') {
-    return {
-      title: tr(language, 'Подписка активна', 'Subscription active'),
-      hint: '',
-      tone: 'good' as const
-    };
-  }
-
-  const parts = normalized.match(/(\d{2})\.(\d{2})\.(\d{4})/);
-  if (!parts) {
-    return {
-      title: tr(language, 'Подписка активна', 'Subscription active'),
-      hint: `${tr(language, 'До', 'Until')} ${normalized}`,
-      tone: 'good' as const
-    };
-  }
-
-  const [, dd, mm, yyyy] = parts;
-  const parsed = new Date(Number(yyyy), Number(mm) - 1, Number(dd), 23, 59, 59);
-  const active = parsed.getTime() >= Date.now();
-
-  return {
-    title: active
-      ? tr(language, 'Подписка активна', 'Subscription active')
-      : tr(language, 'Подписка не активна', 'Subscription inactive'),
-    hint: `${tr(language, 'До', 'Until')} ${normalized}`,
-    tone: active ? ('good' as const) : ('bad' as const)
-  };
-}
 
 interface SidebarNavProps {
   activeTab: AppTab;
   onChange: (tab: AppTab) => void;
+  onExit?: () => void;
+  onShowInfo?: () => void;
   connectionState: ConnectionState;
   session: RemnawaveSession;
   devices: DeviceRecord[];
@@ -44,56 +14,62 @@ interface SidebarNavProps {
   showDiagnostics: boolean;
 }
 
-export function SidebarNav({ activeTab, onChange, connectionState, session, language, showDiagnostics }: SidebarNavProps) {
-  const statusText = {
-    idle: tr(language, 'Не подключено', 'Disconnected'),
-    connecting: tr(language, 'Подключение…', 'Connecting…'),
-    connected: tr(language, 'Защищено', 'Protected'),
-    disconnecting: tr(language, 'Отключение…', 'Disconnecting…')
-  }[connectionState];
-
-  const subscriptionState = resolveSidebarSubscription(language, session.plan.expiresAt);
-
-  const labels: Record<AppTab, string> = {
-    overview: tr(language, 'Обзор', 'Overview'),
-    servers: tr(language, 'Серверы', 'Servers'),
-    devices: tr(language, 'Устройства', 'Devices'),
-    diagnostics: tr(language, 'Диагностика', 'Diagnostics'),
-    settings: tr(language, 'Настройки', 'Settings')
-  };
-
-  const tabs: Array<{ id: AppTab; icon: typeof LayoutDashboard }> = [
-    { id: 'overview', icon: LayoutDashboard },
-    { id: 'servers', icon: Server },
-    { id: 'devices', icon: MonitorSmartphone },
-    ...(showDiagnostics ? [{ id: 'diagnostics' as AppTab, icon: Activity }] : []),
-    { id: 'settings', icon: Settings2 }
+export function SidebarNav({ activeTab, onChange, onExit, onShowInfo, language, showDiagnostics }: SidebarNavProps) {
+  const items: Array<{ id: AppTab; label: string; icon: typeof Home }> = [
+    { id: 'overview', label: tr(language, 'Главная', 'Home'), icon: Home },
+    ...(showDiagnostics ? [{ id: 'diagnostics' as AppTab, label: tr(language, 'Статистика', 'Statistics'), icon: BarChart3 }] : []),
+    { id: 'settings', label: tr(language, 'Настройки', 'Settings'), icon: Settings },
+    { id: 'support', label: tr(language, 'Поддержка', 'Support'), icon: Headphones }
   ];
 
   return (
-    <aside className="sidebar">
-      <div className="sidebar-profile">
-        <span className={`chip status-chip ${connectionState}`}>{statusText}</span>
-        <strong>{session.plan.title}</strong>
-        <span className={`sidebar-subscription ${subscriptionState.tone}`}>{subscriptionState.title}</span>
-        {subscriptionState.hint ? <span className="sidebar-hint single-line-hint">{subscriptionState.hint}</span> : null}
+    <aside className="vk-sidebar">
+      <div className="vk-sidebar-brand" aria-label="VKarmani">
+        <div className="vk-orb-logo" aria-hidden="true">
+          <img src="/assets/logo-vkarmani.png" alt="" className="vk-orb-logo-image" />
+        </div>
       </div>
 
-      <nav className="sidebar-nav">
-        {tabs.map((tab) => {
-          const Icon = tab.icon;
+      <nav className="vk-sidebar-menu" aria-label={tr(language, 'Навигация', 'Navigation')}>
+        {items.map((item) => {
+          const Icon = item.icon;
           return (
             <button
-              key={tab.id}
-              className={`nav-button ${tab.id === activeTab ? 'active' : ''}`}
-              onClick={() => onChange(tab.id)}
+              key={item.id}
+              type="button"
+              className={`vk-nav-item ${activeTab === item.id ? 'active' : ''}`}
+              onClick={() => onChange(item.id)}
+              aria-label={item.label}
+              title={item.label}
             >
-              <Icon size={18} />
-              <span>{labels[tab.id]}</span>
+              <Icon size={22} />
+              <span>{item.label}</span>
             </button>
           );
         })}
       </nav>
+
+      <div className="vk-sidebar-footer">
+        <button
+          type="button"
+          className="vk-info-button"
+          onClick={onShowInfo}
+          aria-label={tr(language, 'Информация о программе', 'Application information')}
+          title={tr(language, 'Информация о программе', 'Application information')}
+        >
+          <CircleAlert size={21} />
+        </button>
+        <button
+          type="button"
+          className="vk-exit-button"
+          onClick={onExit}
+          aria-label={tr(language, 'Выйти', 'Exit')}
+          title={tr(language, 'Выйти', 'Exit')}
+        >
+          <LogOut size={22} />
+          <span>{tr(language, 'Выйти', 'Exit')}</span>
+        </button>
+      </div>
     </aside>
   );
 }

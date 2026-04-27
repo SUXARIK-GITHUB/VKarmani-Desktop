@@ -6,9 +6,9 @@ interface ToastViewportProps {
 
 export function ToastViewport({ items }: ToastViewportProps) {
   return (
-    <div className="toast-viewport" aria-live="polite">
+    <div className="toast-viewport" aria-live="polite" aria-atomic="true">
       {items.map((item) => (
-        <article key={item.id} className={`toast-card ${item.tone}`}>
+        <article key={item.id} className={`toast toast-card ${item.tone}`} role="status">
           <strong>{item.title}</strong>
         </article>
       ))}

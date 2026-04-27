@@ -38,7 +38,24 @@ import { maybeDecodeBase64, parsePort, splitHostPort } from './remnawave/parserC
 import { parseSubscriptionToServers } from './remnawave/subscriptionParser';
 
 const delay = (value: number) => new Promise<void>((resolve) => window.setTimeout(resolve, value));
-const REQUEST_TIMEOUT_MS = 4500;
+const previewDelay = (value: number) => isTauriRuntime ? Promise.resolve() : delay(value);
+const REQUEST_TIMEOUT_MS = 6500;
+const VKARMANI_SUBSCRIPTION_PREFIX = 'https://sub.vkarmani.com/';
+
+function withRequestTimeout<T>(operation: Promise<T>, url: string): Promise<T> {
+  let timer: number | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => {
+      reject(new Error(`Remnawave endpoint не ответил за ${Math.round(REQUEST_TIMEOUT_MS / 1000)} секунд: ${url}`));
+    }, REQUEST_TIMEOUT_MS);
+  });
+
+  return Promise.race([operation, timeoutPromise]).finally(() => {
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+    }
+  }) as Promise<T>;
+}
 
 interface ResolvedAccessKey {
   rawInput: string;
@@ -282,49 +299,34 @@ function resolveAccessKey(rawInput: string): ResolvedAccessKey {
     throw new Error('Введите ключ доступа.');
   }
 
+  if (!normalized.startsWith(VKARMANI_SUBSCRIPTION_PREFIX)) {
+    throw new Error('Ключ доступа должен начинаться с https://sub.vkarmani.com/. Используйте только ключ VKarmani.');
+  }
+
+  let url: URL;
   try {
-    const url = new URL(normalized);
-    const pathname = url.pathname.replace(/\/+$/g, '');
-    const parts = pathname.split('/').filter(Boolean);
-    const identifier = parts[parts.length - 1] ?? '';
-    if (!identifier) {
-      throw new Error();
-    }
-
-    return {
-      rawInput,
-      normalized,
-      identifier,
-      shortUuid: looksLikeUuid(identifier) ? undefined : identifier,
-      kind: 'url'
-    };
+    url = new URL(normalized);
   } catch {
-    if (looksLikeUuid(normalized)) {
-      return {
-        rawInput,
-        normalized,
-        identifier: normalized,
-        kind: 'uuid'
-      };
-    }
+    throw new Error('Некорректная ссылка ключа доступа VKarmani.');
+  }
 
-    if (looksLikeShortUuid(normalized)) {
-      return {
-        rawInput,
-        normalized,
-        identifier: normalized,
-        shortUuid: normalized,
-        kind: 'short-uuid'
-      };
-    }
+  if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== 'sub.vkarmani.com') {
+    throw new Error('Ключ доступа должен быть ссылкой VKarmani: https://sub.vkarmani.com/...');
+  }
+
+  const pathname = url.pathname.replace(/\/+$/g, '');
+  const parts = pathname.split('/').filter(Boolean);
+  const identifier = parts[parts.length - 1] ?? '';
+  if (!identifier || identifier.length < 5) {
+    throw new Error('В ссылке VKarmani не найден идентификатор подписки.');
   }
 
   return {
     rawInput,
     normalized,
-    identifier: normalized,
-    shortUuid: normalized,
-    kind: 'raw'
+    identifier,
+    shortUuid: looksLikeUuid(identifier) ? undefined : identifier,
+    kind: 'url'
   };
 }
 
@@ -335,20 +337,19 @@ function buildUrlDerivedCandidates(rawUrl: string, shortUuid?: string) {
     const url = new URL(rawUrl);
     const base = `${url.origin}${url.pathname.replace(/\/+$/g, '')}`;
     const origin = url.origin;
+    const encodedShortUuid = shortUuid ? encodeURIComponent(shortUuid) : '';
 
     candidates.push(base);
-    if (!base.endsWith('/info')) {
-      candidates.push(`${base}/info`);
-    }
     if (!base.endsWith('/raw')) {
       candidates.push(`${base}/raw`);
     }
+    if (!base.endsWith('/info')) {
+      candidates.push(`${base}/info`);
+    }
 
-    if (shortUuid) {
-      candidates.push(`${origin}/api/sub/${shortUuid}/info`);
-      candidates.push(`${origin}/api/sub/${shortUuid}/raw`);
-      candidates.push(`${origin}/api/subscriptions/by-short-uuid/${shortUuid}`);
-      candidates.push(`${origin}/api/subscriptions/by-short-uuid/${shortUuid}/raw`);
+    if (encodedShortUuid) {
+      candidates.push(`${origin}/api/sub/${encodedShortUuid}/raw`);
+      candidates.push(`${origin}/api/sub/${encodedShortUuid}/info`);
     }
   } catch {
     // ignore malformed URL here; resolver handles validation separately.
@@ -368,12 +369,12 @@ function buildInfoCandidates(key: ResolvedAccessKey) {
   }
 
   if (subscription && shortUuid) {
-    candidates.push(`${subscription}/api/sub/${shortUuid}/info`);
+    candidates.push(`${subscription}/api/sub/${encodeURIComponent(shortUuid)}/info`);
   }
 
   if (panel && shortUuid) {
-    candidates.push(`${panel}/api/sub/${shortUuid}/info`);
-    candidates.push(`${panel}/api/subscriptions/by-short-uuid/${shortUuid}`);
+    candidates.push(`${panel}/api/sub/${encodeURIComponent(shortUuid)}/info`);
+    candidates.push(`${panel}/api/subscriptions/by-short-uuid/${encodeURIComponent(shortUuid)}`);
   }
 
   if (panel && looksLikeUuid(key.identifier)) {
@@ -403,12 +404,12 @@ function buildRawCandidates(key: ResolvedAccessKey, session?: RemnawaveSession |
   }
 
   if (subscription && shortUuid) {
-    candidates.push(`${subscription}/api/sub/${shortUuid}/raw`);
+    candidates.push(`${subscription}/api/sub/${encodeURIComponent(shortUuid)}/raw`);
   }
 
   if (panel && shortUuid) {
-    candidates.push(`${panel}/api/subscriptions/by-short-uuid/${shortUuid}/raw`);
-    candidates.push(`${panel}/api/sub/${shortUuid}/raw`);
+    candidates.push(`${panel}/api/subscriptions/by-short-uuid/${encodeURIComponent(shortUuid)}/raw`);
+    candidates.push(`${panel}/api/sub/${encodeURIComponent(shortUuid)}/raw`);
   }
 
   return [...new Set(candidates)];
@@ -420,7 +421,7 @@ async function fetchJsonCandidates(urls: string[]): Promise<CandidateResult<unkn
   for (const url of urls) {
     try {
       return {
-        value: await fetchRemoteJson(url),
+        value: await withRequestTimeout(fetchRemoteJson(url), url),
         url
       };
     } catch (error) {
@@ -437,7 +438,7 @@ async function fetchTextCandidates(urls: string[]): Promise<CandidateResult<stri
   for (const url of urls) {
     try {
       return {
-        value: await fetchRemoteText(url),
+        value: await withRequestTimeout(fetchRemoteText(url), url),
         url
       };
     } catch (error) {
@@ -585,6 +586,17 @@ function mapSessionFromPayload(
   };
 }
 
+function proxyStatusFromRuntime(runtime: RuntimeStatus): ProxyStatus {
+  return {
+    enabled: Boolean(runtime.systemProxyEnabled),
+    server: runtime.proxyServer,
+    bypass: runtime.proxyBypass,
+    method: runtime.bridge === 'tauri' ? 'wininet-registry' : 'mock',
+    scope: 'current-user',
+    checkedAt: new Date().toLocaleString('ru-RU')
+  };
+}
+
 export class RemnawaveClient {
   private cachedServers: VpnServer[] = [];
   private cachedSession: RemnawaveSession | null = null;
@@ -597,6 +609,7 @@ export class RemnawaveClient {
     message: 'Серверы появятся после синхронизации вашего профиля Remnawave.'
   };
   private lastProbe: ConnectivityProbe | null = null;
+  private runtimeSnapshotInFlight: Promise<{ runtime: RuntimeStatus; proxyStatus: ProxyStatus; diagnostics: DiagnosticsSnapshot }> | null = null;
 
   constructor(
     private readonly options: {
@@ -749,17 +762,17 @@ export class RemnawaveClient {
   }
 
   async loadServers(): Promise<VpnServer[]> {
-    await delay(120);
+    await previewDelay(120);
     return this.cachedServers;
   }
 
   async loadProxyStatus(): Promise<ProxyStatus> {
-    await delay(80);
+    await previewDelay(80);
     return getNativeProxyStatus();
   }
 
   async applySystemProxy(enabled: boolean): Promise<ProxyStatus> {
-    await delay(80);
+    await previewDelay(80);
     return setNativeSystemProxy(enabled);
   }
 
@@ -778,7 +791,7 @@ export class RemnawaveClient {
       splitTunnelEntries?: SplitTunnelEntry[];
     } = {}
   ): Promise<ConnectResult> {
-    await delay(250);
+    await previewDelay(250);
     const exists = this.cachedServers.find((item) => item.id === server.id)
       ?? this.cachedServers.find((item) => {
         const sameRuntime = JSON.stringify(item.runtimeTemplate ?? null) === JSON.stringify(server.runtimeTemplate ?? null);
@@ -862,7 +875,7 @@ export class RemnawaveClient {
   }
 
   async disconnect(options: { useSystemProxy?: boolean } = {}): Promise<void> {
-    await delay(120);
+    await previewDelay(120);
     let firstError: unknown = null;
 
     if (options.useSystemProxy) {
@@ -885,12 +898,12 @@ export class RemnawaveClient {
   }
 
   async loadDevices(): Promise<DeviceRecord[]> {
-    await delay(120);
+    await previewDelay(120);
     return this.cachedDevices.length ? this.cachedDevices : [buildLocalDeviceRecord()];
   }
 
   async revokeDevice(deviceId: string): Promise<DeviceRecord[]> {
-    await delay(120);
+    await previewDelay(120);
     const current = this.cachedDevices.length ? this.cachedDevices : [buildLocalDeviceRecord()];
     const device = current.find((item) => item.id === deviceId);
 
@@ -918,22 +931,18 @@ export class RemnawaveClient {
   }
 
   async loadHistory(): Promise<SessionRecord[]> {
-    await delay(80);
+    await previewDelay(80);
     return [];
   }
 
   async loadRuntimeStatus(): Promise<RuntimeStatus> {
     return getNativeRuntimeStatus();
   }
-
-  async loadDiagnostics(): Promise<DiagnosticsSnapshot> {
-    await delay(140);
-    const [runtime, proxyStatus, nativeLogLines] = await Promise.all([
-      this.loadRuntimeStatus(),
-      this.loadProxyStatus(),
-      readNativeRuntimeLog(16)
-    ]);
-
+  private buildDiagnosticsSnapshot(
+    runtime: RuntimeStatus,
+    proxyStatus: ProxyStatus,
+    nativeLogLines: string[]
+  ): DiagnosticsSnapshot {
     const probeLine = this.lastProbe
       ? this.lastProbe.success
         ? `[probe] OK · IP ${this.lastProbe.publicIp ?? 'не определён'} · ${this.lastProbe.latencyMs ?? 0} мс`
@@ -952,7 +961,7 @@ export class RemnawaveClient {
     ];
 
     const routeMode = runtime.networkMode === 'tun'
-      ? `TUN mode${runtime.tunInterfaceName ? ` (${runtime.tunInterfaceName})` : ''}`
+      ? `TUN selective${runtime.tunInterfaceName ? ` (${runtime.tunInterfaceName})` : ''}`
       : runtime.launchMode === 'xray-sidecar'
         ? `Xray sidecar ${runtime.socksPort ? `SOCKS:${runtime.socksPort}` : ''}${runtime.httpPort ? ` / HTTP:${runtime.httpPort}` : ''}`.trim()
         : runtime.bridge === 'tauri'
@@ -976,6 +985,46 @@ export class RemnawaveClient {
       lastConfigSync: this.profileSyncInfo.lastSyncAt ?? 'Синхронизация ещё не запускалась',
       logLines: mergedLogLines
     };
+  }
+
+  async loadRuntimeSnapshot(): Promise<{ runtime: RuntimeStatus; proxyStatus: ProxyStatus; diagnostics: DiagnosticsSnapshot }> {
+    if (this.runtimeSnapshotInFlight) {
+      return this.runtimeSnapshotInFlight;
+    }
+
+    this.runtimeSnapshotInFlight = (async () => {
+      await previewDelay(80);
+      const [runtime, nativeLogLines] = await Promise.all([
+        this.loadRuntimeStatus(),
+        readNativeRuntimeLog(16)
+      ]);
+      const proxyStatus = proxyStatusFromRuntime(runtime);
+
+      return {
+        runtime,
+        proxyStatus,
+        diagnostics: this.buildDiagnosticsSnapshot(runtime, proxyStatus, nativeLogLines)
+      };
+    })();
+
+    try {
+      return await this.runtimeSnapshotInFlight;
+    } finally {
+      this.runtimeSnapshotInFlight = null;
+    }
+  }
+
+  async loadDiagnostics(): Promise<DiagnosticsSnapshot> {
+    return (await this.loadRuntimeSnapshot()).diagnostics;
+  }
+}
+
+export function isVkarmaniAccessKey(value: string) {
+  try {
+    resolveAccessKey(value);
+    return true;
+  } catch {
+    return false;
   }
 }
 

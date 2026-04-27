@@ -22,6 +22,17 @@ mod tests {
     }
 
     #[test]
+    fn redaction_masks_query_secrets_and_uuids() {
+        let input = "uuid 123e4567-e89b-12d3-a456-426614174000 url https://sub.vkarmani.com/super-secret-path?token=shortSecret&key=abc";
+        let output = redact_sensitive(input);
+        assert!(!output.contains("123e4567-e89b-12d3-a456-426614174000"));
+        assert!(!output.contains("super-secret-path"));
+        assert!(!output.contains("token=shortSecret"));
+        assert!(!output.contains("key=abc"));
+        assert!(output.contains("[redacted-key]") || output.contains("[redacted-secret]"));
+    }
+
+    #[test]
     fn runtime_port_validation_keeps_ports_in_u16_range() {
         assert_eq!(value_as_valid_port(&json!(1)), Some(1));
         assert_eq!(value_as_valid_port(&json!(65535)), Some(65535));
@@ -42,6 +53,12 @@ mod tests {
         let (host, port) = extract_outbound_address_and_port(&template);
         assert_eq!(host.as_deref(), Some("example.com"));
         assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn xray_stat_parser_reads_cli_value() {
+        let output = "stat: <\n  name: \"outbound>>>proxy>>>traffic>>>downlink\"\n  value: 123456\n>";
+        assert_eq!(parse_xray_stat_value(output), Some(123456));
     }
 
     #[test]

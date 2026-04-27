@@ -1,11 +1,21 @@
+import { useRef, useState } from 'react';
 import {
+  ArrowRight,
   ArrowUpRight,
-  Bot,
   CheckCircle2,
   ClipboardPaste,
+  Eye,
+  EyeOff,
+  Globe2,
   KeyRound,
+  LockKeyhole,
+  Rocket,
+  ServerCog,
   Shield,
-  X
+  ShieldCheck,
+  Sparkles,
+  X,
+  Zap
 } from 'lucide-react';
 import { tr, type UiLanguage } from '../i18n';
 import type { IntegrationMeta } from '../types/vpn';
@@ -27,19 +37,11 @@ function detectAccessKeyKind(value: string) {
     return 'empty' as const;
   }
 
-  if (/^https?:\/\//i.test(normalized)) {
+  if (normalized.startsWith('https://sub.vkarmani.com/')) {
     return 'url' as const;
   }
 
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized)) {
-    return 'uuid' as const;
-  }
-
-  if (/^[A-Za-z0-9_-]{5,64}$/.test(normalized)) {
-    return 'short-uuid' as const;
-  }
-
-  return 'raw' as const;
+  return 'invalid' as const;
 }
 
 function summarizeAccessKey(value: string) {
@@ -74,47 +76,83 @@ export function AuthScreen({
   onAccessKeyChange,
   onAuthorize
 }: AuthScreenProps) {
+  const [showAccessKey, setShowAccessKey] = useState(false);
   const normalizedKey = accessKey.trim();
   const accessKeyKind = detectAccessKeyKind(accessKey);
-  const canSubmit = Boolean(normalizedKey) && !authLoading;
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const canSubmit = Boolean(normalizedKey) && accessKeyKind === 'url' && !authLoading;
   const hasClipboard = typeof navigator !== 'undefined' && 'clipboard' in navigator;
   const keyPreview = summarizeAccessKey(accessKey);
   const isError = Boolean(errorText);
   const statusTone = authLoading ? 'loading' : isError ? 'error' : normalizedKey ? 'ready' : 'idle';
 
   const helperText = {
-    empty: tr(language, 'Вставьте short UUID, UUID, subscription URL или raw-ключ.', 'Paste a short UUID, UUID, subscription URL, or raw key.'),
-    url: '',
-    uuid: tr(language, 'Обнаружен UUID. Клиент попробует разрешить его через live-интеграцию и подготовить рабочий профиль.', 'A UUID was detected. The client will try to resolve it through the live integration and prepare a working profile.'),
-    'short-uuid': tr(language, 'Обнаружен short UUID. Это быстрый формат для входа и последующей синхронизации профиля.', 'A short UUID was detected. This is a quick format for sign-in and profile sync.'),
-    raw: tr(language, 'Обнаружен raw-ключ. Клиент проверит его и определит подходящий маршрут авторизации.', 'A raw key was detected. The client will validate it and determine the proper authorization route.')
+    empty: tr(language, 'Вставьте ключ доступа VKarmani, который начинается с https://sub.vkarmani.com/.', 'Paste a VKarmani access key that starts with https://sub.vkarmani.com/.'),
+    url: tr(language, 'Обнаружена ссылка VKarmani. Проверим профиль и импортируем серверы.', 'VKarmani URL detected. We will verify the profile and import servers.'),
+    invalid: tr(language, 'Принимаются только ключи VKarmani формата https://sub.vkarmani.com/....', 'Only VKarmani keys in the format https://sub.vkarmani.com/... are accepted.')
   }[accessKeyKind];
 
   const statusTitle = {
-    idle: tr(language, 'Готово к входу', 'Ready to sign in'),
+    idle: tr(language, 'Ожидаем ключ доступа', 'Waiting for access key'),
     ready: tr(language, 'Ключ готов к проверке', 'Key is ready to verify'),
     loading: tr(language, 'Проверяем доступ', 'Checking access'),
     error: tr(language, 'Не удалось подтвердить ключ', 'Could not verify the key')
   }[statusTone];
 
   const statusBody = {
-    idle: tr(language, 'Вставьте ключ доступа. После проверки клиент синхронизирует профиль и список серверов.', 'Paste your access key. After verification the client will sync your profile and server list.'),
+    idle: tr(language, 'После проверки VKarmani синхронизирует профиль Remnawave и подготовит список серверов.', 'After verification VKarmani will sync the Remnawave profile and prepare the server list.'),
     ready: helperText,
-    loading: tr(language, 'Пожалуйста, подождите. Мы проверяем ключ и готовим профиль подключения.', 'Please wait. We are verifying the key and preparing the connection profile.'),
-    error: errorText || tr(language, 'Проверьте формат ключа, доступ к сети или запросите новый ключ в Telegram-боте.', 'Check the key format, network access, or request a new key in the Telegram bot.')
+    loading: tr(language, 'Проверяем ключ, импортируем профиль и подготавливаем защищённый маршрут.', 'Verifying the key, importing the profile, and preparing a secure route.'),
+    error: errorText || tr(language, 'Проверьте формат ключа, доступ к сети или запросите новый ключ.', 'Check the key format, network access, or request a new key.')
   }[statusTone];
 
   const accessKeyTypeLabel = accessKeyKind === 'url'
-    ? 'Subscription URL'
-    : accessKeyKind === 'uuid'
-      ? 'UUID'
-      : accessKeyKind === 'short-uuid'
-        ? 'Short UUID'
-        : accessKeyKind === 'raw'
-          ? tr(language, 'Raw key', 'Raw key')
-          : tr(language, 'Ожидаем ключ', 'Waiting for key');
+    ? 'VKarmani URL'
+    : accessKeyKind === 'invalid'
+      ? tr(language, 'Неверный формат', 'Invalid format')
+      : tr(language, 'Ключ не введён', 'No key entered');
 
-  const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+  const onKeyDown = async (event: React.KeyboardEvent<HTMLInputElement>) => {
+    const input = inputRef.current;
+    const isShortcut = event.ctrlKey || event.metaKey;
+    const key = event.key.toLowerCase();
+
+    if (isShortcut && input) {
+      if (key === 'v' && hasClipboard) {
+        event.preventDefault();
+        try {
+          const text = await navigator.clipboard.readText();
+          const start = input.selectionStart ?? accessKey.length;
+          const end = input.selectionEnd ?? accessKey.length;
+          onAccessKeyChange(`${accessKey.slice(0, start)}${text}${accessKey.slice(end)}`);
+        } catch {
+          // Native WebView can still handle paste if clipboard API is blocked.
+        }
+        return;
+      }
+
+      if (key === 'c' && hasClipboard) {
+        const start = input.selectionStart ?? 0;
+        const end = input.selectionEnd ?? 0;
+        if (end > start) {
+          event.preventDefault();
+          await navigator.clipboard.writeText(accessKey.slice(start, end)).catch(() => undefined);
+        }
+        return;
+      }
+
+      if (key === 'x' && hasClipboard) {
+        const start = input.selectionStart ?? 0;
+        const end = input.selectionEnd ?? 0;
+        if (end > start) {
+          event.preventDefault();
+          await navigator.clipboard.writeText(accessKey.slice(start, end)).catch(() => undefined);
+          onAccessKeyChange(`${accessKey.slice(0, start)}${accessKey.slice(end)}`);
+        }
+        return;
+      }
+    }
+
     if (event.key === 'Enter' && canSubmit) {
       onAuthorize();
     }
@@ -136,123 +174,143 @@ export function AuthScreen({
   };
 
   return (
-    <div className="auth-grid compact-auth-grid auth-grid-v5">
-      <section className="auth-panel hero-panel compact-hero-panel auth-hero-v5">
-        <div className="auth-brand-lockup auth-brand-lockup-v5">
-          <img src="/assets/logo-dark.jpg" alt="VKarmani" className="auth-brand-logo" />
+    <div className="auth-redesign-screen">
+      <section className="auth-redesign-hero">
+        <div className="auth-orbital-bg" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </div>
+
+        <div className="auth-brand-lockup">
+          <img src="/assets/logo-vkarmani.png" alt="VKarmani" className="auth-brand-logo" />
           <div>
-            <strong>VKarmani Desktop</strong>
-            <span>{tr(language, 'Безопасный VPN-клиент для ПК', 'Secure VPN client for desktop')}</span>
+            <strong>VKarmani</strong>
+            <span>{tr(language, 'VPN без границ', 'VPN without borders')}</span>
           </div>
         </div>
 
         <div className="auth-hero-copy-v5">
-          <span className="chip auth-hero-chip">{tr(language, 'Вход по ключу доступа', 'Access key sign-in')}</span>
-          <h1>{tr(language, 'Вставьте ключ и подключайтесь без лишних шагов.', 'Paste the key and connect without extra steps.')}</h1>
+          <span className="chip auth-hero-chip"><Sparkles size={14} />{tr(language, 'Доступ по ключу Remnawave', 'Remnawave key access')}</span>
+          <h1>{tr(language, 'Активируйте защищённый интернет в один шаг.', 'Activate secure internet in one step.')}</h1>
           <p>
             {tr(
               language,
-              'Клиент сам проверит доступ, синхронизирует профиль и подготовит доступные серверы к подключению.',
-              'The client will verify access, sync the profile, and prepare available servers for connection.'
+              'Вставьте ключ доступа: клиент сам проверит профиль, подтянет серверы и подготовит подключение без лишних окон.',
+              'Paste your access key: the client will verify the profile, import servers, and prepare the connection without extra screens.'
             )}
           </p>
         </div>
 
-        <div className="auth-mini-benefits auth-mini-benefits-v5 auth-mini-benefits-compact">
-          <span><CheckCircle2 size={15} />{tr(language, 'Быстрый вход по ключу', 'Fast key sign-in')}</span>
-          <span><CheckCircle2 size={15} />{tr(language, 'Синхронизация профиля и серверов', 'Profile and server sync')}</span>
-          <span><CheckCircle2 size={15} />{tr(language, 'Proxy и TUN доступны после входа', 'Proxy and TUN after sign-in')}</span>
-        </div>
-
-        <div className="auth-hero-actions auth-hero-actions-v5 auth-hero-actions-compact">
-          <a
-            className="primary-button auth-link-button"
-            href="https://t.me/VKarmani_VPN_bot"
-            target="_blank"
-            rel="noreferrer"
-          >
-            <Bot size={16} />
-            {tr(language, 'Получить ключ', 'Get a key')}
-          </a>
-          <a
-            className="ghost-button auth-link-button"
-            href="https://www.vkarmani.com/"
-            target="_blank"
-            rel="noreferrer"
-          >
-            <ArrowUpRight size={16} />
-            VKarmani.com
-          </a>
+        <div className="auth-step-strip">
+          <article>
+            <span>1</span>
+            <strong>{tr(language, 'Получите ключ', 'Get a key')}</strong>
+            <small>{tr(language, 'На сайте или в Telegram', 'On the website or Telegram')}</small>
+          </article>
+          <article>
+            <span>2</span>
+            <strong>{tr(language, 'Активируйте', 'Activate')}</strong>
+            <small>{tr(language, 'Вставьте ключ ниже', 'Paste the key below')}</small>
+          </article>
+          <article>
+            <span>3</span>
+            <strong>{tr(language, 'Подключитесь', 'Connect')}</strong>
+            <small>{tr(language, 'Нажмите одну кнопку', 'Press one button')}</small>
+          </article>
         </div>
       </section>
 
-      <section className="auth-panel form-panel compact-form-panel auth-form-v5">
-        <div className="auth-form-shell auth-form-shell-v5">
-          <div className="form-header auth-form-header-v5">
-            <span className="chip subdued">{tr(language, 'Вход по ключу', 'Key sign-in')}</span>
-            <h2>{tr(language, 'Подключение к VKarmani', 'Connect to VKarmani')}</h2>
-          </div>
-
-          <div className={`auth-status-strip auth-status-strip-${statusTone}`}>
-            <div className="auth-status-strip-main">
-              {statusTone === 'error' ? <Shield size={16} /> : <CheckCircle2 size={16} />}
+      <section className="auth-redesign-card">
+        <div className={`auth-status-strip auth-status-strip-${statusTone}`}>
+          <div className="auth-status-strip-main">
+            {statusTone === 'error' ? <Shield size={18} /> : statusTone === 'loading' ? <ServerCog size={18} /> : <CheckCircle2 size={18} />}
+            <div>
               <strong>{statusTitle}</strong>
+              <span>{statusBody}</span>
             </div>
-            {normalizedKey ? <span className="auth-status-strip-type">{accessKeyTypeLabel}</span> : null}
           </div>
+          <span className="auth-status-strip-type">{accessKeyTypeLabel}</span>
+        </div>
 
-          <div className="auth-field-block auth-field-block-v5 auth-field-block-compact">
-            <label className="field-label" htmlFor="access-key">
-              {tr(language, 'Ключ доступа', 'Access key')}
-            </label>
-            <div className={`key-input-row auth-key-row-v5 ${normalizedKey ? 'is-filled' : ''}`}>
-              <KeyRound size={18} />
-              <input
-                id="access-key"
-                value={accessKey}
-                onChange={(event: React.ChangeEvent<HTMLInputElement>) => onAccessKeyChange(event.target.value.replace(/\s+/g, ' ').trimStart())}
-                onKeyDown={onKeyDown}
-                autoComplete="off"
-                spellCheck={false}
-                placeholder={tr(language, 'Например: https://sub.example.com/abc123', 'Example: https://sub.example.com/abc123')}
-              />
-            </div>
-            {(statusTone === 'error' ? statusBody : helperText) ? (
-              <div className="auth-field-caption-row auth-field-caption-row-v5 auth-field-caption-row-compact">
-                <span className="auth-field-caption">{statusTone === 'error' ? statusBody : helperText}</span>
-              </div>
+        <div className="auth-field-block auth-field-block-v5">
+          <label className="field-label" htmlFor="access-key">
+            {tr(language, 'Ключ доступа', 'Access key')}
+          </label>
+          <div className={`key-input-row auth-key-row-v5 ${normalizedKey ? 'is-filled' : ''}`}>
+            <KeyRound size={19} />
+            <input
+              id="access-key"
+              ref={inputRef}
+              type={showAccessKey ? 'text' : 'password'}
+              value={accessKey}
+              onChange={(event: React.ChangeEvent<HTMLInputElement>) => onAccessKeyChange(event.target.value.replace(/\s+/g, ' ').trimStart())}
+              onKeyDown={onKeyDown}
+              autoComplete="off"
+              spellCheck={false}
+              placeholder={tr(language, 'https://sub.vkarmani.com/ваш-ключ', 'https://sub.vkarmani.com/your-key')}
+            />
+            {normalizedKey ? (
+              <button
+                type="button"
+                className="key-visibility-button"
+                onClick={() => setShowAccessKey((current) => !current)}
+                aria-label={showAccessKey ? tr(language, 'Скрыть ключ доступа', 'Hide access key') : tr(language, 'Показать ключ доступа', 'Show access key')}
+                title={showAccessKey ? tr(language, 'Скрыть ключ доступа', 'Hide access key') : tr(language, 'Показать ключ доступа', 'Show access key')}
+              >
+                {showAccessKey ? <EyeOff size={17} /> : <Eye size={17} />}
+              </button>
+            ) : null}
+            {hasClipboard ? (
+              <button type="button" className="key-visibility-button" onClick={() => void handlePasteFromClipboard()} title={tr(language, 'Вставить из буфера', 'Paste from clipboard')}>
+                <ClipboardPaste size={17} />
+              </button>
+            ) : null}
+            {normalizedKey ? (
+              <button type="button" className="key-visibility-button" onClick={() => onAccessKeyChange('')} title={tr(language, 'Очистить', 'Clear')}>
+                <X size={17} />
+              </button>
             ) : null}
           </div>
-
-          <div className="auth-input-actions auth-input-actions-v5 auth-input-actions-compact">
-            <div className="auth-input-tools">
-              {hasClipboard ? (
-                <button type="button" className="ghost-button auth-inline-button" onClick={() => void handlePasteFromClipboard()}>
-                  <ClipboardPaste size={15} />
-                  {tr(language, 'Вставить из буфера', 'Paste from clipboard')}
-                </button>
-              ) : null}
-              {normalizedKey ? (
-                <button type="button" className="ghost-button auth-inline-button" onClick={() => onAccessKeyChange('')}>
-                  <X size={15} />
-                  {tr(language, 'Очистить', 'Clear')}
-                </button>
-              ) : null}
-            </div>
-            <span className="auth-input-hint">{tr(language, 'Можно вставить ключ и нажать Enter.', 'Paste the key and press Enter.')}</span>
+          <div className="auth-field-caption-row auth-field-caption-row-v5">
+            <span className="auth-field-caption">{keyPreview || helperText}</span>
           </div>
+        </div>
 
-          <div className="auth-submit-row auth-submit-row-v5 auth-submit-row-compact">
-            <button className="primary-button auth-submit-button auth-submit-button-compact" onClick={onAuthorize} disabled={!canSubmit}>
-              {authLoading ? tr(language, 'Проверяем ключ…', 'Checking key…') : tr(language, 'Подключиться', 'Connect')}
-            </button>
-          </div>
+        <div className="auth-submit-row auth-submit-row-v5">
+          <button className="primary-button auth-submit-button" onClick={onAuthorize} disabled={!canSubmit}>
+            {authLoading ? <ServerCog size={18} /> : <Rocket size={18} />}
+            {authLoading ? tr(language, 'Проверяем ключ…', 'Checking key…') : tr(language, 'Проверить ключ и войти', 'Verify key and sign in')}
+            <ArrowRight size={18} />
+          </button>
+        </div>
 
-          <div className="auth-support-inline auth-support-inline-v5 auth-support-inline-compact">
-            <span>{tr(language, 'Нет ключа?', 'No key?')}</span>
-            <a href="https://t.me/VKarmani_VPN_bot" target="_blank" rel="noreferrer">Telegram</a>
-            <a href="https://www.vkarmani.com/" target="_blank" rel="noreferrer">Сайт</a>
-          </div>
+        <div className="auth-info-grid">
+          <article>
+            <Zap size={18} />
+            <strong>{tr(language, 'Быстро и надёжно', 'Fast and reliable')}</strong>
+            <span>{tr(language, 'Серверы импортируются из вашего профиля Remnawave.', 'Servers are imported from your Remnawave profile.')}</span>
+          </article>
+          <article>
+            <ShieldCheck size={18} />
+            <strong>{tr(language, 'Приватность под защитой', 'Privacy protected')}</strong>
+            <span>{tr(language, 'Ключ хранится в защищённом хранилище Windows.', 'The key is stored in protected Windows storage.')}</span>
+          </article>
+          <article>
+            <Globe2 size={18} />
+            <strong>{tr(language, 'Где взять ключ?', 'Where to get a key?')}</strong>
+            <span>{integrationMeta.isConfigured ? integrationMeta.modeLabel : tr(language, 'Официальный сайт VKarmani и Telegram-бот.', 'VKarmani official website and Telegram bot.')}</span>
+          </article>
+        </div>
+
+        <div className="auth-support-inline auth-support-inline-v5">
+          <LockKeyhole size={16} />
+          <span>{tr(language, 'Нет ключа?', 'No key?')}</span>
+          <a href="https://t.me/VKarmani_VPN_bot" target="_blank" rel="noreferrer">Telegram</a>
+          <a href="https://www.vkarmani.com/" target="_blank" rel="noreferrer">
+            {tr(language, 'Перейти на сайт', 'Open website')}
+            <ArrowUpRight size={14} />
+          </a>
         </div>
       </section>
     </div>

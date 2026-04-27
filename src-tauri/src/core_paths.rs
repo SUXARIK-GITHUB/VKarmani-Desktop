@@ -45,59 +45,54 @@ fn reveal_main_window(app: &AppHandle) {
 }
 
 fn unix_now_string() -> String {
-    let timestamp = SystemTime::now()
+    unix_timestamp_seconds().to_string()
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_secs())
+        .unwrap_or_default()
+}
+
+fn civil_date_from_unix_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year as i32, m as u32, d as u32)
+}
+
+fn utc_date_parts() -> (i32, u32, u32, u32, u32, u32, u32) {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
         .unwrap_or_default();
-    timestamp.to_string()
+    let seconds = now_ms / 1000;
+    let millis = (now_ms % 1000) as u32;
+    let days = (seconds / 86_400) as i64;
+    let day_seconds = seconds % 86_400;
+    let (year, month, day) = civil_date_from_unix_days(days);
+    let hour = (day_seconds / 3_600) as u32;
+    let minute = ((day_seconds % 3_600) / 60) as u32;
+    let second = (day_seconds % 60) as u32;
+    (year, month, day, hour, minute, second, millis)
 }
 
 fn log_timestamp_string() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(value) = run_powershell("(Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')") {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Ok(output) = Command::new("date").args(["+%F %T"]).output() {
-            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !value.is_empty() {
-                return value;
-            }
-        }
-    }
-
-    unix_now_string()
+    let (year, month, day, hour, minute, second, millis) = utc_date_parts();
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
 fn local_day_folder_name() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(value) = run_powershell("(Get-Date).ToString('yyyy-MM-dd')") {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Ok(output) = Command::new("date").args(["+%F"]).output() {
-            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !value.is_empty() {
-                return value;
-            }
-        }
-    }
-
-    unix_now_string()
+    let (year, month, day, _, _, _, _) = utc_date_parts();
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 #[allow(dead_code)]
@@ -211,13 +206,23 @@ fn ensure_log_tree(app: &AppHandle) -> Result<(), String> {
 
 fn redact_sensitive(input: &str) -> String {
     let mut result = input.to_string();
-    for scheme in ["vless://", "vmess://", "trojan://", "ss://"] {
+    for scheme in ["vless://", "vmess://", "trojan://", "ss://", "hy2://", "hysteria2://"] {
         while let Some(start) = result.to_ascii_lowercase().find(scheme) {
             let end = result[start..]
                 .find(char::is_whitespace)
                 .map(|offset| start + offset)
                 .unwrap_or(result.len());
             result.replace_range(start..end, "[redacted-vpn-link]");
+        }
+    }
+
+    for sub_host in ["https://sub.vkarmani.com/"] {
+        while let Some(start) = result.to_ascii_lowercase().find(sub_host) {
+            let end = result[start..]
+                .find(char::is_whitespace)
+                .map(|offset| start + offset)
+                .unwrap_or(result.len());
+            result.replace_range(start..end, "https://sub.vkarmani.com/[redacted-key]");
         }
     }
 
@@ -234,11 +239,35 @@ fn redact_sensitive(input: &str) -> String {
                 && c != '?'
                 && c != '&'
         });
-        let should_mask = trimmed.len() >= 28
-            && trimmed.chars().filter(|c| c.is_ascii_alphanumeric()).count() >= 20
-            && (trimmed.contains('-') || trimmed.contains('_') || trimmed.contains('=') || trimmed.contains("http"));
+        let lower = trimmed.to_ascii_lowercase();
+        let contains_secret_marker = [
+            "access_key=",
+            "access-key=",
+            "apikey=",
+            "api_key=",
+            "authorization=",
+            "bearer=",
+            "key=",
+            "password=",
+            "secret=",
+            "sub=",
+            "subscription=",
+            "token=",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+        let looks_like_uuid = trimmed.len() == 36
+            && trimmed.chars().filter(|c| *c == '-').count() == 4
+            && trimmed.chars().filter(|c| c.is_ascii_hexdigit()).count() == 32;
+        let should_mask = contains_secret_marker
+            || looks_like_uuid
+            || (trimmed.len() >= 28
+                && trimmed.chars().filter(|c| c.is_ascii_alphanumeric()).count() >= 20
+                && (trimmed.contains('-') || trimmed.contains('_') || trimmed.contains('=') || trimmed.contains("http")));
 
-        let rendered = if should_mask {
+        let rendered = if contains_secret_marker {
+            token.replace(trimmed, "[redacted-secret]")
+        } else if should_mask {
             let prefix: String = trimmed.chars().take(6).collect();
             let suffix_rev: String = trimmed.chars().rev().take(4).collect();
             let suffix: String = suffix_rev.chars().rev().collect();

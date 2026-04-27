@@ -1,3 +1,11 @@
+export function decodeBase64Compat(value: string) {
+  let normalized = value.replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+  while (normalized.length % 4 !== 0) {
+    normalized += '=';
+  }
+  return atob(normalized);
+}
+
 export function maybeDecodeBase64(value: string) {
   const compact = value.replace(/\s+/g, '');
   if (!compact || compact.includes('://')) {

@@ -1,6 +1,6 @@
 import type { VpnServer, XrayRuntimeTemplate } from '../../types/vpn';
 import { inferCountryCode, resolveServerFlag } from '../../utils/serverDisplay';
-import { maybeDecodeBase64, parsePort, splitHostPort } from './parserCore';
+import { decodeBase64Compat, maybeDecodeBase64, parsePort, splitHostPort } from './parserCore';
 
 function deepFindString(source: unknown, keys: string[]): string | undefined {
   if (!source || typeof source !== 'object') {
@@ -26,7 +26,7 @@ function deepFindString(source: unknown, keys: string[]): string | undefined {
 
 function deepCollectUris(source: unknown, collected: string[] = []): string[] {
   if (typeof source === 'string') {
-    const matches = source.match(/(?:vless|vmess|trojan|ss):\/\/[^\s"'<>`]+/gi) ?? [];
+    const matches = source.match(/(?:vless|vmess|trojan|ss|hy2|hysteria2):\/\/[^\s"'<>`]+/gi) ?? [];
     for (const match of matches) {
       if (!collected.includes(match.trim())) {
         collected.push(match.trim());
@@ -58,7 +58,7 @@ function decodeHtmlEntities(value: string) {
 
 function extractUrisFromHtml(value: string) {
   const decoded = decodeHtmlEntities(value);
-  const matches = decoded.match(/(?:vless|vmess|trojan|ss):\/\/[^\s"'<>`]+/gi) ?? [];
+  const matches = decoded.match(/(?:vless|vmess|trojan|ss|hy2|hysteria2):\/\/[^\s"'<>`]+/gi) ?? [];
   return [...new Set(matches.map((item) => item.trim()))];
 }
 
@@ -99,6 +99,7 @@ function parseProtocol(protocol: string): VpnServer['protocol'] {
       return 'VLESS';
     case 'hy2':
     case 'hysteria2':
+      return 'Hysteria2';
     case 'tuic':
     case 'sing-box':
       return 'Sing-box';
@@ -164,11 +165,66 @@ function splitCsv(value: string | null) {
     .filter(Boolean);
 }
 
+function getFirstParam(searchParams: URLSearchParams, names: string[]) {
+  for (const name of names) {
+    const value = searchParams.get(name);
+    if (value !== null && value !== '') {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function normalizeTransportName(value: string | null | undefined) {
+  const normalized = (value || 'raw').trim().toLowerCase();
+  if (normalized === 'tcp') return 'raw';
+  if (normalized === 'splithttp') return 'xhttp';
+  return normalized;
+}
+
+function normalizeUrlHostname(hostname: string) {
+  return hostname.replace(/^\[/, '').replace(/\]$/, '');
+}
+
+function parseJsonParam(value: string | null | undefined): unknown {
+  if (!value) {
+    return undefined;
+  }
+
+  const candidates = [value];
+  try {
+    candidates.push(decodeURIComponent(value));
+  } catch {
+    // Keep the original candidate only.
+  }
+
+  try {
+    candidates.push(decodeBase64Compat(value));
+  } catch {
+    // Not a base64/base64url encoded JSON payload.
+  }
+
+  for (const candidate of candidates) {
+    const trimmed = candidate.trim();
+    if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) {
+      continue;
+    }
+
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      // Try the next representation.
+    }
+  }
+
+  return undefined;
+}
+
 function buildTlsSettings(searchParams: URLSearchParams, fallbackServerName?: string) {
-  const serverName = searchParams.get('sni') || searchParams.get('host') || fallbackServerName;
+  const serverName = getFirstParam(searchParams, ['sni', 'peer', 'serverName', 'servername', 'host']) || fallbackServerName;
   return compactObject({
     serverName,
-    fingerprint: searchParams.get('fp') ?? undefined,
+    fingerprint: getFirstParam(searchParams, ['fp', 'fingerprint']) ?? undefined,
     alpn: splitCsv(searchParams.get('alpn')),
     allowInsecure: searchParams.get('allowInsecure') === '1' || searchParams.get('insecure') === '1'
   });
@@ -176,11 +232,11 @@ function buildTlsSettings(searchParams: URLSearchParams, fallbackServerName?: st
 
 function buildRealitySettings(searchParams: URLSearchParams, fallbackServerName?: string) {
   return compactObject({
-    serverName: searchParams.get('sni') || searchParams.get('host') || fallbackServerName,
-    fingerprint: searchParams.get('fp') ?? undefined,
-    publicKey: searchParams.get('pbk') ?? undefined,
-    shortId: searchParams.get('sid') ?? undefined,
-    spiderX: searchParams.get('spx') ?? undefined
+    serverName: getFirstParam(searchParams, ['sni', 'peer', 'serverName', 'servername', 'host']) || fallbackServerName,
+    fingerprint: getFirstParam(searchParams, ['fp', 'fingerprint']) ?? undefined,
+    publicKey: getFirstParam(searchParams, ['pbk', 'publicKey', 'public_key']) ?? undefined,
+    shortId: getFirstParam(searchParams, ['sid', 'shortId', 'short_id']) ?? undefined,
+    spiderX: getFirstParam(searchParams, ['spx', 'spiderX', 'spider_x']) ?? undefined
   });
 }
 
@@ -193,11 +249,11 @@ function buildStreamSettings(base: {
   searchParams: URLSearchParams;
 }) {
   const requestedNetwork = base.network || base.searchParams.get('type') || base.searchParams.get('net') || 'raw';
-  const network = requestedNetwork === 'tcp' ? 'raw' : requestedNetwork;
+  const network = normalizeTransportName(requestedNetwork);
   const security = base.security || base.searchParams.get('security') || (base.searchParams.get('tls') === 'tls' ? 'tls' : 'none');
-  const host = base.host || base.searchParams.get('host') || undefined;
-  const path = base.path || base.searchParams.get('path') || undefined;
-  const serviceName = base.serviceName || base.searchParams.get('serviceName') || base.searchParams.get('service_name') || undefined;
+  const host = base.host || getFirstParam(base.searchParams, ['host', 'authority']) || undefined;
+  const path = base.path || getFirstParam(base.searchParams, ['path', 'pathPrefix']) || undefined;
+  const serviceName = base.serviceName || getFirstParam(base.searchParams, ['serviceName', 'service_name']) || undefined;
 
   const settings: Record<string, unknown> = {
     network,
@@ -235,7 +291,8 @@ function buildStreamSettings(base: {
     settings.xhttpSettings = compactObject({
       host,
       path,
-      mode: base.searchParams.get('mode') || 'auto'
+      mode: base.searchParams.get('mode') || 'auto',
+      extra: parseJsonParam(getFirstParam(base.searchParams, ['extra', 'xhttpExtra', 'xhttp_extra']))
     });
   }
 
@@ -267,14 +324,14 @@ function parseVlessRuntime(uri: string, url: URL, label: string): XrayRuntimeTem
     family: 'xray',
     protocol: 'vless',
     remarks: label,
-    transport: (searchParams.get('type') || searchParams.get('net') || 'raw') as XrayRuntimeTemplate['transport'],
+    transport: normalizeTransportName(searchParams.get('type') || searchParams.get('net')) as XrayRuntimeTemplate['transport'],
     outbound: compactObject({
       tag: 'proxy',
       protocol: 'vless',
       settings: {
         vnext: [
           {
-            address: url.hostname,
+            address: normalizeUrlHostname(url.hostname),
             port: parsePort(url.port, 443),
             users: [user]
           }
@@ -282,7 +339,7 @@ function parseVlessRuntime(uri: string, url: URL, label: string): XrayRuntimeTem
       },
       streamSettings: buildStreamSettings({
         searchParams,
-        host: searchParams.get('host') || url.hostname
+        host: getFirstParam(searchParams, ['host', 'authority']) || normalizeUrlHostname(url.hostname)
       })
     })
   };
@@ -291,7 +348,7 @@ function parseVlessRuntime(uri: string, url: URL, label: string): XrayRuntimeTem
 function parseVmessRuntime(uri: string, label: string): XrayRuntimeTemplate | null {
   const encoded = uri.replace(/^vmess:\/\//i, '');
   try {
-    const decoded = JSON.parse(atob(encoded)) as Record<string, string>;
+    const decoded = JSON.parse(decodeBase64Compat(encoded)) as Record<string, string>;
     const searchParams = new URLSearchParams();
     if (decoded.path) searchParams.set('path', decoded.path);
     if (decoded.host) searchParams.set('host', decoded.host);
@@ -307,7 +364,7 @@ function parseVmessRuntime(uri: string, label: string): XrayRuntimeTemplate | nu
       family: 'xray',
       protocol: 'vmess',
       remarks: decoded.ps || label,
-      transport: (decoded.net || 'raw') as XrayRuntimeTemplate['transport'],
+      transport: normalizeTransportName(decoded.net) as XrayRuntimeTemplate['transport'],
       outbound: compactObject({
         tag: 'proxy',
         protocol: 'vmess',
@@ -346,14 +403,14 @@ function parseTrojanRuntime(url: URL, label: string): XrayRuntimeTemplate {
     family: 'xray',
     protocol: 'trojan',
     remarks: label,
-    transport: (searchParams.get('type') || searchParams.get('net') || 'raw') as XrayRuntimeTemplate['transport'],
+    transport: normalizeTransportName(searchParams.get('type') || searchParams.get('net')) as XrayRuntimeTemplate['transport'],
     outbound: compactObject({
       tag: 'proxy',
       protocol: 'trojan',
       settings: {
         servers: [
           {
-            address: url.hostname,
+            address: normalizeUrlHostname(url.hostname),
             port: parsePort(url.port, 443),
             password: decodeURIComponent(url.username),
             level: 0
@@ -362,7 +419,7 @@ function parseTrojanRuntime(url: URL, label: string): XrayRuntimeTemplate {
       },
       streamSettings: buildStreamSettings({
         searchParams,
-        host: searchParams.get('host') || url.hostname,
+        host: getFirstParam(searchParams, ['host', 'authority']) || normalizeUrlHostname(url.hostname),
         security: searchParams.get('security') || 'tls'
       })
     })
@@ -372,7 +429,7 @@ function parseTrojanRuntime(url: URL, label: string): XrayRuntimeTemplate {
 function decodeShadowsocksCredentials(value: string) {
   const raw = value.includes(':') ? value : (() => {
     try {
-      return atob(value);
+      return decodeBase64Compat(value);
     } catch {
       return value;
     }
@@ -401,7 +458,7 @@ function parseShadowsocksRuntime(uri: string, label: string): XrayRuntimeTemplat
     [credentialsPart, hostPart] = mainPart.split('@');
   } else {
     try {
-      const decoded = atob(mainPart);
+      const decoded = decodeBase64Compat(mainPart);
       if (decoded.includes('@')) {
         [credentialsPart, hostPart] = decoded.split('@');
       }
@@ -443,6 +500,46 @@ function parseShadowsocksRuntime(uri: string, label: string): XrayRuntimeTemplat
   };
 }
 
+function parseHysteria2Runtime(url: URL, label: string): XrayRuntimeTemplate {
+  const searchParams = url.searchParams;
+  const password = decodeURIComponent(url.username || getFirstParam(searchParams, ['password', 'auth']) || '');
+  const obfsType = getFirstParam(searchParams, ['obfs', 'obfs-type', 'obfs_type']) || undefined;
+  const obfsPassword = getFirstParam(searchParams, ['obfs-password', 'obfs_password', 'obfsPassword']) || undefined;
+  const sni = getFirstParam(searchParams, ['sni', 'peer', 'serverName', 'servername']) || normalizeUrlHostname(url.hostname);
+  const insecure = searchParams.get('insecure') === '1' || searchParams.get('allowInsecure') === '1';
+
+  return {
+    family: 'xray',
+    protocol: 'hysteria2',
+    remarks: label,
+    transport: 'udp',
+    outbound: compactObject({
+      tag: 'proxy',
+      protocol: 'hysteria2',
+      settings: {
+        servers: [
+          compactObject({
+            address: normalizeUrlHostname(url.hostname),
+            port: parsePort(url.port, 443),
+            password,
+            obfs: obfsType ? { type: obfsType, password: obfsPassword } : undefined
+          })
+        ]
+      },
+      streamSettings: compactObject({
+        network: 'udp',
+        security: 'tls',
+        tlsSettings: compactObject({
+          serverName: sni,
+          fingerprint: getFirstParam(searchParams, ['fp', 'fingerprint']) ?? undefined,
+          alpn: splitCsv(searchParams.get('alpn')),
+          allowInsecure: insecure
+        })
+      })
+    })
+  };
+}
+
 function buildRuntimeTemplateFromUri(uri: string, label: string): XrayRuntimeTemplate | null {
   const scheme = uri.split('://')[0]?.toLowerCase();
   if (!scheme) {
@@ -459,6 +556,10 @@ function buildRuntimeTemplateFromUri(uri: string, label: string): XrayRuntimeTem
 
   try {
     const url = new URL(uri);
+    if (scheme === 'hy2' || scheme === 'hysteria2') {
+      return parseHysteria2Runtime(url, label);
+    }
+
     if (scheme === 'vless') {
       return parseVlessRuntime(uri, url, label);
     }
@@ -517,7 +618,7 @@ function buildImportedServer(line: string, index: number): VpnServer | null {
   try {
     const url = new URL(trimmed);
     const label = decodeURIComponent(url.hash.replace(/^#/, '')).trim() || runtimeTemplate?.remarks?.trim() || '';
-    const host = runtimeEndpoint.host || url.hostname || 'remote-host';
+    const host = runtimeEndpoint.host || normalizeUrlHostname(url.hostname) || 'remote-host';
     const port = runtimeEndpoint.port || (url.port ? Number(url.port) : 443);
     const location = parseCountryLabel(label, host);
     const flag = resolveServerFlag({ country: location.country, rawLabel: label, host, explicitCode: location.countryCode });
@@ -528,8 +629,9 @@ function buildImportedServer(line: string, index: number): VpnServer | null {
       country: location.country,
       city: location.city,
       flag,
-      latency: 18 + (index % 5) * 7,
-      load: 26 + (index % 4) * 11,
+      latency: null,
+      latencyStatus: 'unchecked',
+      load: 0,
       protocol,
       isRecommended: index === 0,
       tags: [
@@ -567,8 +669,9 @@ function buildImportedServer(line: string, index: number): VpnServer | null {
       country: location.country,
       city: location.city,
       flag,
-      latency: 18 + (index % 5) * 7,
-      load: 26 + (index % 4) * 11,
+      latency: null,
+      latencyStatus: 'unchecked',
+      load: 0,
       protocol,
       isRecommended: index === 0,
       tags: [

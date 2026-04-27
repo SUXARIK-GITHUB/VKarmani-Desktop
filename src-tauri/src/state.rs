@@ -19,6 +19,7 @@ struct AppState {
     runtime: Mutex<Option<ManagedCore>>,
     last_exit_code: Mutex<Option<i32>>,
     previous_proxy: Mutex<Option<ProxyStatus>>,
+    operation_lock: Mutex<()>, 
     session_authorized: Mutex<bool>,
 }
 
@@ -55,7 +56,7 @@ struct RuntimeStatus {
     tun_interface_name: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProxyStatus {
     enabled: bool,
@@ -77,6 +78,20 @@ struct RunningAppInfo {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct NativeAppInfo {
+    app_version: String,
+    xray_version: String,
+    hwid: String,
+    os_name: String,
+    os_version: String,
+    os_build: String,
+    os_architecture: String,
+    device_name: String,
+    core_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ConnectivityProbe {
     success: bool,
     checked_at: String,
@@ -84,7 +99,17 @@ struct ConnectivityProbe {
     socks_port_open: bool,
     public_ip: Option<String>,
     latency_ms: Option<u128>,
+    packet_loss_pct: Option<u8>,
     message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrafficSnapshot {
+    received_bytes: u64,
+    sent_bytes: u64,
+    checked_at: String,
+    source: String,
 }
 
 #[derive(Debug, Deserialize)]

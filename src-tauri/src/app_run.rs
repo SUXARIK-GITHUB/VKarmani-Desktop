@@ -71,12 +71,19 @@ fn refresh_tray_menu(app: &AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let _ = append_interface_event(app, "Повторный запуск: активируем уже открытое окно VKarmani.");
-            reveal_main_window(app);
-            let _ = app.emit("vkarmani://tray-action", "show");
-        }))
+    // Keep single-instance protection only for release builds. In dev mode we intentionally
+    // allow local restarts from the BAT launcher without getting an `unused_mut` warning.
+    #[cfg(debug_assertions)]
+    let builder = tauri::Builder::default();
+
+    #[cfg(not(debug_assertions))]
+    let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        let _ = append_interface_event(app, "Повторный запуск: активируем уже открытое окно VKarmani.");
+        reveal_main_window(app);
+        let _ = app.emit("vkarmani://tray-action", "show");
+    }));
+
+    builder
         .manage(AppState::default())
         .setup(|app| {
             let _ = interface_logs_dir(&app.handle());
@@ -84,6 +91,9 @@ pub fn run() {
             let _ = ensure_log_tree(&app.handle());
             let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, None);
             let _ = cleanup_runtime_config_files(&app.handle());
+            let state = app.state::<AppState>();
+            let _ = recover_orphaned_system_proxy(&app.handle(), &state, "startup_recovery");
+            start_runtime_watchdog(app.handle().clone());
             let _ = append_interface_event(&app.handle(), "Приложение запущено. Структура логов проверена.");
             let _ = append_runtime_event(&app.handle(), "Routing/runtime лог инициализирован. Ожидание действий пользователя.");
             let menu = build_tray_menu(&app.handle(), false, false, false)?;
@@ -145,6 +155,9 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            reveal_main_window(&app.handle());
+            let _ = append_interface_event(&app.handle(), "Главное окно активировано при запуске.");
+
             app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
             Ok(())
         })
@@ -153,6 +166,9 @@ pub fn run() {
             save_access_key_secure,
             load_access_key_secure,
             clear_access_key_secure,
+            save_client_state_value,
+            load_client_state_value,
+            clear_client_state_value,
             runtime_status,
             set_session_authorized,
             request_connect,
@@ -165,7 +181,6 @@ pub fn run() {
             window_toggle_maximize,
             window_close,
             window_hide,
-            window_start_drag,
             ensure_admin_launch,
             set_launch_on_startup,
             proxy_status,
@@ -174,8 +189,12 @@ pub fn run() {
             revoke_hwid_device,
             public_ip_snapshot,
             connectivity_probe,
+            server_ping,
+            traffic_snapshot,
             read_runtime_log,
             list_running_apps,
+            native_app_info,
+            pick_executable_path,
             restart_application
         ])
         .build(tauri::generate_context!())

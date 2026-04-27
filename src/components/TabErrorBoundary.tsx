@@ -26,7 +26,9 @@ export class TabErrorBoundary extends Component<TabErrorBoundaryProps, TabErrorB
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error('TabErrorBoundary', error, info);
+    if (import.meta.env.DEV) {
+      console.error('TabErrorBoundary', error, info);
+    }
   }
 
   render() {

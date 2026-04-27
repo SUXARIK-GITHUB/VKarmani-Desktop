@@ -1,5 +1,6 @@
 const SOCKS_PORT: u16 = 10808;
 const HTTP_PORT: u16 = 10809;
+const XRAY_API_PORT: u16 = 10810;
 const MAX_REMOTE_FETCH_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_REMOTE_FETCH_REDIRECTS: usize = 3;
 const PROXY_BYPASS: &str = "<local>";

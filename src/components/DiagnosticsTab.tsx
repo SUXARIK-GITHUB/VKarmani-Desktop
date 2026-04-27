@@ -108,13 +108,17 @@ interface DiagnosticsTabProps {
   onSyncProfile: () => void;
   onCheckUpdates: () => void;
   onInstallUpdate?: () => void;
+  onExportDiagnostics?: () => void;
   onClearAccessKey: () => void;
   onReleaseChannelChange: (value: AppSettings['releaseChannel']) => void;
   onProtocolStrategyChange: (value: AppSettings['protocolStrategy']) => void;
   onTunnelModeChange: (value: AppSettings['tunnelMode']) => void;
   onLanguageChange: (value: AppSettings['language']) => void;
-  isBusy?: boolean;
+  isProxyBusy?: boolean;
+  isProbeBusy?: boolean;
+  isLogoutBusy?: boolean;
   isSyncingProfile?: boolean;
+  isExportingDiagnostics?: boolean;
 }
 
 export function DiagnosticsTab({
@@ -135,13 +139,17 @@ export function DiagnosticsTab({
   onSyncProfile,
   onCheckUpdates,
   onInstallUpdate,
+  onExportDiagnostics,
   onClearAccessKey,
   onReleaseChannelChange,
   onProtocolStrategyChange,
   onTunnelModeChange,
   onLanguageChange,
-  isBusy = false,
-  isSyncingProfile = false
+  isProxyBusy = false,
+  isProbeBusy = false,
+  isLogoutBusy = false,
+  isSyncingProfile = false,
+  isExportingDiagnostics = false
 }: DiagnosticsTabProps) {
   const safeSession = session ?? {
     accessKey: '',
@@ -195,6 +203,7 @@ export function DiagnosticsTab({
       ? 'good'
       : 'bad';
   const updateTone = updateInfo.available ? 'warn' : updateInfo.status === 'error' ? 'bad' : 'good';
+  const updateBusy = ['checking', 'downloading', 'installing'].includes(updateInfo.status);
 
   return (
     <div className="tab-stack compact-tab-stack diagnostics-screen">
@@ -272,8 +281,8 @@ export function DiagnosticsTab({
             </div>
             <p>{proxyStatus.enabled ? `${tr(language, 'Сервер:', 'Server:')} ${proxyStatus.server ?? '—'}` : tr(language, 'Используйте системный proxy, если нужен браузерный и системный трафик через туннель.', 'Use system proxy when browser and system traffic should go through the tunnel.')}</p>
             <div className="settings-actions compact-actions action-card-buttons">
-              <button className="ghost-button" onClick={onEnableSystemProxy} disabled={isBusy || !runtimeActive}><Waypoints size={15} />{tr(language, 'Включить', 'Enable')}</button>
-              <button className="ghost-button" onClick={onDisableSystemProxy} disabled={isBusy}><Waypoints size={15} />{tr(language, 'Отключить', 'Disable')}</button>
+              <button className="ghost-button" onClick={onEnableSystemProxy} disabled={isProxyBusy || !runtimeActive}><Waypoints size={15} />{tr(language, 'Включить', 'Enable')}</button>
+              <button className="ghost-button" onClick={onDisableSystemProxy} disabled={isProxyBusy}><Waypoints size={15} />{tr(language, 'Отключить', 'Disable')}</button>
             </div>
           </article>
 
@@ -283,8 +292,22 @@ export function DiagnosticsTab({
               <strong>{tr(language, 'Проверка маршрута', 'Route probe')}</strong>
             </div>
             <p>{connectivityProbe?.message ?? tr(language, 'Probe проверяет HTTP/SOCKS порты, внешний IP и базовую доступность маршрута.', 'The probe checks HTTP/SOCKS ports, public IP, and basic route availability.')}</p>
-            <button className="ghost-button" onClick={onRunConnectivityProbe} disabled={isBusy || !runtimeActive}><Radar size={15} />{tr(language, 'Запустить probe', 'Run probe')}</button>
+            <button className="ghost-button" onClick={onRunConnectivityProbe} disabled={isProbeBusy || !runtimeActive}><Radar size={15} />{isProbeBusy ? tr(language, 'Проверяем…', 'Checking…') : tr(language, 'Запустить probe', 'Run probe')}</button>
           </article>
+
+          {onExportDiagnostics ? (
+            <article className="action-card">
+              <div className="action-card-head">
+                <span className="micro-pill active">JSON</span>
+                <strong>{tr(language, 'Экспорт диагностики', 'Diagnostics export')}</strong>
+              </div>
+              <p>{tr(language, 'Собирает безопасный отчёт без ключей, токенов и subscription URL.', 'Collects a safe report without keys, tokens, or subscription URLs.')}</p>
+              <button className="ghost-button" onClick={onExportDiagnostics} disabled={isExportingDiagnostics}>
+                <Download size={15} />
+                {isExportingDiagnostics ? tr(language, 'Готовим…', 'Preparing…') : tr(language, 'Скачать отчёт', 'Download report')}
+              </button>
+            </article>
+          ) : null}
         </div>
       </section>
 
@@ -363,9 +386,9 @@ export function DiagnosticsTab({
           </div>
 
           <div className="settings-actions compact-actions">
-            <button className="ghost-button" onClick={onCheckUpdates}><Download size={15} />{tr(language, 'Проверить', 'Check')}</button>
+            <button className="ghost-button" onClick={onCheckUpdates} disabled={updateBusy}><Download size={15} />{updateBusy ? tr(language, 'Идёт процесс…', 'In progress…') : tr(language, 'Проверить', 'Check')}</button>
             {updateInfo.available && onInstallUpdate ? (
-              <button className="ghost-button accent-action-button" onClick={onInstallUpdate}><Download size={15} />{tr(language, 'Обновить', 'Update')}</button>
+              <button className="ghost-button accent-action-button" onClick={onInstallUpdate} disabled={updateBusy}><Download size={15} />{updateBusy ? tr(language, 'Устанавливаем…', 'Installing…') : tr(language, 'Обновить', 'Update')}</button>
             ) : null}
           </div>
         </section>
@@ -456,13 +479,13 @@ export function DiagnosticsTab({
             <span>{tr(language, 'Режим туннеля', 'Tunnel mode')}</span>
             <select value={settings.tunnelMode} onChange={(event: ChangeEvent<HTMLSelectElement>) => onTunnelModeChange(event.target.value as AppSettings['tunnelMode'])}>
               <option value="proxy">{tr(language, 'Proxy режим', 'Proxy mode')}</option>
-              <option value="tun">{tr(language, 'TUN режим (экспериментальный)', 'TUN mode (experimental)')}</option>
+              <option value="tun">{tr(language, 'TUN selective (экспериментальный)', 'TUN selective (experimental)')}</option>
             </select>
           </label>
         </div>
 
         <div className="settings-actions compact-actions">
-          <button className="ghost-button danger-button" onClick={onClearAccessKey}>{tr(language, 'Удалить сохранённый ключ доступа', 'Remove stored access key')}</button>
+          <button className="ghost-button danger-button" onClick={onClearAccessKey} disabled={isLogoutBusy}>{isLogoutBusy ? tr(language, 'Выходим…', 'Signing out…') : tr(language, 'Удалить сохранённый ключ доступа', 'Remove stored access key')}</button>
         </div>
       </section>
 

@@ -42,6 +42,101 @@ fn secure_access_key_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("access-key.dpapi"))
 }
 
+fn client_state_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("Не удалось определить каталог данных приложения: {error}"))?;
+    fs::create_dir_all(&dir).map_err(|error| format!("Не удалось создать каталог данных приложения: {error}"))?;
+    Ok(dir.join("client-state-v1.json"))
+}
+
+fn is_allowed_client_state_key(key: &str) -> bool {
+    matches!(
+        key,
+        "settings"
+            | "splitTunnelEntries"
+            | "favoriteServerIds"
+            | "selectedServerId"
+            | "lastKnownServers"
+    )
+}
+
+fn read_client_state_map(app: &AppHandle) -> Result<serde_json::Map<String, Value>, String> {
+    let path = client_state_path(app)?;
+    if !path.exists() {
+        return Ok(serde_json::Map::new());
+    }
+
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("Не удалось прочитать сохранённые настройки клиента: {error}"))?;
+
+    if raw.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("Не удалось разобрать сохранённые настройки клиента: {error}"))?;
+
+    Ok(value.as_object().cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+fn save_client_state_value(key: String, value: String, app: AppHandle) -> Result<(), String> {
+    let normalized_key = key.trim();
+    if !is_allowed_client_state_key(normalized_key) {
+        return Err("Недопустимый ключ клиентского состояния.".into());
+    }
+
+    let parsed_value: Value = serde_json::from_str(&value)
+        .map_err(|error| format!("Не удалось сохранить настройки клиента: некорректный JSON: {error}"))?;
+
+    let mut map = read_client_state_map(&app).unwrap_or_default();
+    map.insert(normalized_key.to_string(), parsed_value);
+    map.insert(
+        "updatedAt".to_string(),
+        Value::String(unix_now_string()),
+    );
+
+    let payload = serde_json::to_string_pretty(&Value::Object(map))
+        .map_err(|error| format!("Не удалось подготовить настройки клиента к сохранению: {error}"))?;
+
+    fs::write(client_state_path(&app)?, payload)
+        .map_err(|error| format!("Не удалось сохранить настройки клиента: {error}"))
+}
+
+#[tauri::command]
+fn load_client_state_value(key: String, app: AppHandle) -> Result<Option<String>, String> {
+    let normalized_key = key.trim();
+    if !is_allowed_client_state_key(normalized_key) {
+        return Err("Недопустимый ключ клиентского состояния.".into());
+    }
+
+    let map = read_client_state_map(&app)?;
+    Ok(map
+        .get(normalized_key)
+        .and_then(|value| serde_json::to_string(value).ok()))
+}
+
+#[tauri::command]
+fn clear_client_state_value(key: String, app: AppHandle) -> Result<(), String> {
+    let normalized_key = key.trim();
+    if !is_allowed_client_state_key(normalized_key) {
+        return Err("Недопустимый ключ клиентского состояния.".into());
+    }
+
+    let mut map = read_client_state_map(&app).unwrap_or_default();
+    map.remove(normalized_key);
+    map.insert("updatedAt".to_string(), Value::String(unix_now_string()));
+
+    let payload = serde_json::to_string_pretty(&Value::Object(map))
+        .map_err(|error| format!("Не удалось подготовить настройки клиента к сохранению: {error}"))?;
+
+    fs::write(client_state_path(&app)?, payload)
+        .map_err(|error| format!("Не удалось сохранить настройки клиента: {error}"))
+}
+
+
 #[cfg(target_os = "windows")]
 fn encrypt_access_key(value: &str) -> Result<String, String> {
     let script = r#"
@@ -157,6 +252,11 @@ fn request_connect(
     if runtime_template.family.to_lowercase() != "xray" {
         return Err("Сейчас поддерживается только Xray runtime family.".into());
     }
+    let _operation_guard = state
+        .operation_lock
+        .try_lock()
+        .map_err(|_| "Runtime уже выполняет другое действие. Повторите через несколько секунд.".to_string())?;
+
 
     let core_path = resolve_core_path(&app)
         .ok_or_else(|| core_not_found_message(&app))?;
@@ -361,6 +461,7 @@ fn request_connect(
 
     if normalized_network_mode == "tun" {
         configure_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref()).map_err(|error| {
+            let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref());
             let _ = child.kill();
             let _ = child.wait();
             format!("Не удалось подготовить Windows-маршруты для TUN режима: {error}")
@@ -406,11 +507,17 @@ fn request_connect(
     let _ = app.emit("vkarmani://native-status", server_label);
     refresh_tray_menu(&app);
 
+    drop(_operation_guard);
     Ok(build_runtime_status(&app, state))
 }
 
 #[tauri::command]
 fn request_disconnect(state: tauri::State<AppState>, app: AppHandle) -> Result<RuntimeStatus, String> {
+    let _operation_guard = state
+        .operation_lock
+        .try_lock()
+        .map_err(|_| "Runtime уже выполняет другое действие. Повторите через несколько секунд.".to_string())?;
+
     stop_existing_runtime(&app, &state)?;
 
     if let Ok(mut guard) = state.connected.lock() {
@@ -424,6 +531,7 @@ fn request_disconnect(state: tauri::State<AppState>, app: AppHandle) -> Result<R
     let _ = append_runtime_event(&app, "Xray runtime остановлен пользователем.");
     let _ = app.emit("vkarmani://native-disconnect", "idle");
     refresh_tray_menu(&app);
+    drop(_operation_guard);
     Ok(build_runtime_status(&app, state))
 }
 
@@ -487,14 +595,6 @@ fn window_hide(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), Strin
 }
 
 #[tauri::command]
-fn window_start_drag(window: tauri::WebviewWindow) -> Result<(), String> {
-    window
-        .start_dragging()
-        .map_err(|error| format!("Не удалось начать перемещение окна: {error}"))
-}
-
-
-#[tauri::command]
 fn ensure_admin_launch(app: AppHandle) -> Result<bool, String> {
     #[cfg(all(not(debug_assertions), target_os = "windows"))]
     {
@@ -537,33 +637,19 @@ fn set_launch_on_startup(enabled: bool, app: AppHandle) -> Result<bool, String> 
     {
         let executable = std::env::current_exe()
             .map_err(|error| format!("Не удалось определить путь к приложению: {error}"))?;
-        let executable = ps_quote(&executable.to_string_lossy());
+        let executable = format!("\"{}\"", executable.to_string_lossy());
+        let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
-        let script = if enabled {
-            format!(
-                r#"
-$ErrorActionPreference = 'Stop'
-$key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-New-Item -Path $key -Force | Out-Null
-$exe = '{}'
-$quoted = '"' + $exe + '"'
-Set-ItemProperty -Path $key -Name '{}' -Value $quoted
-"#,
-                executable,
-                STARTUP_REGISTRY_VALUE
-            )
+        if enabled {
+            let mut command = Command::new("reg");
+            command.args(["add", run_key, "/v", STARTUP_REGISTRY_VALUE, "/t", "REG_SZ", "/d", &executable, "/f"]);
+            run_command_with_timeout(command, Duration::from_secs(4), "enable startup")?;
         } else {
-            format!(
-                r#"
-$ErrorActionPreference = 'Stop'
-$key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-Remove-ItemProperty -Path $key -Name '{}' -ErrorAction SilentlyContinue
-"#,
-                STARTUP_REGISTRY_VALUE
-            )
-        };
+            let mut command = Command::new("reg");
+            command.args(["delete", run_key, "/v", STARTUP_REGISTRY_VALUE, "/f"]);
+            let _ = run_command_with_timeout(command, Duration::from_secs(4), "disable startup");
+        }
 
-        run_powershell(&script)?;
         let _ = append_interface_event(
             &app,
             if enabled {
@@ -581,7 +667,6 @@ Remove-ItemProperty -Path $key -Name '{}' -ErrorAction SilentlyContinue
         Ok(false)
     }
 }
-
 #[tauri::command]
 fn proxy_status() -> Result<ProxyStatus, String> {
     current_proxy_snapshot()
@@ -589,25 +674,29 @@ fn proxy_status() -> Result<ProxyStatus, String> {
 
 #[tauri::command]
 fn set_system_proxy(enabled: bool, app: AppHandle, state: tauri::State<AppState>) -> Result<ProxyStatus, String> {
+    let _operation_guard = state
+        .operation_lock
+        .try_lock()
+        .map_err(|_| "Runtime уже выполняет другое действие. Повторите через несколько секунд.".to_string())?;
+
     let is_connected = state.connected.lock().map(|value| *value).unwrap_or(false);
     if enabled && !is_connected {
         return Err("Сначала запустите runtime, затем включайте системный proxy.".into());
     }
 
     let status = if enabled {
-        if let Ok(mut previous_guard) = state.previous_proxy.lock() {
-            if previous_guard.is_none() {
-                *previous_guard = current_proxy_snapshot().ok();
-            }
-        }
+        capture_previous_proxy_state(&app, &state)?;
         set_windows_proxy(true)?
     } else {
-        let previous = state.previous_proxy.lock().ok().and_then(|mut value| value.take());
-        if let Some(snapshot) = previous {
-            apply_windows_proxy_snapshot(&snapshot)?
-        } else {
-            set_windows_proxy(false)?
-        }
+        restore_saved_proxy_state(&app, &state, "manual_proxy_toggle")?
+            .unwrap_or_else(|| current_proxy_snapshot().unwrap_or_else(|_| ProxyStatus {
+                enabled: false,
+                server: None,
+                bypass: None,
+                method: "unknown".into(),
+                scope: "current-user".into(),
+                checked_at: unix_now_string(),
+            }))
     };
 
     let _ = append_runtime_event(
@@ -638,6 +727,7 @@ fn connectivity_probe() -> Result<ConnectivityProbe, String> {
             socks_port_open,
             public_ip: None,
             latency_ms: None,
+            packet_loss_pct: Some(100),
             message: format!("HTTP inbound 127.0.0.1:{HTTP_PORT} не отвечает. Сначала запустите runtime."),
         });
     }
@@ -654,43 +744,544 @@ fn connectivity_probe() -> Result<ConnectivityProbe, String> {
         socks_port_open,
         public_ip: Some(public_ip),
         latency_ms: Some(started.elapsed().as_millis()),
+        packet_loss_pct: Some(0),
         message: "Маршрут через локальный Xray runtime отвечает.".into(),
     })
+}
+
+
+
+fn collect_digits_after_marker(raw: &str, marker: &str) -> Vec<u128> {
+    let mut values = Vec::new();
+    let lower = raw.to_lowercase();
+    let mut offset = 0usize;
+
+    while let Some(found) = lower[offset..].find(marker) {
+        let start = offset + found + marker.len();
+        let tail = &lower[start..];
+        let digits = tail
+            .chars()
+            .skip_while(|ch| ch.is_whitespace())
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+
+        if let Ok(value) = digits.parse::<u128>() {
+            values.push(value.max(1));
+        }
+
+        offset = start.saturating_add(1);
+        if offset >= lower.len() {
+            break;
+        }
+    }
+
+    values
+}
+
+fn parse_ping_loss_percent(raw: &str) -> Option<u8> {
+    let lower = raw.to_lowercase();
+    for marker in ["loss", "потер"] {
+        if let Some(marker_index) = lower.find(marker) {
+            let prefix = &lower[..marker_index];
+            if let Some(percent_index) = prefix.rfind('%') {
+                let before_percent = &prefix[..percent_index];
+                let digits = before_percent
+                    .chars()
+                    .rev()
+                    .skip_while(|ch| ch.is_whitespace())
+                    .take_while(|ch| ch.is_ascii_digit())
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>();
+
+                if let Ok(value) = digits.parse::<u8>() {
+                    return Some(value.min(100));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_ping_output(raw: &str) -> Option<(u128, u8)> {
+    let mut samples = Vec::new();
+    for marker in ["time=", "time<", "время=", "время<"] {
+        samples.extend(collect_digits_after_marker(raw, marker));
+    }
+
+    let average_candidates = [
+        collect_digits_after_marker(raw, "average ="),
+        collect_digits_after_marker(raw, "average="),
+        collect_digits_after_marker(raw, "avg ="),
+        collect_digits_after_marker(raw, "avg="),
+        collect_digits_after_marker(raw, "среднее ="),
+        collect_digits_after_marker(raw, "среднее="),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    let latency_ms = average_candidates
+        .first()
+        .copied()
+        .or_else(|| {
+            if samples.is_empty() {
+                None
+            } else {
+                Some(samples.iter().sum::<u128>() / samples.len() as u128)
+            }
+        })?;
+
+    let packet_loss = parse_ping_loss_percent(raw).unwrap_or_else(|| if samples.is_empty() { 100 } else { 0 });
+    Some((latency_ms.max(1), packet_loss))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_icmp_ping(host: &str) -> Option<(u128, u8)> {
+    let normalized_host = normalize_socket_host(host);
+    if normalized_host.is_empty() {
+        return None;
+    }
+
+    let force_ipv6 = normalized_host.parse::<Ipv6Addr>().is_ok();
+    let mut command = Command::new("ping");
+    if force_ipv6 {
+        command.args(["-6", "-n", "3", "-w", "1200", &normalized_host]);
+    } else {
+        // Большинство пользователей работает без IPv6. Принудительно проверяем IPv4,
+        // чтобы ping не зависал на AAAA-записях и не показывал ложные 1 мс.
+        command.args(["-4", "-n", "3", "-w", "1200", &normalized_host]);
+    }
+
+    let output = run_command_with_timeout(command, Duration::from_secs(6), "icmp ping").unwrap_or_else(|error| error);
+    parse_ping_output(&output)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_icmp_ping(_host: &str) -> Option<(u128, u8)> {
+    None
+}
+
+fn tcp_connect_latency(addresses: &[std::net::SocketAddr], timeout: Duration) -> Option<u128> {
+    let mut best: Option<u128> = None;
+    let mut ordered = addresses.to_vec();
+    ordered.sort_by_key(|address| if address.is_ipv4() { 0 } else { 1 });
+
+    for address in ordered {
+        let started = Instant::now();
+        if TcpStream::connect_timeout(&address, timeout).is_ok() {
+            let elapsed = started.elapsed().as_millis().max(1);
+            best = Some(best.map_or(elapsed, |current| current.min(elapsed)));
+        }
+    }
+
+    best
+}
+
+
+fn run_tcp_ping_samples(addresses: &[std::net::SocketAddr], attempts: u8, timeout: Duration) -> (u8, Option<u128>, u8) {
+    let safe_attempts = attempts.max(1);
+    let mut success_count: u8 = 0;
+    let mut total_ms: u128 = 0;
+
+    for attempt in 0..safe_attempts {
+        if let Some(latency) = tcp_connect_latency(addresses, timeout) {
+            success_count += 1;
+            total_ms += latency;
+        }
+
+        if attempt + 1 < safe_attempts {
+            std::thread::sleep(Duration::from_millis(80));
+        }
+    }
+
+    let packet_loss = (((safe_attempts - success_count) as f32 / safe_attempts as f32) * 100.0).round() as u8;
+    let latency_ms = if success_count > 0 {
+        Some((total_ms / success_count as u128).max(1))
+    } else {
+        None
+    };
+
+    (success_count, latency_ms, packet_loss)
+}
+
+fn server_ping_blocking(host: String, port: u16) -> Result<ConnectivityProbe, String> {
+    let checked_at = unix_now_string();
+    let normalized_host = normalize_socket_host(&host);
+    if normalized_host.is_empty() {
+        return Err("У выбранного сервера нет host для проверки пинга.".into());
+    }
+
+    let addresses = resolve_socket_addresses(&normalized_host, port)?;
+    let endpoint = format_endpoint_for_display(&normalized_host, port);
+
+    // Для VPN-сервера важнее не ICMP, а доступность реального host:port.
+    // Поэтому TCP-проверка идёт первой и с короткими timeout, чтобы UI не выглядел зависшим.
+    let (success_count, latency_ms, packet_loss) = run_tcp_ping_samples(&addresses, 3, Duration::from_millis(850));
+    if success_count > 0 {
+        return Ok(ConnectivityProbe {
+            success: true,
+            checked_at,
+            http_port_open: tcp_port_open("127.0.0.1", HTTP_PORT, 200),
+            socks_port_open: tcp_port_open("127.0.0.1", SOCKS_PORT, 200),
+            public_ip: None,
+            latency_ms,
+            packet_loss_pct: Some(packet_loss),
+            message: format!(
+                "TCP ping {endpoint}: {} мс, порт доступен, потери {}%.",
+                latency_ms.unwrap_or(0),
+                packet_loss
+            ),
+        });
+    }
+
+    // ICMP используем только как диагностику. Если ICMP отвечает, но TCP-порт закрыт,
+    // сервер не считаем рабочим для подключения, чтобы не показывать ложный зелёный ping.
+    if let Some((icmp_latency_ms, icmp_packet_loss)) = windows_icmp_ping(&normalized_host) {
+        return Ok(ConnectivityProbe {
+            success: false,
+            checked_at,
+            http_port_open: tcp_port_open("127.0.0.1", HTTP_PORT, 200),
+            socks_port_open: tcp_port_open("127.0.0.1", SOCKS_PORT, 200),
+            public_ip: None,
+            latency_ms: Some(icmp_latency_ms),
+            packet_loss_pct: Some(icmp_packet_loss.max(packet_loss)),
+            message: format!(
+                "ICMP ping {endpoint}: {icmp_latency_ms} мс, но TCP-порт {port} недоступен."
+            ),
+        });
+    }
+
+    Ok(ConnectivityProbe {
+        success: false,
+        checked_at,
+        http_port_open: tcp_port_open("127.0.0.1", HTTP_PORT, 200),
+        socks_port_open: tcp_port_open("127.0.0.1", SOCKS_PORT, 200),
+        public_ip: None,
+        latency_ms: None,
+        packet_loss_pct: Some(100),
+        message: format!("Ping {endpoint} не получил ответа по TCP/ICMP, потери 100%."),
+    })
+}
+
+#[tauri::command]
+async fn server_ping(host: String, port: u16) -> Result<ConnectivityProbe, String> {
+    tauri::async_runtime::spawn_blocking(move || server_ping_blocking(host, port))
+        .await
+        .map_err(|error| format!("Проверка пинга была прервана: {error}"))?
+}
+
+fn parse_xray_stat_value(raw: &str) -> Option<u64> {
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("value:") {
+            if let Ok(parsed) = value.trim().parse::<u64>() {
+                return Some(parsed);
+            }
+        }
+    }
+
+    None
+}
+
+fn query_xray_stat(core_path: &str, stat_name: &str) -> Result<u64, String> {
+    let mut command = Command::new(core_path);
+    command
+        .arg("api")
+        .arg("statsquery")
+        .arg(format!("--server=127.0.0.1:{XRAY_API_PORT}"))
+        .arg("-name")
+        .arg(stat_name);
+
+    let output = run_command_with_timeout(command, Duration::from_secs(3), "xray api statsquery")?;
+    // Xray can omit a stat until the first bytes pass through it. Treat a missing
+    // value as zero instead of falling back to "unavailable", otherwise the UI
+    // never starts showing proxy traffic on fresh connections.
+    Ok(parse_xray_stat_value(&output).unwrap_or(0))
+}
+
+fn runtime_xray_stats_snapshot(state: &tauri::State<AppState>) -> Option<TrafficSnapshot> {
+    let core_path = state
+        .runtime
+        .lock()
+        .ok()
+        .and_then(|runtime| runtime.as_ref().map(|item| item.core_path.clone()))?;
+
+    let uplink = query_xray_stat(&core_path, "outbound>>>proxy>>>traffic>>>uplink").ok()?;
+    let downlink = query_xray_stat(&core_path, "outbound>>>proxy>>>traffic>>>downlink").ok()?;
+
+    Some(TrafficSnapshot {
+        received_bytes: downlink,
+        sent_bytes: uplink,
+        checked_at: unix_now_string(),
+        source: "xray-stats".into(),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_tun_traffic_snapshot() -> Option<TrafficSnapshot> {
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$stats = Get-NetAdapterStatistics -Name '{}' -ErrorAction SilentlyContinue
+if ($stats) {{
+  [PSCustomObject]@{{ receivedBytes = [UInt64]$stats.ReceivedBytes; sentBytes = [UInt64]$stats.SentBytes }} | ConvertTo-Json -Compress
+}}
+"#,
+        ps_quote(TUN_INTERFACE_NAME)
+    );
+
+    let raw = run_powershell(&script).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_str(raw.trim()).ok()?;
+    Some(TrafficSnapshot {
+        received_bytes: value.get("receivedBytes").and_then(Value::as_u64).unwrap_or(0),
+        sent_bytes: value.get("sentBytes").and_then(Value::as_u64).unwrap_or(0),
+        checked_at: unix_now_string(),
+        source: "windows-tun-adapter".into(),
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_tun_traffic_snapshot() -> Option<TrafficSnapshot> {
+    None
+}
+
+#[tauri::command]
+fn traffic_snapshot(state: tauri::State<AppState>) -> Result<TrafficSnapshot, String> {
+    if let Some(snapshot) = runtime_xray_stats_snapshot(&state) {
+        return Ok(snapshot);
+    }
+
+    if let Some(snapshot) = windows_tun_traffic_snapshot() {
+        return Ok(snapshot);
+    }
+
+    Ok(TrafficSnapshot {
+        received_bytes: 0,
+        sent_bytes: 0,
+        checked_at: unix_now_string(),
+        source: if cfg!(target_os = "windows") { "unavailable".into() } else { "mock".into() },
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn parse_wmic_process_list(raw: &str) -> Vec<RunningAppInfo> {
+    raw.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let parts = line.split(',').map(str::trim).collect::<Vec<_>>();
+            if parts.len() < 4 { return None; }
+            let pid = parts.last()?.parse::<u32>().ok()?;
+            let name = parts.get(parts.len().saturating_sub(2))?.trim().to_string();
+            let path = parts[1..parts.len().saturating_sub(2)].join(",").trim().to_string();
+            if name.is_empty() || !name.to_lowercase().ends_with(".exe") { return None; }
+            Some(RunningAppInfo { pid, name, path: if path.is_empty() { None } else { Some(path) }, title: None })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn split_csv_line(line: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => { current.push('"'); let _ = chars.next(); }
+            '"' => quoted = !quoted,
+            ',' if !quoted => { values.push(current.trim().to_string()); current.clear(); }
+            _ => current.push(ch),
+        }
+    }
+    values.push(current.trim().to_string());
+    values
+}
+
+#[cfg(target_os = "windows")]
+fn parse_tasklist_process_list(raw: &str) -> Vec<RunningAppInfo> {
+    raw.lines()
+        .filter_map(|line| {
+            let parts = split_csv_line(line);
+            let name = parts.first()?.trim().to_string();
+            let pid = parts.get(1)?.trim().parse::<u32>().ok()?;
+            if name.is_empty() || !name.to_lowercase().ends_with(".exe") { return None; }
+            Some(RunningAppInfo { pid, name, path: None, title: None })
+        })
+        .collect()
 }
 
 #[cfg(target_os = "windows")]
 #[tauri::command]
 fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
-    let script = r#"
-$ErrorActionPreference = 'SilentlyContinue'
-Get-Process | Where-Object { $_.Path -and $_.Path.ToLower().EndsWith('.exe') } |
-  Sort-Object ProcessName, Id |
-  Select-Object -First 80 @{Name='pid';Expression={$_.Id}}, @{Name='name';Expression={ if ($_.ProcessName.ToLower().EndsWith('.exe')) { $_.ProcessName } else { $_.ProcessName + '.exe' } }}, @{Name='path';Expression={$_.Path}}, @{Name='title';Expression={$_.MainWindowTitle}} |
-  ConvertTo-Json -Compress
-"#;
+    let mut wmic = Command::new("wmic");
+    wmic.args(["process", "where", "ExecutablePath is not null", "get", "ProcessId,Name,ExecutablePath", "/FORMAT:CSV"]);
+    let raw = run_command_with_timeout(wmic, Duration::from_secs(5), "wmic process list");
 
-    let raw = run_powershell(script)?;
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let value: Value = serde_json::from_str(&raw).map_err(|error| format!("Не удалось прочитать список процессов: {error}"))?;
-    let apps: Vec<RunningAppInfo> = if value.is_array() {
-        serde_json::from_value(value).map_err(|error| format!("Некорректный список процессов: {error}"))?
-    } else {
-        vec![serde_json::from_value(value).map_err(|error| format!("Некорректный процесс: {error}"))?]
+    let apps = match raw {
+        Ok(value) if value.contains("ExecutablePath") => parse_wmic_process_list(&value),
+        _ => {
+            let mut tasklist = Command::new("tasklist");
+            tasklist.args(["/FO", "CSV", "/NH"]);
+            let fallback = run_command_with_timeout(tasklist, Duration::from_secs(4), "tasklist process list")?;
+            parse_tasklist_process_list(&fallback)
+        }
     };
 
-    Ok(apps
-        .into_iter()
-        .filter(|app| !app.name.trim().is_empty())
-        .collect())
+    Ok(apps.into_iter().filter(|app| !app.name.trim().is_empty()).take(80).collect())
 }
-
 #[cfg(not(target_os = "windows"))]
 #[tauri::command]
 fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
     Ok(Vec::new())
+}
+
+fn read_xray_version(app: &AppHandle) -> (String, Option<String>) {
+    let Some(core_path) = resolve_core_path(app) else {
+        return ("Не найден".to_string(), None);
+    };
+
+    let core_path_string = core_path.to_string_lossy().to_string();
+
+    if let Err(error) = validate_core_path(&core_path) {
+        return (format!("Файл Xray повреждён: {error}"), Some(core_path_string));
+    }
+
+    let mut command = Command::new(&core_path);
+    command.arg("version");
+    hide_child_console(&mut command);
+
+    match command.output() {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let first_line = stdout
+                .lines()
+                .chain(stderr.lines())
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("Версия не определена")
+                .to_string();
+            (first_line, Some(core_path_string))
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let message = if stderr.is_empty() { stdout } else { stderr };
+            (if message.is_empty() { "Не удалось запустить xray.exe".to_string() } else { message }, Some(core_path_string))
+        }
+        Err(error) => {
+            let friendly = if error.raw_os_error() == Some(193) {
+                "Ошибка запуска Xray: файл не запускается как Windows x64-приложение (os error 193). Запустите START_VKarmani.bat — он проверит и восстановит core.".to_string()
+            } else {
+                format!("Не удалось запустить Xray-core: {error}")
+            };
+            (friendly, Some(core_path_string))
+        },
+    }
+}
+#[cfg(target_os = "windows")]
+fn read_windows_registry_value(key: &str, value_name: &str) -> Option<String> {
+    let mut command = Command::new("reg");
+    command.args(["query", key, "/v", value_name]);
+    run_command_with_timeout(command, Duration::from_secs(4), &format!("reg query {value_name}"))
+        .ok()
+        .and_then(|raw| parse_reg_value(&raw, value_name))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_device_info() -> (String, String, String, String, String, String) {
+    let current_version_key = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+    let hwid = read_windows_registry_value(r"HKLM\SOFTWARE\Microsoft\Cryptography", "MachineGuid")
+        .unwrap_or_else(|| "—".to_string());
+    let product_name = read_windows_registry_value(current_version_key, "ProductName")
+        .unwrap_or_else(|| "Windows".to_string());
+    let display_version = read_windows_registry_value(current_version_key, "DisplayVersion")
+        .or_else(|| read_windows_registry_value(current_version_key, "ReleaseId"))
+        .unwrap_or_else(|| "—".to_string());
+    let build = read_windows_registry_value(current_version_key, "CurrentBuildNumber")
+        .or_else(|| read_windows_registry_value(current_version_key, "CurrentBuild"))
+        .unwrap_or_else(|| "—".to_string());
+    let architecture = std::env::var("PROCESSOR_ARCHITECTURE")
+        .or_else(|_| std::env::var("PROCESSOR_ARCHITEW6432"))
+        .unwrap_or_else(|_| std::env::consts::ARCH.to_string());
+    let device_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "—".to_string());
+
+    (hwid, product_name, display_version, build, architecture, device_name)
+}
+#[cfg(not(target_os = "windows"))]
+fn windows_device_info() -> (String, String, String, String, String, String) {
+    (
+        "—".to_string(),
+        std::env::consts::OS.to_string(),
+        "—".to_string(),
+        "—".to_string(),
+        std::env::consts::ARCH.to_string(),
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "—".to_string()),
+    )
+}
+
+#[tauri::command]
+fn native_app_info(app: AppHandle) -> NativeAppInfo {
+    let (xray_version, core_path) = read_xray_version(&app);
+    let (hwid, os_name, os_version, os_build, os_architecture, device_name) = windows_device_info();
+
+    NativeAppInfo {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        xray_version,
+        hwid,
+        os_name,
+        os_version,
+        os_build,
+        os_architecture,
+        device_name,
+        core_path,
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn pick_executable_path() -> Result<Option<String>, String> {
+    let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = 'Выберите приложение для TUN'
+$dialog.Filter = 'Windows applications (*.exe)|*.exe|All files (*.*)|*.*'
+$dialog.Multiselect = $false
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  $dialog.FileName
+}
+"#;
+
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-STA", "-Command", script]);
+    hide_child_console(&mut command);
+
+    let output = command
+        .output()
+        .map_err(|error| format!("Не удалось открыть выбор приложения: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if stderr.is_empty() { stdout } else { stderr });
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if value.is_empty() { None } else { Some(value) })
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn pick_executable_path() -> Result<Option<String>, String> {
+    Ok(None)
 }
 
 #[tauri::command]

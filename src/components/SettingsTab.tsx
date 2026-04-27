@@ -1,4 +1,5 @@
-import { Bell, Bolt, MonitorCog, Shield, Sparkles } from 'lucide-react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { Bell, Download, Globe2, Languages, MonitorCog, Palette, RefreshCw, Route, Shield, SlidersHorizontal, Split, Star, Wifi, Zap } from 'lucide-react';
 import { tr, type UiLanguage } from '../i18n';
 import type { AppSettings } from '../types/vpn';
 
@@ -7,204 +8,343 @@ interface SettingsTabProps {
   language: UiLanguage;
   onToggleSetting: (key: keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode'>) => void;
   onTunnelModeChange: (value: AppSettings['tunnelMode']) => void;
+  onLanguageChange: (value: UiLanguage) => void;
 }
 
 type ToggleKey = keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode'>;
+type SectionId = 'general' | 'network' | 'tunnel' | 'split' | 'proxy' | 'startup' | 'notifications' | 'diagnostics';
 
 interface ToggleItem {
   key: ToggleKey;
   title: string;
   description: string;
+  icon: typeof Shield;
 }
 
-export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeChange }: SettingsTabProps) {
-  const groups: Array<{ title: string; subtitle: string; icon: typeof Shield; items: ToggleItem[] }> = [
-    {
-      title: tr(language, 'Подключение и профиль', 'Connection and profile'),
-      subtitle: tr(language, 'Настройки, которые влияют на вход, старт туннеля и обновление live-профиля.', 'Options that affect sign-in, tunnel startup, and live profile sync.'),
-      icon: Shield,
-      items: [
-        {
-          key: 'autoConnect',
-          title: tr(language, 'Автоподключение', 'Auto-connect'),
-          description: tr(language, 'Поднимать туннель после успешного входа по ключу', 'Start the tunnel after successful sign-in')
-        },
-        {
-          key: 'profileSyncOnLogin',
-          title: tr(language, 'Синхронизация профиля при входе', 'Sync profile on sign-in'),
-          description: tr(language, 'Сразу подтягивать subscription-профиль Remnawave', 'Fetch the Remnawave subscription profile immediately')
-        },
-        {
-          key: 'useSystemProxy',
-          title: tr(language, 'Системный proxy после подключения', 'Enable system proxy after connect'),
-          description: tr(language, 'Направлять HTTP/HTTPS трафик Windows в локальный HTTP inbound Xray', 'Route Windows HTTP/HTTPS traffic into the local Xray HTTP inbound')
-        },
-        {
-          key: 'probeOnConnect',
-          title: tr(language, 'Проверять маршрут после подключения', 'Run probe after connect'),
-          description: tr(language, 'Сразу проверять локальные порты и внешний IP', 'Check local ports and public IP immediately after connect')
-        }
-      ]
-    },
-    {
-      title: tr(language, 'Система и фоновые действия', 'System and background behavior'),
-      subtitle: tr(language, 'То, как приложение ведёт себя при запуске Windows и при закрытии окна.', 'How the app behaves on Windows startup and when the window is closed.'),
-      icon: MonitorCog,
-      items: [
-        {
-          key: 'launchOnStartup',
-          title: tr(language, 'Автозапуск', 'Launch on startup'),
-          description: tr(language, 'Запускать VKarmani вместе с системой', 'Start VKarmani with the operating system')
-        },
-        {
-          key: 'runAsAdmin',
-          title: tr(language, 'Запуск с правами администратора', 'Run with administrator rights'),
-          description: tr(language, 'В собранной версии VKarmani запросит права администратора при старте, если они нужны системным действиям', 'In the packaged build VKarmani will request administrator rights on start when system actions require them')
-        },
-        {
-          key: 'minimizeToTray',
-          title: tr(language, 'Сворачивать в трей', 'Minimize to tray'),
-          description: tr(language, 'При закрытии окна оставлять приложение в фоне', 'Keep the app running in the background when the window is closed')
-        },
-        {
-          key: 'showDiagnostics',
-          title: tr(language, 'Диагностика', 'Diagnostics'),
-          description: tr(language, 'Показывать вкладку для продвинутой диагностики и служебной информации', 'Show the advanced diagnostics and service information tab')
-        }
-      ]
-    },
-    {
-      title: tr(language, 'Обновления и интерфейс', 'Updates and interface'),
-      subtitle: tr(language, 'Косметика и то, как клиент сообщает о событиях и релизах.', 'Visual polish and how the client reports events and releases.'),
-      icon: Sparkles,
-      items: [
-        {
-          key: 'autoUpdate',
-          title: tr(language, 'Автопроверка обновлений', 'Auto-check updates'),
-          description: tr(language, 'Проверять релизы в фоне и показывать предложение установить новую версию', 'Check releases in the background and offer a new version when available')
-        },
-        {
-          key: 'autoInstallUpdates',
-          title: tr(language, 'Автоустановка обновлений', 'Auto-install updates'),
-          description: tr(language, 'Скачивать и устанавливать найденное обновление автоматически. По умолчанию выключено, чтобы VPN не прерывался без согласия.', 'Download and install found updates automatically. Disabled by default so the VPN is not interrupted without consent.')
-        },
-        {
-          key: 'notifications',
-          title: tr(language, 'Уведомления', 'Notifications'),
-          description: tr(language, 'Показывать статус подключения и обновлений', 'Show connection and update status')
-        },
-        {
-          key: 'themeGlow',
-          title: tr(language, 'Световой акцент', 'Glow accent'),
-          description: tr(language, 'Подсвечивать активные состояния в фирменном стиле', 'Highlight active states using the VKarmani visual accent')
-        }
-      ]
-    }
+function scrollToSettingsSection(id: SectionId) {
+  const target = document.getElementById(`settings-${id}`);
+  if (!target) {
+    return;
+  }
+
+  const container = target.closest('.settings-screen-redesign') as HTMLElement | null;
+  if (container) {
+    container.scrollTo({
+      top: Math.max(0, target.offsetTop - container.offsetTop - 12),
+      behavior: 'smooth'
+    });
+    return;
+  }
+
+  target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function ToggleRow({ item, enabled, onClick, language }: { item: ToggleItem; enabled: boolean; onClick: () => void; language: UiLanguage }) {
+  const Icon = item.icon;
+  return (
+    <button className={`setting-row button-row ${enabled ? 'setting-row-active' : ''}`} onClick={onClick} type="button">
+      <div className="setting-row-icon"><Icon size={18} /></div>
+      <div className="setting-copy">
+        <strong>{item.title}</strong>
+        <span>{item.description}</span>
+      </div>
+      <div className="setting-side">
+        <span className={`micro-pill ${enabled ? 'active' : ''}`}>{enabled ? tr(language, 'Вкл', 'On') : tr(language, 'Выкл', 'Off')}</span>
+        <div className={`toggle ${enabled ? 'on' : ''}`} />
+      </div>
+    </button>
+  );
+}
+
+function SettingsSection({ id, kicker, title, icon: Icon, children }: { id: SectionId; kicker: string; title: string; icon: typeof Shield; children: ReactNode }) {
+  return (
+    <section id={`settings-${id}`} className="settings-wide-panel panel settings-anchor-section">
+      <div className="panel-header compact compact-header-row">
+        <div>
+          <span className="section-kicker">{kicker}</span>
+          <h3>{title}</h3>
+        </div>
+        <Icon size={19} />
+      </div>
+      {children}
+    </section>
+  );
+}
+
+export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeChange, onLanguageChange }: SettingsTabProps) {
+  const [activeSection, setActiveSection] = useState<SectionId>('general');
+  const scrollSpyFrameRef = useRef<number | null>(null);
+  const nextLanguage: UiLanguage = language === 'ru' ? 'en' : 'ru';
+
+  const tabs: Array<{ id: SectionId; label: string }> = [
+    { id: 'general', label: tr(language, 'Общие', 'General') },
+    { id: 'network', label: tr(language, 'Сеть', 'Network') },
+    { id: 'tunnel', label: tr(language, 'Режим туннеля', 'Tunnel mode') },
+    { id: 'split', label: tr(language, 'Раздельное туннелирование', 'Split tunneling') },
+    { id: 'proxy', label: tr(language, 'Системный прокси', 'System proxy') },
+    { id: 'startup', label: tr(language, 'Автозапуск', 'Startup') },
+    { id: 'notifications', label: tr(language, 'Уведомления', 'Notifications') },
+    { id: 'diagnostics', label: tr(language, 'Диагностика', 'Diagnostics') }
   ];
 
+  const sections: Record<SectionId, ToggleItem[]> = {
+    general: [
+      {
+        key: 'minimizeToTray',
+        title: tr(language, 'Минимизировать в трей', 'Minimize to tray'),
+        description: tr(language, 'Сворачивать приложение в системный трей при закрытии', 'Keep the app in the system tray when closing the window'),
+        icon: SlidersHorizontal
+      },
+      {
+        key: 'themeGlow',
+        title: tr(language, 'Световой акцент', 'Glow accent'),
+        description: tr(language, 'Подсвечивать активные состояния фирменным синим цветом', 'Highlight active states with the branded blue accent'),
+        icon: Palette
+      }
+    ],
+    network: [
+      {
+        key: 'autoConnect',
+        title: tr(language, 'Автоподключение', 'Auto-connect'),
+        description: tr(language, 'Поднимать туннель после успешного входа по ключу', 'Start the tunnel after successful sign-in'),
+        icon: Zap
+      },
+      {
+        key: 'autoConnectFavorite',
+        title: tr(language, 'После запуска подключаться к избранному серверу', 'Connect to a favorite server after launch'),
+        description: tr(language, 'При запуске с сохранённым ключом VKarmani автоматически выберет первый доступный избранный сервер.', 'With a saved key, VKarmani will automatically choose the first available favorite server on launch.'),
+        icon: Star
+      },
+      {
+        key: 'profileSyncOnLogin',
+        title: tr(language, 'Синхронизация профиля при входе', 'Sync profile on sign-in'),
+        description: tr(language, 'Сразу подтягивать subscription-профиль Remnawave', 'Fetch the Remnawave subscription profile immediately'),
+        icon: RefreshCw
+      },
+      {
+        key: 'probeOnConnect',
+        title: tr(language, 'Проверять маршрут после подключения', 'Run probe after connect'),
+        description: tr(language, 'Сразу проверять локальные порты и внешний IP', 'Check local ports and public IP immediately after connect'),
+        icon: Shield
+      }
+    ],
+    tunnel: [],
+    split: [],
+    proxy: [
+      {
+        key: 'useSystemProxy',
+        title: tr(language, 'Системный прокси', 'System proxy'),
+        description: tr(language, 'Направлять HTTP/HTTPS трафик Windows в локальный HTTP inbound Xray', 'Route Windows HTTP/HTTPS traffic into the local Xray HTTP inbound'),
+        icon: Wifi
+      }
+    ],
+    startup: [
+      {
+        key: 'launchOnStartup',
+        title: tr(language, 'Запускать при старте Windows', 'Launch on Windows startup'),
+        description: tr(language, 'Автоматически запускать приложение при включении компьютера', 'Start the app automatically when the computer turns on'),
+        icon: MonitorCog
+      },
+      {
+        key: 'runAsAdmin',
+        title: tr(language, 'Запуск с правами администратора', 'Run with administrator rights'),
+        description: tr(language, 'Нужно для системных действий и TUN-режима', 'Needed for system actions and TUN mode'),
+        icon: Shield
+      }
+    ],
+    notifications: [
+      {
+        key: 'notifications',
+        title: tr(language, 'Уведомления', 'Notifications'),
+        description: tr(language, 'Показывать статус подключения и обновлений', 'Show connection and update status'),
+        icon: Bell
+      },
+      {
+        key: 'autoUpdate',
+        title: tr(language, 'Автопроверка обновлений', 'Auto-check updates'),
+        description: tr(language, 'Проверять релизы в фоне', 'Check releases in the background'),
+        icon: RefreshCw
+      },
+      {
+        key: 'autoInstallUpdates',
+        title: tr(language, 'Автоустановка обновлений', 'Auto-install updates'),
+        description: tr(language, 'Устанавливать найденные обновления автоматически', 'Install found updates automatically'),
+        icon: Download
+      }
+    ],
+    diagnostics: [
+      {
+        key: 'showDiagnostics',
+        title: tr(language, 'Расширенная диагностика', 'Advanced diagnostics'),
+        description: tr(language, 'Показывать вкладку диагностики и служебной информации', 'Show diagnostics and service information tab'),
+        icon: Shield
+      }
+    ]
+  };
+
+  const handleTabClick = (id: SectionId) => {
+    setActiveSection(id);
+    window.requestAnimationFrame(() => scrollToSettingsSection(id));
+  };
+
+  useEffect(() => {
+    const container = document.querySelector('.settings-screen-redesign') as HTMLElement | null;
+    if (!container) {
+      return;
+    }
+
+    const sectionIds = tabs.map((tab) => tab.id);
+
+    const updateActiveSection = () => {
+      if (scrollSpyFrameRef.current !== null) {
+        window.cancelAnimationFrame(scrollSpyFrameRef.current);
+      }
+
+      scrollSpyFrameRef.current = window.requestAnimationFrame(() => {
+        const scrollMarker = container.scrollTop + 180;
+        let nextActive = sectionIds[0];
+
+        for (const id of sectionIds) {
+          const section = document.getElementById(`settings-${id}`);
+          if (!section) {
+            continue;
+          }
+
+          if (section.offsetTop <= scrollMarker) {
+            nextActive = id;
+          }
+        }
+
+        setActiveSection((current) => (current === nextActive ? current : nextActive));
+        scrollSpyFrameRef.current = null;
+      });
+    };
+
+    updateActiveSection();
+    container.addEventListener('scroll', updateActiveSection, { passive: true });
+    window.addEventListener('resize', updateActiveSection);
+
+    return () => {
+      if (scrollSpyFrameRef.current !== null) {
+        window.cancelAnimationFrame(scrollSpyFrameRef.current);
+        scrollSpyFrameRef.current = null;
+      }
+      container.removeEventListener('scroll', updateActiveSection);
+      window.removeEventListener('resize', updateActiveSection);
+    };
+  }, [language]);
+
   return (
-    <div className="tab-stack compact-tab-stack">
-      <section className="panel compact-panel">
-        <div className="panel-header compact compact-header-row">
-          <div>
-            <span className="chip subdued">{tr(language, 'Быстрые рекомендации', 'Quick recommendations')}</span>
-            <h3>{tr(language, 'Что обычно включают', 'What is usually enabled')}</h3>
-          </div>
+    <div className="settings-screen-redesign">
+      <section className="settings-hero-line">
+        <div>
+          <span className="section-kicker">VKarmani</span>
+          <h1>{tr(language, 'Настройки', 'Settings')}</h1>
+          <p>{tr(language, 'Управляйте параметрами приложения, подключения и системной интеграции.', 'Manage application, connection, and system integration settings.')}</p>
         </div>
-
-        <div className="settings-tip-grid">
-          <article className="support-item compact-support-item">
-            <Bolt size={18} />
-            <div>
-              <strong>{tr(language, 'Для повседневного использования', 'For daily use')}</strong>
-              <span>{tr(language, 'Автоподключение + sync профиля + уведомления.', 'Auto-connect + profile sync + notifications.')}</span>
-            </div>
-          </article>
-          <article className="support-item compact-support-item">
-            <MonitorCog size={18} />
-            <div>
-              <strong>{tr(language, 'Для фоновой работы', 'For background use')}</strong>
-              <span>{tr(language, 'Автозапуск и сворачивание в трей делают клиент менее навязчивым.', 'Launch on startup and minimize to tray make the client less intrusive.')}</span>
-            </div>
-          </article>
-          <article className="support-item compact-support-item">
-            <Bell size={18} />
-            <div>
-              <strong>{tr(language, 'Для контроля соединения', 'For connection awareness')}</strong>
-              <span>{tr(language, 'Probe после подключения помогает быстро понять, жив ли маршрут.', 'Probe after connect helps confirm the route is actually alive.')}</span>
-            </div>
-          </article>
+        <div className="settings-health-card">
+          <span className="system-status-dot" />
+          <div>
+            <strong>{tr(language, 'Все системы работают', 'All systems operational')}</strong>
+            <small>{tr(language, 'Параметры применяются сразу', 'Settings apply instantly')}</small>
+          </div>
         </div>
       </section>
 
-      <section className="panel compact-panel">
-        <div className="panel-header compact compact-header-row">
-          <div>
-            <span className="chip subdued">{tr(language, 'Маршрутизация', 'Routing mode')}</span>
-            <h3>{tr(language, 'Режим туннеля', 'Tunnel mode')}</h3>
-          </div>
-        </div>
-
-        <div className="settings-tip-grid">
-          <button className={`setting-row button-row ${settings.tunnelMode === 'proxy' ? 'setting-row-active' : ''}`} onClick={() => onTunnelModeChange('proxy')}>
-            <div className="setting-copy">
-              <strong>{tr(language, 'Proxy режим', 'Proxy mode')}</strong>
-              <span>{tr(language, 'Классический режим: Xray поднимает локальные SOCKS/HTTP порты, а Windows-трафик можно отправлять через system proxy.', 'Classic mode: Xray exposes local SOCKS/HTTP ports and Windows traffic can be routed through the system proxy.')}</span>
-            </div>
-            <div className="setting-side">
-              <span className={`micro-pill ${settings.tunnelMode === 'proxy' ? 'active' : ''}`}>{settings.tunnelMode === 'proxy' ? tr(language, 'Выбран', 'Selected') : tr(language, 'Доступен', 'Available')}</span>
-            </div>
+      <div className="settings-tab-strip" role="tablist" aria-label={tr(language, 'Разделы настроек', 'Settings sections')}>
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            role="tab"
+            aria-selected={activeSection === tab.id}
+            className={activeSection === tab.id ? 'active' : ''}
+            onClick={() => handleTabClick(tab.id)}
+          >
+            {tab.label}
           </button>
-
-          <button className={`setting-row button-row ${settings.tunnelMode === 'tun' ? 'setting-row-active' : ''}`} onClick={() => onTunnelModeChange('tun')}>
-            <div className="setting-copy">
-              <strong>{tr(language, 'TUN режим', 'TUN mode')}</strong>
-              <span>{tr(language, 'Экспериментальный полный маршрут: Xray создаёт TUN-интерфейс и клиент добавляет Windows-маршруты. Для него обычно нужны права администратора.', 'Experimental full-route mode: Xray creates a TUN interface and the client adds Windows routes. This usually requires administrator rights.')}</span>
-            </div>
-            <div className="setting-side">
-              <span className={`micro-pill ${settings.tunnelMode === 'tun' ? 'active' : ''}`}>{settings.tunnelMode === 'tun' ? tr(language, 'Выбран', 'Selected') : tr(language, 'Экспериментальный', 'Experimental')}</span>
-            </div>
-          </button>
-        </div>
-      </section>
-
-      <div className="settings-group-grid">
-        {groups.map((group) => {
-          const Icon = group.icon;
-          return (
-            <section key={group.title} className="panel compact-panel settings-group-panel">
-              <div className="panel-header compact compact-header-row settings-group-header">
-                <div>
-                  <span className="chip subdued">{group.title}</span>
-                  <h3>{group.title}</h3>
-                  <p className="muted settings-group-note">{group.subtitle}</p>
-                </div>
-                <div className="settings-group-icon">
-                  <Icon size={18} />
-                </div>
-              </div>
-
-              <div className="quick-settings compact-quick-settings settings-group-list">
-                {group.items.map((item) => (
-                  <button key={item.key} className="setting-row button-row" onClick={() => onToggleSetting(item.key)}>
-                    <div className="setting-copy">
-                      <strong>{item.title}</strong>
-                      <span>{item.description}</span>
-                    </div>
-                    <div className="setting-side">
-                      <span className={`micro-pill ${settings[item.key] ? 'active' : ''}`}>
-                        {settings[item.key] ? tr(language, 'Вкл', 'On') : tr(language, 'Выкл', 'Off')}
-                      </span>
-                      <div className={`toggle ${settings[item.key] ? 'on' : ''}`} />
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </section>
-          );
-        })}
+        ))}
       </div>
 
+      <div className="settings-redesign-grid">
+        <SettingsSection id="general" kicker={tr(language, 'Общие', 'General')} title={tr(language, 'Основные параметры', 'Core preferences')} icon={Globe2}>
+          <div className="settings-list-modern">
+            <button className="setting-row button-row" type="button" onClick={() => onLanguageChange(nextLanguage)}>
+              <div className="setting-row-icon"><Languages size={18} /></div>
+              <div className="setting-copy">
+                <strong>{tr(language, 'Язык интерфейса', 'Interface language')}</strong>
+                <span>{tr(language, 'Нажмите, чтобы переключить русский / английский интерфейс', 'Click to switch Russian / English interface')}</span>
+              </div>
+              <div className="select-field">{language === 'ru' ? 'Русский' : 'English'}</div>
+            </button>
+            {sections.general.map((item) => (
+              <ToggleRow key={item.key} item={item} enabled={Boolean(settings[item.key])} onClick={() => onToggleSetting(item.key)} language={language} />
+            ))}
+          </div>
+        </SettingsSection>
+
+        <SettingsSection id="network" kicker={tr(language, 'Сеть', 'Network')} title={tr(language, 'Поведение подключения', 'Connection behavior')} icon={Wifi}>
+          <div className="settings-two-columns">
+            {sections.network.map((item) => (
+              <ToggleRow key={item.key} item={item} enabled={Boolean(settings[item.key])} onClick={() => onToggleSetting(item.key)} language={language} />
+            ))}
+          </div>
+        </SettingsSection>
+
+        <SettingsSection id="tunnel" kicker={tr(language, 'Режим туннеля', 'Tunnel mode')} title={tr(language, 'Proxy или TUN', 'Proxy or TUN')} icon={Route}>
+          <div className="settings-mode-card-inline">
+            <div>
+              <h4>{settings.tunnelMode === 'tun' ? 'TUN' : 'Proxy'}</h4>
+              <p>{settings.tunnelMode === 'tun'
+                ? tr(language, 'TUN-режим шифрует выбранный системный трафик через VPN.', 'TUN mode routes selected system traffic through VPN.')
+                : tr(language, 'Proxy-режим использует локальные SOCKS/HTTP порты.', 'Proxy mode uses local SOCKS/HTTP ports.')}</p>
+            </div>
+            <div className="settings-mode-switch">
+              <button className={settings.tunnelMode === 'proxy' ? 'active' : ''} type="button" onClick={() => onTunnelModeChange('proxy')}>Proxy</button>
+              <button className={settings.tunnelMode === 'tun' ? 'active' : ''} type="button" onClick={() => onTunnelModeChange('tun')}>TUN</button>
+            </div>
+          </div>
+        </SettingsSection>
+
+        <SettingsSection id="split" kicker={tr(language, 'Раздельное туннелирование', 'Split tunneling')} title={tr(language, 'Маршрутизация приложений', 'App routing')} icon={Split}>
+          <div className="settings-note-card">
+            <strong>{tr(language, 'Раздельное туннелирование управляется на главном экране TUN-режима', 'Split tunneling is managed from the main TUN-mode screen')}</strong>
+            <span>{tr(language, 'Здесь можно быстро переключить режим туннеля. Списки приложений и служб применяются при переподключении.', 'Here you can quickly switch tunnel mode. App and service lists apply on reconnect.')}</span>
+          </div>
+        </SettingsSection>
+
+        <SettingsSection id="proxy" kicker={tr(language, 'Системный прокси', 'System proxy')} title={tr(language, 'Интеграция Windows', 'Windows integration')} icon={Globe2}>
+          <div className="settings-list-modern">
+            {sections.proxy.map((item) => (
+              <ToggleRow key={item.key} item={item} enabled={Boolean(settings[item.key])} onClick={() => onToggleSetting(item.key)} language={language} />
+            ))}
+          </div>
+        </SettingsSection>
+
+        <SettingsSection id="startup" kicker={tr(language, 'Автозапуск', 'Startup')} title={tr(language, 'Запуск приложения', 'Application startup')} icon={MonitorCog}>
+          <div className="settings-two-columns">
+            {sections.startup.map((item) => (
+              <ToggleRow key={item.key} item={item} enabled={Boolean(settings[item.key])} onClick={() => onToggleSetting(item.key)} language={language} />
+            ))}
+          </div>
+        </SettingsSection>
+
+        <SettingsSection id="notifications" kicker={tr(language, 'Уведомления', 'Notifications')} title={tr(language, 'Обновления и события', 'Updates and events')} icon={Bell}>
+          <div className="settings-two-columns">
+            {sections.notifications.map((item) => (
+              <ToggleRow key={item.key} item={item} enabled={Boolean(settings[item.key])} onClick={() => onToggleSetting(item.key)} language={language} />
+            ))}
+          </div>
+        </SettingsSection>
+
+        <SettingsSection id="diagnostics" kicker={tr(language, 'Диагностика', 'Diagnostics')} title={tr(language, 'Служебная информация', 'Service information')} icon={Shield}>
+          <div className="settings-list-modern">
+            {sections.diagnostics.map((item) => (
+              <ToggleRow key={item.key} item={item} enabled={Boolean(settings[item.key])} onClick={() => onToggleSetting(item.key)} language={language} />
+            ))}
+          </div>
+        </SettingsSection>
+      </div>
     </div>
   );
 }
