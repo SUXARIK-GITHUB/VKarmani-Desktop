@@ -222,7 +222,7 @@ fn redact_sensitive(input: &str) -> String {
                 .find(char::is_whitespace)
                 .map(|offset| start + offset)
                 .unwrap_or(result.len());
-            result.replace_range(start..end, "https://sub.vkarmani.com/[redacted-key]");
+            result.replace_range(start..end, "[redacted-key]");
         }
     }
 
