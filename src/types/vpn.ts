@@ -130,7 +130,9 @@ export interface ProfileSyncInfo {
   source: RemnawaveSource;
   sourceLabel: string;
   configCount: number;
+  readyCount?: number;
   lastSyncAt?: string;
+  updatedAt?: string;
   rawUrl?: string;
   message?: string;
   accessKeyKind?: AccessKeyKind;
