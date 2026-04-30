@@ -1,15 +1,32 @@
-const TRAY_ID: &str = "vkarmani-main-tray";
+use super::*;
 
-fn build_tray_menu(app: &AppHandle, connected: bool, proxy_active: bool, authorized: bool) -> tauri::Result<Menu<tauri::Wry>> {
+pub(crate) const TRAY_ID: &str = "vkarmani-main-tray";
+
+pub(crate) fn build_tray_menu(
+    app: &AppHandle,
+    connected: bool,
+    proxy_active: bool,
+    authorized: bool,
+    update_available: bool,
+    update_busy: bool,
+) -> tauri::Result<Menu<tauri::Wry>> {
     let show_item = MenuItem::with_id(app, "show", "Открыть VKarmani", true, None::<&str>)?;
     let connect_item = MenuItem::with_id(app, "connect", "Быстрое подключение", true, None::<&str>)?;
     let disconnect_item = MenuItem::with_id(app, "disconnect", "Отключиться", true, None::<&str>)?;
+    let update_label = if update_busy {
+        "Обновление: выполняется…"
+    } else if update_available {
+        "Установить обновление"
+    } else {
+        "Проверить обновления"
+    };
+    let update_item = MenuItem::with_id(app, "update_action", update_label, !update_busy, None::<&str>)?;
     let restart_app_item = MenuItem::with_id(app, "restart_app", "Перезапустить программу", true, None::<&str>)?;
     let restart_proxy_item = MenuItem::with_id(app, "restart_proxy", "Перезапустить прокси", true, None::<&str>)?;
     let logout_item = MenuItem::with_id(app, "logout", "Выйти из ЛК", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
 
-    let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&show_item];
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&show_item, &update_item];
 
     if authorized && !connected {
         items.push(&connect_item);
@@ -34,7 +51,7 @@ fn build_tray_menu(app: &AppHandle, connected: bool, proxy_active: bool, authori
     Menu::with_items(app, &items)
 }
 
-fn tray_runtime_flags(app: &AppHandle) -> (bool, bool, bool) {
+pub(crate) fn tray_runtime_flags(app: &AppHandle) -> (bool, bool, bool, bool, bool) {
     let state = app.state::<AppState>();
     let connected = state
         .runtime
@@ -52,13 +69,25 @@ fn tray_runtime_flags(app: &AppHandle) -> (bool, bool, bool) {
         .map(|value| *value)
         .unwrap_or(false);
 
-    (connected, proxy_active, authorized)
+    let update_available = state
+        .tray_update_available
+        .lock()
+        .map(|value| *value)
+        .unwrap_or(false);
+
+    let update_busy = state
+        .tray_update_busy
+        .lock()
+        .map(|value| *value)
+        .unwrap_or(false);
+
+    (connected, proxy_active, authorized, update_available, update_busy)
 }
 
-fn refresh_tray_menu(app: &AppHandle) {
-    let (connected, proxy_active, authorized) = tray_runtime_flags(app);
+pub(crate) fn refresh_tray_menu(app: &AppHandle) {
+    let (connected, proxy_active, authorized, update_available, update_busy) = tray_runtime_flags(app);
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        match build_tray_menu(app, connected, proxy_active, authorized) {
+        match build_tray_menu(app, connected, proxy_active, authorized, update_available, update_busy) {
             Ok(menu) => {
                 let _ = tray.set_menu(Some(menu));
             }
@@ -96,7 +125,7 @@ pub fn run() {
             start_runtime_watchdog(app.handle().clone());
             let _ = append_interface_event(&app.handle(), "Приложение запущено. Структура логов проверена.");
             let _ = append_runtime_event(&app.handle(), "Routing/runtime лог инициализирован. Ожидание действий пользователя.");
-            let menu = build_tray_menu(&app.handle(), false, false, false)?;
+            let menu = build_tray_menu(&app.handle(), false, false, false, false, false)?;
 
             let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID);
             if let Some(icon) = app.default_window_icon() {
@@ -121,6 +150,27 @@ pub fn run() {
                         let _ = append_interface_event(app, "Tray: отключение.");
                         reveal_main_window(app);
                         let _ = app.emit("vkarmani://tray-action", "disconnect");
+                    }
+                    "update_action" => {
+                        let update_available = app
+                            .state::<AppState>()
+                            .tray_update_available
+                            .lock()
+                            .map(|value| *value)
+                            .unwrap_or(false);
+                        let _ = append_interface_event(
+                            app,
+                            if update_available {
+                                "Tray: установка найденного обновления."
+                            } else {
+                                "Tray: проверка наличия обновлений."
+                            },
+                        );
+                        reveal_main_window(app);
+                        let _ = app.emit(
+                            "vkarmani://tray-action",
+                            if update_available { "install_update" } else { "check_updates" },
+                        );
                     }
                     "restart_app" => {
                         let _ = append_interface_event(app, "Tray: перезапуск приложения.");
@@ -171,6 +221,7 @@ pub fn run() {
             clear_client_state_value,
             runtime_status,
             set_session_authorized,
+            set_tray_update_state,
             request_connect,
             request_disconnect,
             cache_profile_sync,
@@ -189,6 +240,7 @@ pub fn run() {
             revoke_hwid_device,
             public_ip_snapshot,
             connectivity_probe,
+            repair_runtime_environment,
             server_ping,
             traffic_snapshot,
             read_runtime_log,

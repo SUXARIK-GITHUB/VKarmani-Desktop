@@ -1,4 +1,6 @@
-fn build_runtime_status(app: &AppHandle, state: tauri::State<AppState>) -> RuntimeStatus {
+use super::*;
+
+pub(crate) fn build_runtime_status(app: &AppHandle, state: tauri::State<AppState>) -> RuntimeStatus {
     sync_runtime_liveness(app, &state);
     let connected = state.connected.lock().map(|value| *value).unwrap_or(false);
     let active_server_label = state
@@ -23,6 +25,7 @@ fn build_runtime_status(app: &AppHandle, state: tauri::State<AppState>) -> Runti
                 runtime.config_path.clone(),
                 runtime.log_path.clone(),
                 runtime.server_id.clone(),
+                runtime.server_fingerprint.clone(),
                 runtime.started_at.clone(),
                 runtime.network_mode.clone(),
                 runtime.tun_interface_name.clone(),
@@ -30,8 +33,8 @@ fn build_runtime_status(app: &AppHandle, state: tauri::State<AppState>) -> Runti
         })
     });
 
-    let current_network_mode = runtime_snapshot.as_ref().map(|snapshot| snapshot.5.clone());
-    let current_tun_name = runtime_snapshot.as_ref().and_then(|snapshot| snapshot.6.clone());
+    let current_network_mode = runtime_snapshot.as_ref().map(|snapshot| snapshot.6.clone());
+    let current_tun_name = runtime_snapshot.as_ref().and_then(|snapshot| snapshot.7.clone());
 
     let message = if connected && current_network_mode.as_deref() == Some("tun") {
         format!(
@@ -68,7 +71,8 @@ fn build_runtime_status(app: &AppHandle, state: tauri::State<AppState>) -> Runti
         socks_port: Some(SOCKS_PORT),
         http_port: Some(HTTP_PORT),
         last_prepared_server_id: runtime_snapshot.as_ref().map(|snapshot| snapshot.3.clone()),
-        last_prepared_at: runtime_snapshot.as_ref().map(|snapshot| snapshot.4.clone()),
+        last_prepared_server_fingerprint: runtime_snapshot.as_ref().and_then(|snapshot| snapshot.4.clone()),
+        last_prepared_at: runtime_snapshot.as_ref().map(|snapshot| snapshot.5.clone()),
         last_exit_code,
         system_proxy_enabled: proxy_snapshot.as_ref().map(|snapshot| snapshot.enabled),
         proxy_server: proxy_snapshot.as_ref().and_then(|snapshot| snapshot.server.clone()),
@@ -80,7 +84,7 @@ fn build_runtime_status(app: &AppHandle, state: tauri::State<AppState>) -> Runti
 
 
 
-fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
+pub(crate) fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     let [a, b, c, d] = octets;
 
@@ -100,7 +104,7 @@ fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
         || (a == 255 && b == 255 && c == 255 && d == 255)
 }
 
-fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
+pub(crate) fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
     if let Some(mapped) = ip.to_ipv4_mapped() {
         return is_forbidden_ipv4(mapped);
     }
@@ -114,14 +118,14 @@ fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
         || (octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x0d && octets[3] == 0xb8) // 2001:db8::/32 docs
 }
 
-fn is_forbidden_remote_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_forbidden_remote_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(value) => is_forbidden_ipv4(value),
         IpAddr::V6(value) => is_forbidden_ipv6(value),
     }
 }
 
-fn is_forbidden_remote_host_label(host: &str) -> bool {
+pub(crate) fn is_forbidden_remote_host_label(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     host.is_empty()
         || host == "localhost"

@@ -1,4 +1,5 @@
 import type { AppSettings, SplitTunnelEntry } from '../types/vpn';
+import { defaultRoutingExclusions, sanitizeRoutingExclusions } from '../utils/routingExclusions';
 
 const ACCESS_KEY_STORAGE = 'vkarmani.access-key';
 const ACCESS_KEY_FORM_STORAGE = 'vkarmani.form.access-key';
@@ -30,7 +31,9 @@ export const defaultSettings: AppSettings = {
   useSystemProxy: true,
   probeOnConnect: true,
   tunnelMode: 'proxy',
-  language: 'ru'
+  ipStack: 'ipv4',
+  language: 'ru',
+  routingExclusions: { ...defaultRoutingExclusions, domains: [], ips: [] }
 };
 
 function normalizeStoredSettings(value: unknown): AppSettings {
@@ -39,7 +42,7 @@ function normalizeStoredSettings(value: unknown): AppSettings {
   }
 
   const candidate = value as Partial<AppSettings>;
-  const booleanKeys: Array<keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'tunnelMode'>> = [
+  const booleanKeys: Array<keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'tunnelMode' | 'ipStack' | 'routingExclusions'>> = [
     'launchOnStartup',
     'runAsAdmin',
     'showDiagnostics',
@@ -64,7 +67,7 @@ function normalizeStoredSettings(value: unknown): AppSettings {
     }
   }
 
-  if (candidate.releaseChannel === 'stable' || candidate.releaseChannel === 'beta') {
+  if (candidate.releaseChannel === 'stable') {
     next.releaseChannel = candidate.releaseChannel;
   }
 
@@ -76,9 +79,15 @@ function normalizeStoredSettings(value: unknown): AppSettings {
     next.tunnelMode = candidate.tunnelMode;
   }
 
+  if (candidate.ipStack === 'ipv4' || candidate.ipStack === 'ipv6') {
+    next.ipStack = candidate.ipStack;
+  }
+
   if (candidate.language === 'ru' || candidate.language === 'en') {
     next.language = candidate.language;
   }
+
+  next.routingExclusions = sanitizeRoutingExclusions(candidate.routingExclusions);
 
   return next;
 }
@@ -90,6 +99,32 @@ const tauriWindow = typeof window !== 'undefined'
 const canUseTauriSecureStorage = Boolean(
   tauriWindow && (tauriWindow.__TAURI_INTERNALS__ || tauriWindow.__TAURI__)
 );
+
+
+function safeLocalStorageSet(key: string, value: string) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Native storage is the source of truth in Tauri. Ignore broken localStorage
+    // so a corrupted WebView profile does not break buttons/settings.
+  }
+}
+
+function safeLocalStorageRemove(key: string) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    // Best effort cleanup only.
+  }
+}
 
 async function invokeTauri<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   const { invoke } = await import('@tauri-apps/api/core');
@@ -165,13 +200,17 @@ function loadLegacyAccessKeyFromLocalStorage() {
     return '';
   }
 
-  const values = [
-    readFallbackAccessKeyPayload(window.localStorage.getItem(ACCESS_KEY_FALLBACK_STORAGE)),
-    parseStoredAccessKey(window.localStorage.getItem(ACCESS_KEY_FORM_STORAGE)),
-    parseStoredAccessKey(window.localStorage.getItem(ACCESS_KEY_STORAGE))
-  ];
+  try {
+    const values = [
+      readFallbackAccessKeyPayload(window.localStorage.getItem(ACCESS_KEY_FALLBACK_STORAGE)),
+      parseStoredAccessKey(window.localStorage.getItem(ACCESS_KEY_FORM_STORAGE)),
+      parseStoredAccessKey(window.localStorage.getItem(ACCESS_KEY_STORAGE))
+    ];
 
-  return values.find((value) => value.trim()) ?? '';
+    return values.find((value) => value.trim()) ?? '';
+  } catch {
+    return '';
+  }
 }
 
 function saveLegacyAccessKeyToLocalStorage(value: string) {
@@ -323,9 +362,7 @@ export function loadSettings() {
 }
 
 export function saveSettings(value: AppSettings) {
-  if (typeof window !== 'undefined') {
-    window.localStorage.setItem(SETTINGS_STORAGE, JSON.stringify(value));
-  }
+  safeLocalStorageSet(SETTINGS_STORAGE, JSON.stringify(value));
 
   void saveNativeClientStateValue(NATIVE_SETTINGS_KEY, value);
 }
@@ -373,9 +410,7 @@ export function loadSplitTunnelEntries() {
 }
 
 export function saveSplitTunnelEntries(value: SplitTunnelEntry[]) {
-  if (typeof window !== 'undefined') {
-    window.localStorage.setItem(SPLIT_TUNNEL_STORAGE, JSON.stringify(value));
-  }
+  safeLocalStorageSet(SPLIT_TUNNEL_STORAGE, JSON.stringify(value));
 
   void saveNativeClientStateValue(NATIVE_SPLIT_TUNNEL_KEY, value);
 }
@@ -424,9 +459,7 @@ export function loadFavoriteServerIds() {
 
 export function saveFavoriteServerIds(value: string[]) {
   const normalized = [...new Set(value.map((item) => item.trim()).filter(Boolean))];
-  if (typeof window !== 'undefined') {
-    window.localStorage.setItem(FAVORITE_SERVERS_STORAGE, JSON.stringify(normalized));
-  }
+  safeLocalStorageSet(FAVORITE_SERVERS_STORAGE, JSON.stringify(normalized));
 
   void saveNativeClientStateValue(NATIVE_FAVORITES_KEY, normalized);
 }
@@ -454,12 +487,10 @@ export function loadSelectedServerId() {
 
 export function saveSelectedServerId(value: string) {
   const normalized = value.trim();
-  if (typeof window !== 'undefined') {
-    if (normalized) {
-      window.localStorage.setItem(SELECTED_SERVER_STORAGE, normalized);
-    } else {
-      window.localStorage.removeItem(SELECTED_SERVER_STORAGE);
-    }
+  if (normalized) {
+    safeLocalStorageSet(SELECTED_SERVER_STORAGE, normalized);
+  } else {
+    safeLocalStorageRemove(SELECTED_SERVER_STORAGE);
   }
 
   void saveNativeClientStateValue(NATIVE_SELECTED_SERVER_KEY, normalized);

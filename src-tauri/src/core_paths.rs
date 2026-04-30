@@ -1,4 +1,6 @@
-fn build_http_client(proxy_url: Option<&str>, timeout: Duration) -> Result<reqwest::blocking::Client, String> {
+use super::*;
+
+pub(crate) fn build_http_client(proxy_url: Option<&str>, timeout: Duration) -> Result<reqwest::blocking::Client, String> {
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -17,7 +19,7 @@ fn build_http_client(proxy_url: Option<&str>, timeout: Duration) -> Result<reqwe
         .map_err(|error| format!("Не удалось создать HTTP client: {error}"))
 }
 
-fn fetch_public_ip(client: &reqwest::blocking::Client) -> Result<String, String> {
+pub(crate) fn fetch_public_ip(client: &reqwest::blocking::Client) -> Result<String, String> {
     let response = client
         .get(IPIFY_URL)
         .header(reqwest::header::USER_AGENT, APP_USER_AGENT)
@@ -36,7 +38,7 @@ fn fetch_public_ip(client: &reqwest::blocking::Client) -> Result<String, String>
     Ok(payload.ip)
 }
 
-fn reveal_main_window(app: &AppHandle) {
+pub(crate) fn reveal_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -44,18 +46,18 @@ fn reveal_main_window(app: &AppHandle) {
     }
 }
 
-fn unix_now_string() -> String {
+pub(crate) fn unix_now_string() -> String {
     unix_timestamp_seconds().to_string()
 }
 
-fn unix_timestamp_seconds() -> u64 {
+pub(crate) fn unix_timestamp_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_secs())
         .unwrap_or_default()
 }
 
-fn civil_date_from_unix_days(days_since_epoch: i64) -> (i32, u32, u32) {
+pub(crate) fn civil_date_from_unix_days(days_since_epoch: i64) -> (i32, u32, u32) {
     let z = days_since_epoch + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -69,7 +71,7 @@ fn civil_date_from_unix_days(days_since_epoch: i64) -> (i32, u32, u32) {
     (year as i32, m as u32, d as u32)
 }
 
-fn utc_date_parts() -> (i32, u32, u32, u32, u32, u32, u32) {
+pub(crate) fn utc_date_parts() -> (i32, u32, u32, u32, u32, u32, u32) {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_millis() as u64)
@@ -85,18 +87,18 @@ fn utc_date_parts() -> (i32, u32, u32, u32, u32, u32, u32) {
     (year, month, day, hour, minute, second, millis)
 }
 
-fn log_timestamp_string() -> String {
+pub(crate) fn log_timestamp_string() -> String {
     let (year, month, day, hour, minute, second, millis) = utc_date_parts();
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
-fn local_day_folder_name() -> String {
+pub(crate) fn local_day_folder_name() -> String {
     let (year, month, day, _, _, _, _) = utc_date_parts();
     format!("{year:04}-{month:02}-{day:02}")
 }
 
 #[allow(dead_code)]
-fn looks_like_launch_root(path: &Path) -> bool {
+pub(crate) fn looks_like_launch_root(path: &Path) -> bool {
     path.join("package.json").exists()
         || path.join("START_VKarmani.bat").exists()
         || path.join("resources").exists()
@@ -104,12 +106,12 @@ fn looks_like_launch_root(path: &Path) -> bool {
 }
 
 #[allow(dead_code)]
-fn looks_like_tauri_subdir(path: &Path) -> bool {
+pub(crate) fn looks_like_tauri_subdir(path: &Path) -> bool {
     matches!(path.file_name().and_then(|name| name.to_str()), Some("src-tauri") | Some("target") | Some("debug") | Some("release"))
 }
 
 #[allow(dead_code)]
-fn normalize_log_base_candidate(path: PathBuf) -> PathBuf {
+pub(crate) fn normalize_log_base_candidate(path: PathBuf) -> PathBuf {
     let mut candidate = path;
 
     if matches!(candidate.file_name().and_then(|name| name.to_str()), Some("src-tauri")) {
@@ -132,7 +134,7 @@ fn normalize_log_base_candidate(path: PathBuf) -> PathBuf {
 }
 
 #[allow(dead_code)]
-fn push_candidate_dir(candidates: &mut Vec<PathBuf>, value: Option<PathBuf>) {
+pub(crate) fn push_candidate_dir(candidates: &mut Vec<PathBuf>, value: Option<PathBuf>) {
     if let Some(path) = value {
         let normalized = normalize_log_base_candidate(path);
         if !candidates.iter().any(|item| item == &normalized) {
@@ -141,7 +143,7 @@ fn push_candidate_dir(candidates: &mut Vec<PathBuf>, value: Option<PathBuf>) {
     }
 }
 
-fn app_logs_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn app_logs_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
         .path()
         .app_local_data_dir()
@@ -153,37 +155,37 @@ fn app_logs_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 
-fn daily_log_root(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn daily_log_root(app: &AppHandle) -> Result<PathBuf, String> {
     let root = app_logs_base_dir(app)?.join(local_day_folder_name());
     fs::create_dir_all(&root)
         .map_err(|error| format!("Не удалось создать каталог логов дня: {error}"))?;
     Ok(root)
 }
 
-fn interface_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn interface_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let path = daily_log_root(app)?.join("Interface");
     fs::create_dir_all(&path)
         .map_err(|error| format!("Не удалось создать Interface каталог: {error}"))?;
     Ok(path)
 }
 
-fn routing_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn routing_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let path = daily_log_root(app)?.join("routing");
     fs::create_dir_all(&path)
         .map_err(|error| format!("Не удалось создать routing каталог: {error}"))?;
     Ok(path)
 }
 
-fn interface_log_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn interface_log_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(interface_logs_dir(app)?.join("interface.log"))
 }
 
-fn routing_event_log_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn routing_event_log_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(routing_logs_dir(app)?.join("routing.log"))
 }
 
 
-fn ensure_log_file(path: &PathBuf) -> Result<(), String> {
+pub(crate) fn ensure_log_file(path: &PathBuf) -> Result<(), String> {
     if path.exists() {
         return Ok(());
     }
@@ -193,7 +195,7 @@ fn ensure_log_file(path: &PathBuf) -> Result<(), String> {
         .map_err(|error| format!("Не удалось создать лог-файл {}: {error}", path.display()))
 }
 
-fn ensure_log_tree(app: &AppHandle) -> Result<(), String> {
+pub(crate) fn ensure_log_tree(app: &AppHandle) -> Result<(), String> {
     let interface_path = interface_log_path(app)?;
     let routing_path = routing_event_log_path(app)?;
     let runtime_path = runtime_log_path(app)?;
@@ -204,7 +206,7 @@ fn ensure_log_tree(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn redact_sensitive(input: &str) -> String {
+pub(crate) fn redact_sensitive(input: &str) -> String {
     let mut result = input.to_string();
     for scheme in ["vless://", "vmess://", "trojan://", "ss://", "hy2://", "hysteria2://"] {
         while let Some(start) = result.to_ascii_lowercase().find(scheme) {
@@ -285,7 +287,7 @@ fn redact_sensitive(input: &str) -> String {
     output
 }
 
-fn append_log_line(path: &PathBuf, scope: &str, line: &str) -> Result<(), String> {
+pub(crate) fn append_log_line(path: &PathBuf, scope: &str, line: &str) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -296,22 +298,113 @@ fn append_log_line(path: &PathBuf, scope: &str, line: &str) -> Result<(), String
         .map_err(|error| format!("Не удалось записать лог {}: {error}", path.display()))
 }
 
-fn append_interface_event(app: &AppHandle, line: &str) -> Result<(), String> {
+pub(crate) fn append_interface_event(app: &AppHandle, line: &str) -> Result<(), String> {
     let log_path = interface_log_path(app)?;
     append_log_line(&log_path, "INTERFACE", line)
 }
 
-const MIN_XRAY_CORE_SIZE_BYTES: u64 = 1_000_000;
-const PE_MACHINE_AMD64: u16 = 0x8664;
-const PE32_PLUS_MAGIC: u16 = 0x20b;
+pub(crate) const MIN_XRAY_CORE_SIZE_BYTES: u64 = 1_000_000;
+pub(crate) const PE_MACHINE_AMD64: u16 = 0x8664;
+pub(crate) const PE32_PLUS_MAGIC: u16 = 0x20b;
 
-fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+pub(crate) fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|item| item == &path) {
         paths.push(path);
     }
 }
 
-fn validate_pe_binary(path: &Path, label: &str) -> Result<(), String> {
+pub(crate) fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+}
+
+pub(crate) fn sha256_file_hex(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path)
+        .map_err(|error| format!("не удалось открыть файл для sha256 {}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("не удалось прочитать файл для sha256 {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>())
+}
+
+pub(crate) fn manifest_expected_sha256(manifest_path: &Path, file_name: &str) -> Result<String, String> {
+    let raw = fs::read_to_string(manifest_path)
+        .map_err(|error| format!("не удалось прочитать core-manifest.json: {error}"))?;
+    // Windows PowerShell 5 writes UTF-8 with BOM when using Set-Content -Encoding UTF8.
+    // serde_json expects JSON to start directly with `{`/`[`, so strip BOM defensively.
+    let raw = raw.trim_start_matches('\u{feff}');
+    let manifest: Value = serde_json::from_str(raw)
+        .map_err(|error| format!("не удалось разобрать core-manifest.json: {error}"))?;
+
+    let files = manifest
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "core-manifest.json не содержит массив files".to_string())?;
+
+    for item in files {
+        let Some(name) = item.get("file").and_then(Value::as_str) else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case(file_name) {
+            return item
+                .get("sha256")
+                .and_then(Value::as_str)
+                .map(|value| value.to_ascii_lowercase())
+                .filter(|value| value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
+                .ok_or_else(|| format!("core-manifest.json содержит некорректный sha256 для {file_name}"));
+        }
+    }
+
+    Err(format!("core-manifest.json не содержит запись для {file_name}"))
+}
+
+pub(crate) fn verify_core_manifest_artifact(path: &Path, file_name: &str) -> Result<(), String> {
+    let manifest_path = path
+        .parent()
+        .ok_or_else(|| format!("не удалось определить папку для {file_name}"))?
+        .join("core-manifest.json");
+
+    if !manifest_path.exists() {
+        #[cfg(debug_assertions)]
+        {
+            return Ok(());
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            return Err(format!(
+                "рядом с {file_name} нет core-manifest.json; release-сборка не запускает непроверенный Xray-core"
+            ));
+        }
+    }
+
+    let expected = manifest_expected_sha256(&manifest_path, file_name)?;
+    let actual = sha256_file_hex(path)?.to_ascii_lowercase();
+    if actual != expected {
+        return Err(format!(
+            "sha256 {file_name} не совпадает с core-manifest.json: ожидалось {expected}, получено {actual}"
+        ));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_core_sidecar_path(path: &Path, label: &str) -> Result<(), String> {
+    validate_pe_binary(path, label)?;
+    verify_core_manifest_artifact(path, label)
+}
+
+pub(crate) fn validate_pe_binary(path: &Path, label: &str) -> Result<(), String> {
     let mut file = File::open(path)
         .map_err(|error| format!("не удалось открыть {label}: {error}"))?;
     let mut header = [0u8; 4096];
@@ -368,7 +461,7 @@ fn validate_pe_binary(path: &Path, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn format_xray_spawn_error(error: &std::io::Error, core_path: &Path) -> String {
+pub(crate) fn format_xray_spawn_error(error: &std::io::Error, core_path: &Path) -> String {
     let code = error.raw_os_error();
     let hint = match code {
         Some(193) => "Windows вернул os error 193: установленный xray.exe не запускается как Windows x64-приложение. Обычно это значит, что в installer/updater попал неправильный или повреждённый файл xray.exe. Полностью удалите старую установку VKarmani, установите актуальную версию и убедитесь, что GitHub Actions прошёл шаг Verify bundled Xray binary on Windows.",
@@ -384,7 +477,7 @@ fn format_xray_spawn_error(error: &std::io::Error, core_path: &Path) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn ensure_core_launchable(path: &Path) -> Result<(), String> {
+pub(crate) fn ensure_core_launchable(path: &Path) -> Result<(), String> {
     validate_core_path(path)?;
     let core_working_dir = path.parent().ok_or_else(|| {
         "Не удалось определить рабочую папку Xray-core для проверки запуска.".to_string()
@@ -415,11 +508,11 @@ fn ensure_core_launchable(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn ensure_core_launchable(path: &Path) -> Result<(), String> {
+pub(crate) fn ensure_core_launchable(path: &Path) -> Result<(), String> {
     validate_core_path(path)
 }
 
-fn validate_core_path(path: &Path) -> Result<(), String> {
+pub(crate) fn validate_core_path(path: &Path) -> Result<(), String> {
     let metadata = fs::metadata(path)
         .map_err(|error| format!("не удалось проверить файл: {error}"))?;
     if !metadata.is_file() {
@@ -428,16 +521,18 @@ fn validate_core_path(path: &Path) -> Result<(), String> {
     if metadata.len() < MIN_XRAY_CORE_SIZE_BYTES {
         return Err(format!("слишком маленький файл: {} байт", metadata.len()));
     }
-    validate_pe_binary(path, "xray.exe")
+    validate_pe_binary(path, "xray.exe")?;
+    verify_core_manifest_artifact(path, "xray.exe")
 }
 
-fn is_usable_core_path(path: &Path) -> bool {
+pub(crate) fn is_usable_core_path(path: &Path) -> bool {
     validate_core_path(path).is_ok()
 }
 
-fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
+pub(crate) fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
+    #[cfg(debug_assertions)]
     if let Ok(env_path) = std::env::var("VKARMANI_XRAY_PATH") {
         push_unique_path(&mut paths, PathBuf::from(env_path));
     }
@@ -502,13 +597,13 @@ fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
     paths
 }
 
-fn resolve_core_path(app: &AppHandle) -> Option<PathBuf> {
+pub(crate) fn resolve_core_path(app: &AppHandle) -> Option<PathBuf> {
     candidate_core_paths(app)
         .into_iter()
         .find(|path| is_usable_core_path(path))
 }
 
-fn core_not_found_message(app: &AppHandle) -> String {
+pub(crate) fn core_not_found_message(app: &AppHandle) -> String {
     let candidates = candidate_core_paths(app)
         .into_iter()
         .map(|path| {
@@ -527,38 +622,83 @@ fn core_not_found_message(app: &AppHandle) -> String {
         .join("; ");
 
     if candidates.is_empty() {
-        "Xray-core не найден. В сборке должен быть файл core/windows/xray.exe, либо задайте VKARMANI_XRAY_PATH.".to_string()
+        "Xray-core не найден. В сборке должен быть файл core/windows/xray.exe с корректным core-manifest.json.".to_string()
     } else {
         format!(
-            "Xray-core не найден или повреждён. В сборке должен быть файл core/windows/xray.exe, либо задайте VKARMANI_XRAY_PATH. Проверенные пути: {candidates}"
+            "Xray-core не найден или повреждён. В сборке должен быть файл core/windows/xray.exe с корректным core-manifest.json. Проверенные пути: {candidates}"
         )
     }
 }
 
 #[allow(dead_code)]
-fn resolve_core_sidecar_path(core_path: &Path, file_name: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_core_sidecar_path(core_path: &Path, file_name: &str) -> Option<PathBuf> {
     core_path.parent().map(|dir| dir.join(file_name))
 }
 
-#[tauri::command]
-fn read_runtime_log_excerpt(path: &Path, lines: usize) -> Vec<String> {
-    fs::read_to_string(path)
-        .map(|content| {
-            content
-                .lines()
-                .rev()
-                .take(lines)
-                .map(|line| line.trim().to_string())
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+pub(crate) fn read_runtime_log_excerpt(path: &Path, lines: usize) -> Vec<String> {
+    const MAX_EXCERPT_BYTES: u64 = 128 * 1024;
+
+    let Ok(mut file) = File::open(path) else {
+        return Vec::new();
+    };
+    let file_len = file.metadata().map(|metadata| metadata.len()).unwrap_or_default();
+    let start = file_len.saturating_sub(MAX_EXCERPT_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+
+    let mut content = String::new();
+    if file.read_to_string(&mut content).is_err() {
+        return Vec::new();
+    }
+    if start > 0 {
+        if let Some(first_newline) = content.find('\n') {
+            content = content[first_newline + 1..].to_string();
+        }
+    }
+
+    content
+        .lines()
+        .rev()
+        .take(lines)
+        .map(|line| line.trim().to_string())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
 }
 
-fn runtime_output_dir(app: &AppHandle) -> Result<PathBuf, String> {
+#[cfg(target_os = "windows")]
+pub(crate) fn harden_runtime_output_dir(path: &Path) {
+    let path_string = path.to_string_lossy().to_string();
+    let path_text = ps_quote(&path_string);
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$path = '{}'
+$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$acl = Get-Acl -LiteralPath $path
+$acl.SetAccessRuleProtection($true, $false)
+$rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+$inheritance = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+$propagation = [System.Security.AccessControl.PropagationFlags]::None
+$allow = [System.Security.AccessControl.AccessControlType]::Allow
+foreach ($identity in @($user, 'SYSTEM', 'BUILTIN\Administrators')) {{
+  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, $propagation, $allow)
+  $acl.SetAccessRule($rule)
+}}
+Set-Acl -LiteralPath $path -AclObject $acl
+"#,
+        path_text
+    );
+    let _ = run_powershell(&script);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn harden_runtime_output_dir(_path: &Path) {}
+
+pub(crate) fn runtime_output_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
         .path()
         .app_local_data_dir()
@@ -567,10 +707,11 @@ fn runtime_output_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
     let path = base.join("runtime");
     fs::create_dir_all(&path).map_err(|error| format!("Не удалось создать runtime каталог: {error}"))?;
+    harden_runtime_output_dir(&path);
     Ok(path)
 }
 
-fn cleanup_runtime_config_files(app: &AppHandle) -> Result<(), String> {
+pub(crate) fn cleanup_runtime_config_files(app: &AppHandle) -> Result<(), String> {
     let dir = runtime_output_dir(app)?;
     for entry in fs::read_dir(&dir).map_err(|error| format!("Не удалось прочитать runtime каталог: {error}"))? {
         let path = entry.map_err(|error| format!("Не удалось прочитать runtime файл: {error}"))?.path();
@@ -582,23 +723,42 @@ fn cleanup_runtime_config_files(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn runtime_log_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn runtime_log_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(routing_logs_dir(app)?.join("xray-runtime.log"))
 }
 
-fn append_runtime_event(app: &AppHandle, line: &str) -> Result<(), String> {
+pub(crate) fn append_runtime_event(app: &AppHandle, line: &str) -> Result<(), String> {
     let log_path = routing_event_log_path(app)?;
     append_log_line(&log_path, "ROUTING", line)
 }
 
-fn tail_runtime_log(app: &AppHandle, lines: usize) -> Result<Vec<String>, String> {
+pub(crate) fn tail_runtime_log(app: &AppHandle, lines: usize) -> Result<Vec<String>, String> {
+    const MAX_TAIL_BYTES: u64 = 256 * 1024;
+
     let log_path = runtime_log_path(app)?;
     if !log_path.exists() {
         return Ok(Vec::new());
     }
 
-    let content = fs::read_to_string(&log_path)
-        .map_err(|error| format!("Не удалось прочитать лог runtime: {error}"))?;
+    let mut file = File::open(&log_path)
+        .map_err(|error| format!("Не удалось открыть лог runtime: {error}"))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("Не удалось прочитать размер runtime log: {error}"))?
+        .len();
+    let start = file_len.saturating_sub(MAX_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| format!("Не удалось перейти к хвосту runtime log: {error}"))?;
+
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|error| format!("Не удалось прочитать хвост runtime log: {error}"))?;
+
+    if start > 0 {
+        if let Some(first_newline) = content.find('\n') {
+            content = content[first_newline + 1..].to_string();
+        }
+    }
 
     let collected = content
         .lines()
@@ -613,7 +773,7 @@ fn tail_runtime_log(app: &AppHandle, lines: usize) -> Result<Vec<String>, String
     Ok(collected)
 }
 
-fn strip_windows_exe_suffix(value: &str) -> String {
+pub(crate) fn strip_windows_exe_suffix(value: &str) -> String {
     if value.len() > 4 && value.to_ascii_lowercase().ends_with(".exe") {
         value[..value.len() - 4].to_string()
     } else {
@@ -621,7 +781,7 @@ fn strip_windows_exe_suffix(value: &str) -> String {
     }
 }
 
-fn extract_executable_value(value: &str) -> String {
+pub(crate) fn extract_executable_value(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -646,7 +806,7 @@ fn extract_executable_value(value: &str) -> String {
     unwrapped.trim().trim_matches('"').to_string()
 }
 
-fn normalize_process_match(value: &str) -> Option<String> {
+pub(crate) fn normalize_process_match(value: &str) -> Option<String> {
     let executable = extract_executable_value(value);
     let trimmed = executable.trim();
     if trimmed.is_empty() {
@@ -661,7 +821,7 @@ fn normalize_process_match(value: &str) -> Option<String> {
     }
 }
 
-fn push_unique_process_match(matches: &mut Vec<String>, candidate: String) -> bool {
+pub(crate) fn push_unique_process_match(matches: &mut Vec<String>, candidate: String) -> bool {
     let candidate = candidate.trim().trim_matches('"').to_string();
     if candidate.is_empty() {
         return false;
@@ -675,7 +835,7 @@ fn push_unique_process_match(matches: &mut Vec<String>, candidate: String) -> bo
     true
 }
 
-fn process_match_candidates(value: &str) -> Vec<String> {
+pub(crate) fn process_match_candidates(value: &str) -> Vec<String> {
     let Some(normalized) = normalize_process_match(value) else {
         return Vec::new();
     };
@@ -714,7 +874,7 @@ fn process_match_candidates(value: &str) -> Vec<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn resolve_service_process_match(service_value: &str) -> Result<Option<(String, String)>, String> {
+pub(crate) fn resolve_service_process_match(service_value: &str) -> Result<Option<(String, String)>, String> {
     let service_name = service_value.trim();
     if service_name.is_empty() {
         return Ok(None);
@@ -776,11 +936,11 @@ $fileName = [System.IO.Path]::GetFileName($exe)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn resolve_service_process_match(_service_value: &str) -> Result<Option<(String, String)>, String> {
+pub(crate) fn resolve_service_process_match(_service_value: &str) -> Result<Option<(String, String)>, String> {
     Ok(None)
 }
 
-fn build_split_tunnel_rule_plan(entries: &[SplitTunnelEntryPayload]) -> SplitTunnelRulePlan {
+pub(crate) fn build_split_tunnel_rule_plan(entries: &[SplitTunnelEntryPayload]) -> SplitTunnelRulePlan {
     let mut process_matches = Vec::new();
     let mut resolved_apps = 0usize;
     let mut resolved_services = 0usize;
@@ -829,7 +989,7 @@ fn build_split_tunnel_rule_plan(entries: &[SplitTunnelEntryPayload]) -> SplitTun
     }
 }
 
-fn private_bypass_cidrs() -> Vec<&'static str> {
+pub(crate) fn private_bypass_cidrs() -> Vec<&'static str> {
     vec![
         "0.0.0.0/8",
         "10.0.0.0/8",

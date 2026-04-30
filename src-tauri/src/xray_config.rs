@@ -1,4 +1,6 @@
-fn tune_outbound_for_performance(outbound: &mut Value) {
+use super::*;
+
+pub(crate) fn tune_outbound_for_performance(outbound: &mut Value) {
     let Some(outbound_map) = outbound.as_object_mut() else {
         return;
     };
@@ -8,9 +10,9 @@ fn tune_outbound_for_performance(outbound: &mut Value) {
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    // Hysteria2 is QUIC/UDP based. TCP socket options do not help it and can make
-    // generated configs noisier, so keep it untouched.
-    if protocol.eq_ignore_ascii_case("hysteria2") {
+    // Hysteria/Hysteria2 is QUIC/UDP based. TCP socket options do not help it and can make
+    // generated configs invalid/noisier, so keep it untouched.
+    if protocol.eq_ignore_ascii_case("hysteria") || protocol.eq_ignore_ascii_case("hysteria2") {
         return;
     }
 
@@ -52,13 +54,181 @@ fn tune_outbound_for_performance(outbound: &mut Value) {
     }
 }
 
-fn build_xray_config(
+
+const ROUTING_EXCLUSION_LIMIT: usize = 300;
+
+fn is_valid_domain_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 63 {
+        return false;
+    }
+
+    let bytes = label.as_bytes();
+    if bytes.first() == Some(&b'-') || bytes.last() == Some(&b'-') {
+        return false;
+    }
+
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+}
+
+fn normalize_route_domain(raw_value: &str) -> Option<String> {
+    let mut value = raw_value.trim().to_ascii_lowercase();
+    if value.is_empty() || value.len() > 253 {
+        return None;
+    }
+
+    for prefix in ["https://", "http://", "socks5://", "socks4://"] {
+        if value.starts_with(prefix) {
+            value = value.trim_start_matches(prefix).to_string();
+            break;
+        }
+    }
+
+    value = value
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('.')
+        .to_string();
+
+    if let Some(stripped) = value.strip_prefix("*.") {
+        value = format!(".{stripped}");
+    }
+
+    if let Some((host, port)) = value.rsplit_once(':') {
+        if !host.contains(':') && port.chars().all(|ch| ch.is_ascii_digit()) {
+            value = host.to_string();
+        }
+    }
+
+    let domain = value.strip_prefix('.').unwrap_or(&value);
+    if domain.is_empty() || domain.contains("..") || domain.contains('_') {
+        return None;
+    }
+
+    if !domain.split('.').all(is_valid_domain_label) {
+        return None;
+    }
+
+    Some(value)
+}
+
+fn normalize_route_ip(raw_value: &str) -> Option<String> {
+    let value = raw_value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Some((ip, prefix)) = value.split_once('/') {
+        let parsed_ip = ip.trim().parse::<Ipv4Addr>().ok()?;
+        let parsed_prefix = prefix.trim().parse::<u8>().ok()?;
+        if parsed_prefix > 32 {
+            return None;
+        }
+        return Some(format!("{parsed_ip}/{parsed_prefix}"));
+    }
+
+    value.trim().parse::<Ipv4Addr>().ok().map(|ip| ip.to_string())
+}
+
+fn tld_domain_matcher(tld: &str) -> String {
+    format!("regexp:(^|\\.){tld}$")
+}
+
+fn custom_domain_matcher(domain: &str) -> String {
+    if let Some(suffix) = domain.strip_prefix('.') {
+        return tld_domain_matcher(&suffix.replace('.', "\\."));
+    }
+
+    format!("domain:{domain}")
+}
+
+pub(crate) fn build_routing_exclusion_rule_plan(
+    exclusions: Option<&RoutingExclusionSettingsPayload>,
+) -> RoutingExclusionRulePlan {
+    let mut plan = RoutingExclusionRulePlan {
+        domain_rules: Vec::new(),
+        ip_rules: Vec::new(),
+        skipped_notes: Vec::new(),
+    };
+
+    let Some(exclusions) = exclusions else {
+        return plan;
+    };
+
+    if !exclusions.enabled {
+        return plan;
+    }
+
+    if exclusions.bypass_ru_domains {
+        plan.domain_rules.push(tld_domain_matcher("ru"));
+    }
+    if exclusions.bypass_su_domains {
+        plan.domain_rules.push(tld_domain_matcher("su"));
+    }
+    if exclusions.bypass_rf_domains {
+        plan.domain_rules.push(tld_domain_matcher("xn--p1ai"));
+    }
+
+    for raw_domain in &exclusions.domains {
+        if plan.domain_rules.len() >= ROUTING_EXCLUSION_LIMIT {
+            plan.skipped_notes.push("Routing exclusions: часть доменов пропущена из-за лимита direct-правил.".to_string());
+            break;
+        }
+
+        match normalize_route_domain(raw_domain) {
+            Some(domain) => {
+                let matcher = custom_domain_matcher(&domain);
+                if !plan.domain_rules.iter().any(|item| item == &matcher) {
+                    plan.domain_rules.push(matcher);
+                }
+            }
+            None => plan
+                .skipped_notes
+                .push(format!("Routing exclusions: домен пропущен как некорректный: {raw_domain}")),
+        }
+    }
+
+    for raw_ip in &exclusions.ips {
+        if plan.ip_rules.len() >= ROUTING_EXCLUSION_LIMIT {
+            plan.skipped_notes.push("Routing exclusions: часть IPv4/CIDR пропущена из-за лимита direct-правил.".to_string());
+            break;
+        }
+
+        match normalize_route_ip(raw_ip) {
+            Some(ip) => {
+                if !plan.ip_rules.iter().any(|item| item == &ip) {
+                    plan.ip_rules.push(ip);
+                }
+            }
+            None => plan
+                .skipped_notes
+                .push(format!("Routing exclusions: IPv4/CIDR пропущен как некорректный: {raw_ip}")),
+        }
+    }
+
+    plan
+}
+
+fn routing_exclusion_inbound_tags(network_mode: &str) -> Vec<&'static str> {
+    if network_mode == "tun" {
+        vec!["tun-in"]
+    } else {
+        vec!["socks-in", "http-in"]
+    }
+}
+
+pub(crate) fn build_xray_config(
     template: &RuntimeTemplate,
     network_mode: &str,
+    ip_stack: &str,
     send_through_ip: Option<&str>,
     split_tunnel_entries: &[SplitTunnelEntryPayload],
+    routing_exclusions: Option<&RoutingExclusionSettingsPayload>,
     runtime_log_path: Option<&Path>,
-) -> (Value, SplitTunnelRulePlan) {
+) -> (Value, SplitTunnelRulePlan, RoutingExclusionRulePlan) {
     let plan = if network_mode == "tun" {
         build_split_tunnel_rule_plan(split_tunnel_entries)
     } else {
@@ -69,6 +239,8 @@ fn build_xray_config(
             skipped_notes: Vec::new(),
         }
     };
+
+    let routing_exclusion_plan = build_routing_exclusion_rule_plan(routing_exclusions);
 
     let mut outbound = if template.outbound.is_object() {
         template.outbound.clone()
@@ -81,8 +253,10 @@ fn build_xray_config(
     if let Some(map) = outbound.as_object_mut() {
         map.insert("tag".to_string(), Value::String("proxy".to_string()));
         if let Some(ip) = send_through_ip {
-            map.entry("sendThrough".to_string())
-                .or_insert_with(|| Value::String(ip.to_string()));
+            // В TUN режиме исходный адрес должен соответствовать текущему физическому
+            // адаптеру после остановки старого runtime. Не сохраняем sendThrough из
+            // импортированного/старого шаблона, иначе можно получить loop при soft switch.
+            map.insert("sendThrough".to_string(), Value::String(ip.to_string()));
         }
     }
 
@@ -132,6 +306,24 @@ fn build_xray_config(
         "ruleTag": "xray-api"
     })];
 
+    let routing_exclusion_inbounds = routing_exclusion_inbound_tags(network_mode);
+    if !routing_exclusion_plan.domain_rules.is_empty() {
+        routing_rules.push(json!({
+            "inboundTag": routing_exclusion_inbounds.clone(),
+            "domain": routing_exclusion_plan.domain_rules.clone(),
+            "outboundTag": "direct",
+            "ruleTag": "user-domain-direct"
+        }));
+    }
+    if !routing_exclusion_plan.ip_rules.is_empty() {
+        routing_rules.push(json!({
+            "inboundTag": routing_exclusion_inbounds,
+            "ip": routing_exclusion_plan.ip_rules.clone(),
+            "outboundTag": "direct",
+            "ruleTag": "user-ip-direct"
+        }));
+    }
+
     if network_mode == "tun" {
         inbounds.push(json!({
             "tag": "tun-in",
@@ -167,6 +359,14 @@ fn build_xray_config(
             "domain": ["domain:localhost", "full:localhost", "keyword:.local"],
             "outboundTag": "direct",
             "ruleTag": "tun-local-domain-direct"
+        }));
+
+
+        routing_rules.push(json!({
+            "inboundTag": ["tun-in"],
+            "ip": ["::/0"],
+            "outboundTag": "block",
+            "ruleTag": "tun-ipv6-leak-guard"
         }));
 
         if !plan.process_matches.is_empty() {
@@ -223,11 +423,17 @@ fn build_xray_config(
         })
     };
 
+    let dns_query_strategy = if ip_stack == "ipv6" {
+        "UseIPv6"
+    } else {
+        "UseIPv4"
+    };
+
     (
         json!({
             "log": log_object,
             "dns": {
-                "queryStrategy": "UseIPv4",
+                "queryStrategy": dns_query_strategy,
                 "servers": ["1.1.1.1", "8.8.8.8", "localhost"]
             },
             "api": {
@@ -265,17 +471,18 @@ fn build_xray_config(
             ]
         }),
         plan,
+        routing_exclusion_plan,
     )
 }
 
-fn value_as_valid_port(value: &Value) -> Option<u16> {
+pub(crate) fn value_as_valid_port(value: &Value) -> Option<u16> {
     value
         .as_u64()
         .filter(|port| (1..=65535).contains(port))
         .map(|port| port as u16)
 }
 
-fn extract_outbound_address_and_port(template: &RuntimeTemplate) -> (Option<String>, u16) {
+pub(crate) fn extract_outbound_address_and_port(template: &RuntimeTemplate) -> (Option<String>, u16) {
     let default_port = 443_u16;
     let settings = template.outbound.get("settings");
 
@@ -314,14 +521,14 @@ fn extract_outbound_address_and_port(template: &RuntimeTemplate) -> (Option<Stri
     (None, default_port)
 }
 
-fn resolve_ipv4_address(host: &str, port: u16) -> Option<String> {
+pub(crate) fn resolve_ipv4_address(host: &str, port: u16) -> Option<String> {
     resolve_socket_addresses(host, port)
         .ok()
         .and_then(|items| items.into_iter().find(|addr| addr.ip().is_ipv4()))
         .map(|addr| addr.ip().to_string())
 }
 
-fn detect_primary_ipv4_address() -> Option<String> {
+pub(crate) fn detect_primary_ipv4_address() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("1.1.1.1:53").ok()?;
     let addr = socket.local_addr().ok()?;
@@ -333,21 +540,21 @@ fn detect_primary_ipv4_address() -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn run_windows_net_command(program: &str, args: &[String], timeout: Duration, context: &str) -> Result<String, String> {
+pub(crate) fn run_windows_net_command(program: &str, args: &[String], timeout: Duration, context: &str) -> Result<String, String> {
     let mut command = Command::new(program);
     command.args(args);
     run_command_with_timeout(command, timeout, context)
 }
 
 #[cfg(target_os = "windows")]
-fn run_windows_net_command_str(program: &str, args: &[&str], timeout: Duration, context: &str) -> Result<String, String> {
+pub(crate) fn run_windows_net_command_str(program: &str, args: &[&str], timeout: Duration, context: &str) -> Result<String, String> {
     let mut command = Command::new(program);
     command.args(args);
     run_command_with_timeout(command, timeout, context)
 }
 
 #[cfg(target_os = "windows")]
-fn default_route_snapshot() -> Result<DefaultRouteSnapshot, String> {
+pub(crate) fn default_route_snapshot() -> Result<DefaultRouteSnapshot, String> {
     // Fast path: `route.exe` starts much faster than PowerShell/Get-NetRoute.
     // Expected active-route columns: destination, mask, gateway, interface, metric.
     let raw = run_windows_net_command_str(
@@ -389,7 +596,7 @@ fn default_route_snapshot() -> Result<DefaultRouteSnapshot, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn find_tun_interface_index(interface_name: &str) -> Result<u32, String> {
+pub(crate) fn find_tun_interface_index(interface_name: &str) -> Result<u32, String> {
     let raw = run_windows_net_command_str(
         "netsh",
         &["interface", "ipv4", "show", "interfaces"],
@@ -417,7 +624,7 @@ fn find_tun_interface_index(interface_name: &str) -> Result<u32, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn wait_for_tun_interface(interface_name: &str) -> Result<u32, String> {
+pub(crate) fn wait_for_tun_interface(interface_name: &str) -> Result<u32, String> {
     // Xray usually creates Wintun quickly. Poll with a lightweight netsh call instead
     // of repeatedly starting PowerShell/Get-NetAdapter.
     let mut last_error = String::new();
@@ -438,7 +645,7 @@ fn wait_for_tun_interface(interface_name: &str) -> Result<u32, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn route_delete(destination: &str, mask: &str, gateway: Option<&str>, if_index: Option<u32>) {
+pub(crate) fn route_delete(destination: &str, mask: &str, gateway: Option<&str>, if_index: Option<u32>) {
     let mut args = vec![
         "delete".to_string(),
         destination.to_string(),
@@ -459,7 +666,7 @@ fn route_delete(destination: &str, mask: &str, gateway: Option<&str>, if_index: 
 }
 
 #[cfg(target_os = "windows")]
-fn route_add(destination: &str, mask: &str, gateway: &str, metric: u32, if_index: Option<u32>) -> Result<(), String> {
+pub(crate) fn route_add(destination: &str, mask: &str, gateway: &str, metric: u32, if_index: Option<u32>) -> Result<(), String> {
     let mut args = vec![
         "add".to_string(),
         destination.to_string(),
@@ -479,8 +686,31 @@ fn route_add(destination: &str, mask: &str, gateway: &str, metric: u32, if_index
 }
 
 #[cfg(target_os = "windows")]
-fn configure_tun_routes_fast(interface_name: &str, server_ip: Option<&str>) -> Result<(), String> {
+pub(crate) fn configure_tun_routes_fast(interface_name: &str, server_ip: Option<&str>) -> Result<(), String> {
+    // Snapshot the real default route before adding split-default TUN routes.
+    // Taking it afterwards can capture the just-created TUN route on some Windows setups
+    // and break the /32 escape route to the VPN server.
+    let default_route_before_tun = default_route_snapshot().ok();
     let tun_index = wait_for_tun_interface(interface_name)?;
+
+    // Critical for soft server switching: protect the VPN server endpoint before
+    // split-default routes are added. Otherwise Windows can briefly route the new
+    // Xray outbound into the just-created TUN interface, which causes reconnect loops
+    // and high xray.exe CPU on some machines.
+    if let Some(ip) = server_ip.filter(|value| !value.trim().is_empty()) {
+        let default_route = default_route_before_tun.as_ref().ok_or_else(|| {
+            "Не удалось снять default route до добавления TUN routes; fallback PowerShell будет использован для безопасной настройки server /32 route.".to_string()
+        })?;
+
+        if default_route.next_hop.trim().is_empty() || default_route.next_hop == "0.0.0.0" {
+            return Err("Default route не содержит gateway для server /32 route; fallback PowerShell будет использован.".to_string());
+        }
+
+        route_delete(ip, "255.255.255.255", None, None);
+        if let Err(error) = route_add(ip, "255.255.255.255", &default_route.next_hop, 1, None) {
+            return Err(format!("Не удалось добавить /32 route до VPN-сервера через исходный gateway: {error}"));
+        }
+    }
 
     route_delete("0.0.0.0", "128.0.0.0", Some("0.0.0.0"), Some(tun_index));
     route_delete("128.0.0.0", "128.0.0.0", Some("0.0.0.0"), Some(tun_index));
@@ -497,20 +727,11 @@ fn configure_tun_routes_fast(interface_name: &str, server_ip: Option<&str>) -> R
         return Err(error);
     }
 
-    if let Some(ip) = server_ip.filter(|value| !value.trim().is_empty()) {
-        if let Ok(default_route) = default_route_snapshot() {
-            if !default_route.next_hop.trim().is_empty() && default_route.next_hop != "0.0.0.0" {
-                route_delete(ip, "255.255.255.255", None, None);
-                let _ = route_add(ip, "255.255.255.255", &default_route.next_hop, 1, None);
-            }
-        }
-    }
-
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn configure_tun_routes_powershell(interface_name: &str, server_ip: Option<&str>) -> Result<(), String> {
+pub(crate) fn configure_tun_routes_powershell(interface_name: &str, server_ip: Option<&str>) -> Result<(), String> {
     let script = r#"
 $ErrorActionPreference = 'Stop'
 $route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.State -eq 'Alive' } | Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1 InterfaceAlias, InterfaceIndex, NextHop
@@ -563,9 +784,9 @@ $ErrorActionPreference = 'Stop'
 $tun = '{}'
 Remove-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceAlias $tun -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias $tun -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+{}
 New-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceAlias $tun -NextHop '0.0.0.0' -RouteMetric 6 -PolicyStore ActiveStore | Out-Null
 New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias $tun -NextHop '0.0.0.0' -RouteMetric 6 -PolicyStore ActiveStore | Out-Null
-{}
 "#,
         ps_quote(interface_name),
         server_route
@@ -576,7 +797,7 @@ New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias $tun -NextHop '0.0
 }
 
 #[cfg(target_os = "windows")]
-fn configure_tun_routes(interface_name: &str, server_ip: Option<&str>) -> Result<(), String> {
+pub(crate) fn configure_tun_routes(interface_name: &str, server_ip: Option<&str>) -> Result<(), String> {
     match configure_tun_routes_fast(interface_name, server_ip) {
         Ok(()) => Ok(()),
         Err(fast_error) => {
@@ -595,12 +816,59 @@ fn configure_tun_routes(interface_name: &str, server_ip: Option<&str>) -> Result
 }
 
 #[cfg(not(target_os = "windows"))]
-fn configure_tun_routes(_interface_name: &str, _server_ip: Option<&str>) -> Result<(), String> {
+pub(crate) fn configure_tun_routes(_interface_name: &str, _server_ip: Option<&str>) -> Result<(), String> {
     Err("TUN маршруты сейчас реализованы только для Windows сборки VKarmani.".into())
 }
 
 #[cfg(target_os = "windows")]
-fn cleanup_tun_routes(interface_name: &str, server_ip: Option<&str>) -> Result<(), String> {
+pub(crate) fn apply_tun_ipv6_route_guard(interface_name: &str) -> Result<(), String> {
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$tun = '{}'
+$adapter = Get-NetAdapter -Name $tun -ErrorAction SilentlyContinue
+if (-not $adapter) {{ throw "TUN adapter not found for IPv6 leak guard" }}
+Remove-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/1' -InterfaceAlias $tun -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+Remove-NetRoute -AddressFamily IPv6 -DestinationPrefix '8000::/1' -InterfaceAlias $tun -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+try {{
+  New-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/1' -InterfaceAlias $tun -NextHop '::' -RouteMetric 6 -PolicyStore ActiveStore | Out-Null
+  New-NetRoute -AddressFamily IPv6 -DestinationPrefix '8000::/1' -InterfaceAlias $tun -NextHop '::' -RouteMetric 6 -PolicyStore ActiveStore | Out-Null
+}} catch {{
+  throw "IPv6 split-default route could not be applied: $($_.Exception.Message)"
+}}
+"#,
+        ps_quote(interface_name)
+    );
+
+    run_powershell(&script).map(|_| ())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn apply_tun_ipv6_route_guard(_interface_name: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn cleanup_tun_ipv6_routes(interface_name: &str) {
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$tun = '{}'
+Remove-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/1' -InterfaceAlias $tun -Confirm:$false | Out-Null
+Remove-NetRoute -AddressFamily IPv6 -DestinationPrefix '8000::/1' -InterfaceAlias $tun -Confirm:$false | Out-Null
+"#,
+        ps_quote(interface_name)
+    );
+    let _ = run_powershell(&script);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn cleanup_tun_ipv6_routes(_interface_name: &str) {}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn cleanup_tun_routes(interface_name: &str, server_ip: Option<&str>) -> Result<(), String> {
+    cleanup_tun_ipv6_routes(interface_name);
+
     if let Ok(tun_index) = find_tun_interface_index(interface_name) {
         route_delete("0.0.0.0", "128.0.0.0", Some("0.0.0.0"), Some(tun_index));
         route_delete("128.0.0.0", "128.0.0.0", Some("0.0.0.0"), Some(tun_index));
@@ -637,6 +905,6 @@ Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias $tun -Confirm:$
 }
 
 #[cfg(not(target_os = "windows"))]
-fn cleanup_tun_routes(_interface_name: &str, _server_ip: Option<&str>) -> Result<(), String> {
+pub(crate) fn cleanup_tun_routes(_interface_name: &str, _server_ip: Option<&str>) -> Result<(), String> {
     Ok(())
 }

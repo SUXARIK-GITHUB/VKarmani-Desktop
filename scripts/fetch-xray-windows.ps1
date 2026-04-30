@@ -1,6 +1,6 @@
 param(
   [string]$ProjectDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
-  [string]$XrayVersion = 'v26.3.27',
+  [string]$XrayVersion = 'v26.4.25',
   [string]$ExpectedZipSha256 = '',
   [switch]$Force
 )
@@ -42,6 +42,36 @@ function Test-XrayLaunch([string]$Path) {
   } finally {
     if ($stdout) { Remove-Item -LiteralPath $stdout -Force -ErrorAction SilentlyContinue }
     if ($stderr) { Remove-Item -LiteralPath $stderr -Force -ErrorAction SilentlyContinue }
+  }
+}
+
+function Test-CoreManifestValid {
+  if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return $false }
+
+  try {
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    foreach ($name in @('xray.exe', 'wintun.dll', 'geoip.dat', 'geosite.dat')) {
+      $entry = @($manifest.files | Where-Object { $_.file -ieq $name } | Select-Object -First 1)
+      if (-not $entry -or -not $entry[0]) { return $false }
+
+      $path = Join-Path $coreDir $name
+      if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+
+      $item = Get-Item -LiteralPath $path
+      $expectedSize = [int64]$entry[0].size
+      if ($expectedSize -gt 0 -and $item.Length -ne $expectedSize) { return $false }
+
+      $expectedHash = ([string]$entry[0].sha256).Trim().ToLowerInvariant()
+      if ($expectedHash -notmatch '^[a-f0-9]{64}$') { return $false }
+
+      $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+      if ($actualHash -ne $expectedHash) { return $false }
+    }
+
+    return $true
+  } catch {
+    Write-WarnLine "Existing core manifest is invalid: $($_.Exception.Message)"
+    return $false
   }
 }
 
@@ -91,12 +121,12 @@ if (-not (Test-Path -LiteralPath $coreDir)) {
 }
 
 $xrayPath = Join-Path $coreDir 'xray.exe'
-if (-not $Force -and (Test-XrayLaunch $xrayPath)) {
-  Write-Info 'Existing xray.exe launches successfully; keeping bundled file.'
+if (-not $Force -and (Test-XrayLaunch $xrayPath) -and (Test-CoreManifestValid)) {
+  Write-Info 'Existing Xray bundle launches successfully and matches core-manifest.json; keeping bundled files.'
   exit 0
 }
 
-Write-Info "Downloading official Xray-core Windows x64 $XrayVersion because bundled xray.exe is missing or not launchable."
+Write-Info "Downloading official Xray-core Windows x64 $XrayVersion because bundled core is missing, not launchable, or does not match core-manifest.json."
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("vkarmani-xray-" + [System.Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
@@ -185,7 +215,9 @@ try {
     files = $files
   }
 
-  ($manifest | ConvertTo-Json -Depth 6) + "`n" | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+  $manifestJson = ($manifest | ConvertTo-Json -Depth 6) + "`n"
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($manifestPath, $manifestJson, $utf8NoBom)
   Write-Info "Updated core manifest: $manifestPath"
   Write-Info "Xray-core Windows x64 $XrayVersion is ready."
 } finally {

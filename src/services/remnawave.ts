@@ -11,7 +11,9 @@ import type {
   RuntimeStatus,
   SessionRecord,
   SplitTunnelEntry,
+  RoutingExclusionSettings,
   TunnelMode,
+  IpStack,
   VpnServer,
   XrayRuntimeTemplate
 } from '../types/vpn';
@@ -36,6 +38,8 @@ import {
 } from './runtime';
 import { maybeDecodeBase64, parsePort, splitHostPort } from './remnawave/parserCore';
 import { parseSubscriptionToServers } from './remnawave/subscriptionParser';
+import { assertNativeRuntimeServerMatches } from './connectionGuards';
+import { buildServerRuntimeFingerprint } from '../utils/serverIdentity';
 
 const delay = (value: number) => new Promise<void>((resolve) => window.setTimeout(resolve, value));
 const previewDelay = (value: number) => isTauriRuntime ? Promise.resolve() : delay(value);
@@ -815,7 +819,8 @@ export class RemnawaveClient {
       const infoError = error instanceof Error ? error.message : 'Не удалось получить профиль из Remnawave.';
 
       // У части подписок VKarmani/Remnawave доступен только raw subscription без отдельного JSON info endpoint.
-      // В таком случае ключ всё равно считается рабочим, если raw-профиль скачался и в нём есть серверы.
+      // Такой ключ допускается только как ограниченный raw-only режим: сервера импортируются,
+      // но статус подписки/лимитов/устройств не считается подтверждённым panel info endpoint.
       try {
         const rawResult = await fetchTextCandidates(buildRawCandidates(key, provisionalSession));
         const importedServers = parseSubscriptionToServers(rawResult.value);
@@ -835,7 +840,7 @@ export class RemnawaveClient {
           readyCount: importedServers.filter((item) => item.runtimeTemplate).length,
           updatedAt: new Date().toISOString(),
           accessKeyKind: key.kind,
-          message: 'Ключ подтверждён через raw subscription.'
+          message: 'Ключ принят через raw subscription. Серверы доступны, но статус подписки, срок действия и лимит устройств не подтверждены info/profile endpoint.'
         };
         return provisionalSession;
       } catch (rawError) {
@@ -951,36 +956,45 @@ export class RemnawaveClient {
       probeAfterConnect?: boolean;
       tunnelMode?: TunnelMode;
       splitTunnelEntries?: SplitTunnelEntry[];
+      routingExclusions?: RoutingExclusionSettings;
+      ipStack?: IpStack;
+      reconnect?: boolean;
     } = {}
   ): Promise<ConnectResult> {
     await previewDelay(250);
-    const exists = this.cachedServers.find((item) => item.id === server.id)
-      ?? this.cachedServers.find((item) => {
-        const sameRuntime = JSON.stringify(item.runtimeTemplate ?? null) === JSON.stringify(server.runtimeTemplate ?? null);
-        const sameEndpoint = item.host === server.host && (item.port ?? 443) === (server.port ?? 443);
-        const sameLabel = item.country === server.country && item.city === server.city && item.protocol === server.protocol;
-        return sameRuntime || sameEndpoint || sameLabel;
-      })
-      ?? this.cachedServers.find((item) => Boolean(item.runtimeTemplate))
-      ?? (server.runtimeTemplate ? server : null);
+    this.lastProbe = null;
+    const cachedExactServer = this.cachedServers.find((item) => item.id === server.id) ?? null;
+
+    // Ручной выбор пользователя должен запускать именно тот runtimeTemplate,
+    // который пришёл из выбранной строки UI. Раньше cachedServers имел приоритет,
+    // поэтому при устаревшем кэше или повторной синхронизации можно было стартовать
+    // похожий/старый config с тем же id. Это выглядело как подключение к
+    // "рандомному" серверу.
+    const exists = server.runtimeTemplate ? server : cachedExactServer;
 
     if (!exists) {
       throw new Error('Сервер не найден в активном профиле. Сначала обновите профиль или выберите другой узел.');
     }
 
-    if (!this.cachedServers.some((item) => item.id === exists.id)) {
-      this.cachedServers = [exists, ...this.cachedServers.filter((item) => item.id !== exists.id)];
-    }
+    this.cachedServers = [exists, ...this.cachedServers.filter((item) => item.id !== exists.id)];
 
     if (isTauriRuntime) {
       const networkMode = options.tunnelMode ?? 'proxy';
+      const ipStack = options.ipStack ?? 'ipv4';
       const activeSplitTunnelEntries = (options.splitTunnelEntries ?? []).filter((entry) => entry.enabled && entry.value.trim());
       let runtimeStarted = false;
       let systemProxyEnabled = false;
 
       try {
-        await requestNativeConnect(exists, networkMode, activeSplitTunnelEntries);
+        const runtime = await requestNativeConnect(exists, networkMode, activeSplitTunnelEntries, ipStack, Boolean(options.reconnect), options.routingExclusions);
         runtimeStarted = true;
+
+        assertNativeRuntimeServerMatches(
+          runtime.lastPreparedServerId,
+          exists.id,
+          runtime.lastPreparedServerFingerprint,
+          buildServerRuntimeFingerprint(exists)
+        );
 
         let proxy: ProxyStatus | null = null;
         if (networkMode !== 'tun' && options.useSystemProxy) {
@@ -994,20 +1008,35 @@ export class RemnawaveClient {
         }
 
         return {
-          externalIp: probe?.publicIp ?? this.lastProbe?.publicIp ?? 'Определяется после проверки маршрута',
+          externalIp: probe?.publicIp ?? 'Определяется после проверки маршрута',
           dnsMode: networkMode === 'tun'
             ? activeSplitTunnelEntries.length
-              ? 'TUN режим → только выбранные программы и службы идут через VPN, остальное выходит напрямую'
-              : 'TUN режим → список маршрутизации пуст, поэтому обычный трафик остаётся прямым'
+              ? `TUN режим → ${ipStack.toUpperCase()} → только выбранные программы и службы идут через VPN, остальное выходит напрямую`
+              : `TUN режим → ${ipStack.toUpperCase()} → список маршрутизации пуст, поэтому обычный трафик остаётся прямым`
             : options.useSystemProxy
-              ? 'Windows system proxy → локальный Xray HTTP proxy 127.0.0.1:10809'
-              : 'Локальный Xray sidecar на 127.0.0.1:10808/10809',
+              ? `Windows system proxy → ${ipStack.toUpperCase()} → локальный Xray HTTP proxy 127.0.0.1:10809`
+              : `Локальный Xray sidecar → ${ipStack.toUpperCase()} → 127.0.0.1:10808/10809`,
           transport: exists.protocol,
           probe,
-          proxy
+          proxy,
+          runtime
         };
       } catch (error) {
-        // Даже если native connect завис/упал до ответа, пробуем остановить Xray,
+        const errorMessage = error instanceof Error ? error.message : String(error ?? '');
+        const nativeConnectStillRunning = errorMessage.includes('Подключение заняло больше')
+          || errorMessage.includes('UI разблокирован');
+        const runtimeTemporarilyBusy = errorMessage.includes('Runtime уже выполняет другое действие');
+
+        // Если frontend timeout сработал раньше, чем Rust реально закончил request_connect,
+        // нельзя тут же отправлять request_disconnect: он попадёт в тот же operation_lock
+        // и может усилить зависание/гонку при переключении сервера. Короткая занятость
+        // runtime-lock тоже не означает, что новый сервер окончательно не стартовал:
+        // App.tsx повторит старт выбранного сервера без rollback на случайный/старый узел.
+        if (nativeConnectStillRunning || runtimeTemporarilyBusy) {
+          throw error;
+        }
+
+        // Даже если native connect упал до ответа, пробуем остановить Xray,
         // чтобы не оставить сиротский процесс и включённый proxy/TUN после ошибки.
         try {
           await requestNativeDisconnect();

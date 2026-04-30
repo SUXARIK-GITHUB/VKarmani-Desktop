@@ -2010,3 +2010,121 @@ html.vk-window-dragging *::after {
   white-space: nowrap;
   letter-spacing: 0;
 }
+
+/* VKarmani 0.13.40 stability pass: final layout guard for 1000x670 dashboard.
+   Keep this block last so traffic/session values never overflow their cards. */
+.vk-dashboard-side,
+.vk-traffic-card,
+.vk-session-card,
+.vk-mode-card,
+.vk-primary-power,
+.vk-power-actions {
+  min-width: 0;
+  min-height: 0;
+}
+
+.vk-traffic-card,
+.vk-session-card {
+  overflow: hidden;
+  contain: layout paint;
+}
+
+.vk-traffic-stats,
+.vk-session-lines {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.vk-traffic-stats span,
+.vk-session-lines span,
+.vk-session-lines strong {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vk-traffic-stats strong,
+.vk-session-lines strong {
+  font-size: clamp(12px, 1.05vw, 15px);
+  line-height: 1.18;
+}
+
+.vk-power-actions {
+  align-self: end;
+}
+
+@media (min-width: 940px) and (max-width: 1120px) {
+  .vk-dashboard-side {
+    grid-auto-rows: minmax(0, auto);
+  }
+
+  .vk-traffic-stats {
+    gap: 8px;
+  }
+
+  .vk-session-lines {
+    gap: 8px;
+  }
+}
+
+
+/* 0.13.40 hotfix: keep Session card readable on 1000x670 and similar sizes */
+.vk-session-lines {
+  overflow: visible !important;
+}
+
+.vk-session-line {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto !important;
+  align-items: center !important;
+  gap: 8px !important;
+  min-width: 0 !important;
+}
+
+.vk-session-line-label {
+  min-width: 0 !important;
+  color: var(--vk-muted) !important;
+  font-size: 11px !important;
+  line-height: 1.15 !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+
+.vk-session-line-value {
+  min-width: 0 !important;
+  color: #dce7f7 !important;
+  font-weight: 600 !important;
+  font-size: 11px !important;
+  line-height: 1.15 !important;
+  white-space: nowrap !important;
+  overflow: visible !important;
+  text-overflow: clip !important;
+}
+
+@media (min-width: 940px) and (max-width: 1120px) {
+  .vk-session-card {
+    padding: 12px 14px 12px !important;
+  }
+
+  .vk-session-time {
+    margin: 4px 0 6px !important;
+    font-size: 18px !important;
+  }
+
+  .vk-session-lines {
+    gap: 6px !important;
+    padding-top: 6px !important;
+  }
+
+  .vk-session-line {
+    gap: 6px !important;
+  }
+
+  .vk-session-line-label,
+  .vk-session-line-value {
+    font-size: 10.5px !important;
+  }
+}

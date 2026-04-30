@@ -1,4 +1,18 @@
-fn terminate_child_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+use super::*;
+
+#[cfg(target_os = "windows")]
+pub(crate) fn force_kill_process_tree(pid: u32) {
+    let mut command = Command::new("taskkill");
+    command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+    hide_child_console(&mut command);
+    let _ = command.output();
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn force_kill_process_tree(_pid: u32) {}
+
+pub(crate) fn terminate_child_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let pid = child.id();
     let _ = child.kill();
     let started_at = Instant::now();
 
@@ -7,6 +21,23 @@ fn terminate_child_with_timeout(child: &mut Child, timeout: Duration) -> Option<
             Ok(Some(status)) => return Some(status),
             Ok(None) => {
                 if started_at.elapsed() >= timeout {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(35));
+            }
+            Err(_) => return None,
+        }
+    }
+
+    // Защита от редкого зависания xray.exe при быстром переключении серверов:
+    // если обычный kill не завершил процесс, на Windows добиваем всё дерево процесса.
+    force_kill_process_tree(pid);
+    let forced_started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if forced_started_at.elapsed() >= Duration::from_secs(2) {
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(35));
@@ -16,7 +47,29 @@ fn terminate_child_with_timeout(child: &mut Child, timeout: Duration) -> Option<
     }
 }
 
-fn stop_existing_runtime(app: &AppHandle, state: &tauri::State<AppState>) -> Result<(), String> {
+pub(crate) fn acquire_operation_lock<'a>(
+    state: &'a tauri::State<AppState>,
+    timeout: Duration,
+    context: &str,
+) -> Result<MutexGuard<'a, ()>, String> {
+    let started_at = Instant::now();
+    loop {
+        match state.operation_lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(_) if started_at.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "Runtime уже выполняет другое действие ({context}) дольше {} секунд. Повторите через несколько секунд.",
+                    timeout.as_secs()
+                ));
+            }
+        }
+    }
+}
+
+pub(crate) fn stop_existing_runtime(app: &AppHandle, state: &tauri::State<AppState>, restore_proxy: bool) -> Result<(), String> {
     let runtime_to_stop = {
         let mut runtime_guard = state
             .runtime
@@ -26,8 +79,16 @@ fn stop_existing_runtime(app: &AppHandle, state: &tauri::State<AppState>) -> Res
     };
 
     if let Some(mut runtime) = runtime_to_stop {
-        let _ = append_runtime_event(app, "Останавливаем предыдущий Xray runtime.");
-        let status = terminate_child_with_timeout(&mut runtime.child, Duration::from_secs(3));
+        let shutdown_timeout = if restore_proxy { Duration::from_secs(3) } else { Duration::from_millis(1200) };
+        let _ = append_runtime_event(
+            app,
+            if restore_proxy {
+                "Останавливаем предыдущий Xray runtime."
+            } else {
+                "Быстро останавливаем предыдущий Xray runtime для мягкого переключения сервера."
+            },
+        );
+        let status = terminate_child_with_timeout(&mut runtime.child, shutdown_timeout);
 
         if runtime.network_mode == "tun" {
             let _ = cleanup_tun_routes(
@@ -36,7 +97,11 @@ fn stop_existing_runtime(app: &AppHandle, state: &tauri::State<AppState>) -> Res
             );
         }
 
-        let _ = restore_saved_proxy_state(app, state, "runtime_stop");
+        if restore_proxy {
+            let _ = restore_saved_proxy_state(app, state, "runtime_stop");
+        } else {
+            let _ = append_runtime_event(app, "Proxy backup сохранён: при мягком переподключении системный proxy не сбрасываем между старым и новым Xray.");
+        }
         let _ = fs::remove_file(Path::new(&runtime.config_path));
 
         if let Some(code) = status.and_then(|item| item.code()) {
@@ -58,16 +123,29 @@ fn stop_existing_runtime(app: &AppHandle, state: &tauri::State<AppState>) -> Res
 }
 
 #[cfg(target_os = "windows")]
-fn escape_powershell_single_quoted(value: &str) -> String {
+pub(crate) fn escape_powershell_single_quoted(value: &str) -> String {
     value.replace("'", "''")
 }
 
 #[cfg(target_os = "windows")]
-fn stop_orphan_xray_processes(app: &AppHandle, core_path: &Path) {
+pub(crate) fn stop_orphan_xray_processes(app: &AppHandle, core_path: &Path) {
     let target = escape_powershell_single_quoted(&core_path.to_string_lossy());
+    let runtime_dir = runtime_output_dir(app)
+        .map(|path| escape_powershell_single_quoted(&path.to_string_lossy()))
+        .unwrap_or_default();
     let script = format!(
-        r#"& {{ $target = '{}'; Get-CimInstance Win32_Process -Filter "name = 'xray.exe'" | Where-Object {{ $_.ExecutablePath -and ($_.ExecutablePath -ieq $target) }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output $_.ProcessId }} }}"#,
-        target
+        r#"& {{
+$target = '{}'
+$runtimeDir = '{}'
+$items = Get-CimInstance Win32_Process -Filter "name = 'xray.exe'" | Where-Object {{
+  ($_.ExecutablePath -and ($_.ExecutablePath -ieq $target)) -or
+  ($runtimeDir -and $_.CommandLine -and $_.CommandLine.Contains($runtimeDir) -and $_.CommandLine.Contains('xray-config-'))
+}}
+$items | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output $_.ProcessId }}
+Start-Sleep -Milliseconds 150
+}}"#,
+        target,
+        runtime_dir
     );
 
     let mut command = Command::new("powershell");
@@ -93,24 +171,24 @@ fn stop_orphan_xray_processes(app: &AppHandle, core_path: &Path) {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn stop_orphan_xray_processes(_app: &AppHandle, _core_path: &Path) {}
+pub(crate) fn stop_orphan_xray_processes(_app: &AppHandle, _core_path: &Path) {}
 
 
-fn cleanup_application(app: &AppHandle, reason: &str) {
+pub(crate) fn cleanup_application(app: &AppHandle, reason: &str) {
     let state = app.state::<AppState>();
     let _ = append_runtime_event(app, &format!("Запущен cleanup приложения: {reason}."));
-    let _ = stop_existing_runtime(app, &state);
+    let _ = stop_existing_runtime(app, &state, true);
     let _ = restore_saved_proxy_state(app, &state, reason);
     let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, None);
     let _ = cleanup_runtime_config_files(app);
     refresh_tray_menu(app);
 }
 
-fn normalize_socket_host(host: &str) -> String {
+pub(crate) fn normalize_socket_host(host: &str) -> String {
     host.trim().trim_matches('[').trim_matches(']').to_string()
 }
 
-fn format_endpoint_for_display(host: &str, port: u16) -> String {
+pub(crate) fn format_endpoint_for_display(host: &str, port: u16) -> String {
     let normalized = normalize_socket_host(host);
     if normalized.contains(':') {
         format!("[{normalized}]:{port}")
@@ -119,7 +197,7 @@ fn format_endpoint_for_display(host: &str, port: u16) -> String {
     }
 }
 
-fn resolve_socket_addresses(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, String> {
+pub(crate) fn resolve_socket_addresses(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, String> {
     let normalized = normalize_socket_host(host);
     if normalized.is_empty() {
         return Err("Host пустой.".into());
@@ -142,7 +220,7 @@ fn resolve_socket_addresses(host: &str, port: u16) -> Result<Vec<std::net::Socke
     Ok(addresses)
 }
 
-fn tcp_port_open(host: &str, port: u16, timeout_ms: u64) -> bool {
+pub(crate) fn tcp_port_open(host: &str, port: u16, timeout_ms: u64) -> bool {
     let timeout = Duration::from_millis(timeout_ms);
 
     resolve_socket_addresses(host, port)
@@ -154,7 +232,7 @@ fn tcp_port_open(host: &str, port: u16, timeout_ms: u64) -> bool {
         .unwrap_or(false)
 }
 
-fn ensure_runtime_ports_available() -> Result<(), String> {
+pub(crate) fn runtime_busy_ports() -> Vec<u16> {
     let mut busy_ports = Vec::new();
 
     if tcp_port_open("127.0.0.1", SOCKS_PORT, 350) {
@@ -169,25 +247,55 @@ fn ensure_runtime_ports_available() -> Result<(), String> {
         busy_ports.push(XRAY_API_PORT);
     }
 
+    busy_ports
+}
+
+pub(crate) fn format_busy_runtime_ports(busy_ports: &[u16]) -> String {
+    busy_ports
+        .iter()
+        .map(|port| format!("127.0.0.1:{port}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(crate) fn ensure_runtime_ports_available() -> Result<(), String> {
+    let busy_ports = runtime_busy_ports();
+
     if busy_ports.is_empty() {
         return Ok(());
     }
 
     Err(format!(
         "Локальные порты VKarmani уже заняты: {}. Закройте другой VPN/proxy-клиент или перезапустите VKarmani.",
-        busy_ports
-            .iter()
-            .map(|port| format!("127.0.0.1:{port}"))
-            .collect::<Vec<_>>()
-            .join(", ")
+        format_busy_runtime_ports(&busy_ports)
     ))
 }
 
-#[cfg(target_os = "windows")]
-const POWERSHELL_COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
+pub(crate) fn wait_for_runtime_ports_release(timeout: Duration) -> Result<(), String> {
+    let started_at = Instant::now();
+    loop {
+        let busy_ports = runtime_busy_ports();
+        if busy_ports.is_empty() {
+            return Ok(());
+        }
+
+        if started_at.elapsed() >= timeout {
+            return Err(format!(
+                "После остановки Xray локальные порты не освободились за {} секунд: {}. Старый процесс мог зависнуть, перезапустите VKarmani или завершите xray.exe в диспетчере задач.",
+                timeout.as_secs(),
+                format_busy_runtime_ports(&busy_ports)
+            ));
+        }
+
+        std::thread::sleep(Duration::from_millis(120));
+    }
+}
 
 #[cfg(target_os = "windows")]
-fn run_powershell_command(mut command: Command, context: &str) -> Result<String, String> {
+pub(crate) const POWERSHELL_COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
+
+#[cfg(target_os = "windows")]
+pub(crate) fn run_powershell_command(mut command: Command, context: &str) -> Result<String, String> {
     hide_child_console(&mut command);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -229,13 +337,13 @@ fn run_powershell_command(mut command: Command, context: &str) -> Result<String,
 }
 
 #[cfg(target_os = "windows")]
-fn run_powershell(script: &str) -> Result<String, String> {
+pub(crate) fn run_powershell(script: &str) -> Result<String, String> {
     let mut command = Command::new("powershell");
     command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
     run_powershell_command(command, "script")
 }
 
-fn run_command_with_timeout(mut command: Command, timeout: Duration, context: &str) -> Result<String, String> {
+pub(crate) fn run_command_with_timeout(mut command: Command, timeout: Duration, context: &str) -> Result<String, String> {
     hide_child_console(&mut command);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -276,18 +384,9 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration, context: &s
     }
 }
 
-#[cfg(target_os = "windows")]
-fn run_powershell_with_env(script: &str, envs: &[(String, String)]) -> Result<String, String> {
-    let mut command = Command::new("powershell");
-    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
-    for (key, value) in envs {
-        command.env(key, value);
-    }
-    run_powershell_command(command, "script-with-env")
-}
 
 #[cfg(test)]
-fn proxy_status_from_registry_json(raw: &str, method: &str) -> Result<ProxyStatus, String> {
+pub(crate) fn proxy_status_from_registry_json(raw: &str, method: &str) -> Result<ProxyStatus, String> {
     let value: Value = serde_json::from_str(raw)
         .map_err(|error| format!("Не удалось разобрать ответ PowerShell: {error}"))?;
 
@@ -310,17 +409,17 @@ fn proxy_status_from_registry_json(raw: &str, method: &str) -> Result<ProxyStatu
 }
 
 #[cfg(target_os = "windows")]
-const INTERNET_SETTINGS_REG_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+pub(crate) const INTERNET_SETTINGS_REG_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
 #[cfg(target_os = "windows")]
-fn run_reg_command(args: &[&str], context: &str) -> Result<String, String> {
+pub(crate) fn run_reg_command(args: &[&str], context: &str) -> Result<String, String> {
     let mut command = Command::new("reg");
     command.args(args);
     run_command_with_timeout(command, Duration::from_secs(4), context)
 }
 
 #[cfg(target_os = "windows")]
-fn parse_reg_value(raw: &str, value_name: &str) -> Option<String> {
+pub(crate) fn parse_reg_value(raw: &str, value_name: &str) -> Option<String> {
     raw.lines()
         .map(str::trim)
         .find(|line| line.starts_with(value_name))
@@ -336,7 +435,7 @@ fn parse_reg_value(raw: &str, value_name: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn read_reg_value(value_name: &str) -> Option<String> {
+pub(crate) fn read_reg_value(value_name: &str) -> Option<String> {
     run_reg_command(&["query", INTERNET_SETTINGS_REG_KEY, "/v", value_name], &format!("reg query {value_name}"))
         .ok()
         .and_then(|raw| parse_reg_value(&raw, value_name))
@@ -345,7 +444,7 @@ fn read_reg_value(value_name: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn write_reg_dword(value_name: &str, value: u32) -> Result<(), String> {
+pub(crate) fn write_reg_dword(value_name: &str, value: u32) -> Result<(), String> {
     run_reg_command(
         &["add", INTERNET_SETTINGS_REG_KEY, "/v", value_name, "/t", "REG_DWORD", "/d", &value.to_string(), "/f"],
         &format!("reg add {value_name}"),
@@ -354,7 +453,7 @@ fn write_reg_dword(value_name: &str, value: u32) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn write_reg_string(value_name: &str, value: &str) -> Result<(), String> {
+pub(crate) fn write_reg_string(value_name: &str, value: &str) -> Result<(), String> {
     run_reg_command(
         &["add", INTERNET_SETTINGS_REG_KEY, "/v", value_name, "/t", "REG_SZ", "/d", value, "/f"],
         &format!("reg add {value_name}"),
@@ -363,7 +462,7 @@ fn write_reg_string(value_name: &str, value: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn notify_wininet_proxy_changed() {
+pub(crate) fn notify_wininet_proxy_changed() {
     use windows_sys::Win32::Networking::WinInet::{
         InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
     };
@@ -388,7 +487,7 @@ fn notify_wininet_proxy_changed() {
 }
 
 #[cfg(target_os = "windows")]
-fn current_proxy_snapshot() -> Result<ProxyStatus, String> {
+pub(crate) fn current_proxy_snapshot() -> Result<ProxyStatus, String> {
     let enabled_raw = read_reg_value("ProxyEnable").unwrap_or_else(|| "0x0".to_string());
     let enabled = u32::from_str_radix(enabled_raw.trim_start_matches("0x"), 16).unwrap_or(0) == 1
         || enabled_raw.trim() == "1";
@@ -403,7 +502,7 @@ fn current_proxy_snapshot() -> Result<ProxyStatus, String> {
     })
 }
 #[cfg(not(target_os = "windows"))]
-fn current_proxy_snapshot() -> Result<ProxyStatus, String> {
+pub(crate) fn current_proxy_snapshot() -> Result<ProxyStatus, String> {
     Ok(ProxyStatus {
         enabled: false,
         server: None,
@@ -414,7 +513,7 @@ fn current_proxy_snapshot() -> Result<ProxyStatus, String> {
     })
 }
 
-fn proxy_backup_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn proxy_backup_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_local_data_dir()
@@ -424,7 +523,7 @@ fn proxy_backup_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("system-proxy-backup.json"))
 }
 
-fn save_proxy_backup_snapshot(app: &AppHandle, snapshot: &ProxyStatus) -> Result<(), String> {
+pub(crate) fn save_proxy_backup_snapshot(app: &AppHandle, snapshot: &ProxyStatus) -> Result<(), String> {
     let path = proxy_backup_path(app)?;
     let payload = serde_json::to_string_pretty(snapshot)
         .map_err(|error| format!("Не удалось сериализовать backup системного proxy: {error}"))?;
@@ -432,7 +531,7 @@ fn save_proxy_backup_snapshot(app: &AppHandle, snapshot: &ProxyStatus) -> Result
         .map_err(|error| format!("Не удалось сохранить backup системного proxy: {error}"))
 }
 
-fn load_proxy_backup_snapshot(app: &AppHandle) -> Result<Option<ProxyStatus>, String> {
+pub(crate) fn load_proxy_backup_snapshot(app: &AppHandle) -> Result<Option<ProxyStatus>, String> {
     let path = proxy_backup_path(app)?;
     if !path.exists() {
         return Ok(None);
@@ -445,13 +544,13 @@ fn load_proxy_backup_snapshot(app: &AppHandle) -> Result<Option<ProxyStatus>, St
     Ok(Some(snapshot))
 }
 
-fn clear_proxy_backup_snapshot(app: &AppHandle) {
+pub(crate) fn clear_proxy_backup_snapshot(app: &AppHandle) {
     if let Ok(path) = proxy_backup_path(app) {
         let _ = fs::remove_file(path);
     }
 }
 
-fn capture_previous_proxy_state(app: &AppHandle, state: &tauri::State<AppState>) -> Result<(), String> {
+pub(crate) fn capture_previous_proxy_state(app: &AppHandle, state: &tauri::State<AppState>) -> Result<(), String> {
     if let Ok(mut previous_guard) = state.previous_proxy.lock() {
         if previous_guard.is_some() {
             return Ok(());
@@ -475,7 +574,7 @@ fn capture_previous_proxy_state(app: &AppHandle, state: &tauri::State<AppState>)
     save_proxy_backup_snapshot(app, &snapshot)
 }
 
-fn take_saved_proxy_state(app: &AppHandle, state: &tauri::State<AppState>) -> Option<ProxyStatus> {
+pub(crate) fn take_saved_proxy_state(app: &AppHandle, state: &tauri::State<AppState>) -> Option<ProxyStatus> {
     state
         .previous_proxy
         .lock()
@@ -485,7 +584,7 @@ fn take_saved_proxy_state(app: &AppHandle, state: &tauri::State<AppState>) -> Op
 }
 
 #[cfg(target_os = "windows")]
-fn apply_windows_proxy_snapshot(snapshot: &ProxyStatus) -> Result<ProxyStatus, String> {
+pub(crate) fn apply_windows_proxy_snapshot(snapshot: &ProxyStatus) -> Result<ProxyStatus, String> {
     let proxy_enable = if snapshot.enabled { 1 } else { 0 };
     let proxy_server = snapshot.server.clone().unwrap_or_default();
     let proxy_bypass = snapshot.bypass.clone().unwrap_or_default();
@@ -497,7 +596,7 @@ fn apply_windows_proxy_snapshot(snapshot: &ProxyStatus) -> Result<ProxyStatus, S
     current_proxy_snapshot()
 }
 #[cfg(not(target_os = "windows"))]
-fn apply_windows_proxy_snapshot(snapshot: &ProxyStatus) -> Result<ProxyStatus, String> {
+pub(crate) fn apply_windows_proxy_snapshot(snapshot: &ProxyStatus) -> Result<ProxyStatus, String> {
     Ok(ProxyStatus {
         enabled: snapshot.enabled,
         server: snapshot.server.clone(),
@@ -509,7 +608,7 @@ fn apply_windows_proxy_snapshot(snapshot: &ProxyStatus) -> Result<ProxyStatus, S
 }
 
 #[cfg(target_os = "windows")]
-fn set_windows_proxy(enabled: bool) -> Result<ProxyStatus, String> {
+pub(crate) fn set_windows_proxy(enabled: bool) -> Result<ProxyStatus, String> {
     let proxy_enable = if enabled { 1 } else { 0 };
     let proxy_server = if enabled {
         format!("http=127.0.0.1:{HTTP_PORT};https=127.0.0.1:{HTTP_PORT}")
@@ -525,7 +624,7 @@ fn set_windows_proxy(enabled: bool) -> Result<ProxyStatus, String> {
     current_proxy_snapshot()
 }
 #[cfg(not(target_os = "windows"))]
-fn set_windows_proxy(enabled: bool) -> Result<ProxyStatus, String> {
+pub(crate) fn set_windows_proxy(enabled: bool) -> Result<ProxyStatus, String> {
     Ok(ProxyStatus {
         enabled,
         server: if enabled {
@@ -545,7 +644,7 @@ fn set_windows_proxy(enabled: bool) -> Result<ProxyStatus, String> {
 }
 
 
-fn proxy_snapshot_points_to_runtime(snapshot: &ProxyStatus) -> bool {
+pub(crate) fn proxy_snapshot_points_to_runtime(snapshot: &ProxyStatus) -> bool {
     snapshot.enabled
         && snapshot
             .server
@@ -554,7 +653,7 @@ fn proxy_snapshot_points_to_runtime(snapshot: &ProxyStatus) -> bool {
             .unwrap_or(false)
 }
 
-fn restore_saved_proxy_state(app: &AppHandle, state: &tauri::State<AppState>, reason: &str) -> Result<Option<ProxyStatus>, String> {
+pub(crate) fn restore_saved_proxy_state(app: &AppHandle, state: &tauri::State<AppState>, reason: &str) -> Result<Option<ProxyStatus>, String> {
     let previous = take_saved_proxy_state(app, state);
 
     let restored = if let Some(snapshot) = previous {
@@ -587,7 +686,7 @@ fn restore_saved_proxy_state(app: &AppHandle, state: &tauri::State<AppState>, re
     Ok(restored)
 }
 
-fn recover_orphaned_system_proxy(app: &AppHandle, state: &tauri::State<AppState>, reason: &str) -> Result<Option<ProxyStatus>, String> {
+pub(crate) fn recover_orphaned_system_proxy(app: &AppHandle, state: &tauri::State<AppState>, reason: &str) -> Result<Option<ProxyStatus>, String> {
     let current = current_proxy_snapshot()?;
     if !proxy_snapshot_points_to_runtime(&current) {
         return Ok(None);
@@ -606,7 +705,7 @@ fn recover_orphaned_system_proxy(app: &AppHandle, state: &tauri::State<AppState>
 
 
 #[cfg(target_os = "windows")]
-fn is_process_elevated() -> Result<bool, String> {
+pub(crate) fn is_process_elevated() -> Result<bool, String> {
     // `fltmc` exits successfully only in an elevated process. It is much lighter than
     // spinning up PowerShell just to ask WindowsPrincipal for the admin role.
     let mut command = Command::new("fltmc");
@@ -615,16 +714,16 @@ fn is_process_elevated() -> Result<bool, String> {
     Ok(output.status.success())
 }
 #[cfg(not(target_os = "windows"))]
-fn is_process_elevated() -> Result<bool, String> {
+pub(crate) fn is_process_elevated() -> Result<bool, String> {
     Ok(false)
 }
 
 #[cfg(target_os = "windows")]
-fn ps_quote(value: &str) -> String {
+pub(crate) fn ps_quote(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn sync_runtime_liveness(app: &AppHandle, state: &tauri::State<AppState>) {
+pub(crate) fn sync_runtime_liveness(app: &AppHandle, state: &tauri::State<AppState>) {
     let mut exit_code: Option<Option<i32>> = None;
     let mut finished_runtime: Option<ManagedCore> = None;
 
@@ -679,7 +778,7 @@ fn sync_runtime_liveness(app: &AppHandle, state: &tauri::State<AppState>) {
     }
 }
 
-fn start_runtime_watchdog(app: AppHandle) {
+pub(crate) fn start_runtime_watchdog(app: AppHandle) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(2));
         let state = app.state::<AppState>();

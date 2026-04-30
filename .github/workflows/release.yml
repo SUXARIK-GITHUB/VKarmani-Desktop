@@ -65,6 +65,13 @@ jobs:
         shell: pwsh
         run: .\scripts\verify-xray-windows.ps1
 
+      - name: Verify bundled Xray manifest cross-platform
+        run: node scripts/verify-core-manifest.mjs
+
+      - name: Verify Hysteria2 schema on bundled Xray
+        shell: pwsh
+        run: .\scripts\verify-hysteria2-bundled-xray.ps1
+
       - name: Setup Node.js
         uses: actions/setup-node@v5.0.0
         with:

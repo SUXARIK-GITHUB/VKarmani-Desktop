@@ -1,5 +1,7 @@
+use super::*;
+
 #[tauri::command]
-fn write_interface_log(message: String, details: Option<String>, app: AppHandle) -> Result<(), String> {
+pub(crate) fn write_interface_log(message: String, details: Option<String>, app: AppHandle) -> Result<(), String> {
     let line = details
         .filter(|value| !value.trim().is_empty())
         .map(|details| format!("{message} | {details}"))
@@ -8,7 +10,7 @@ fn write_interface_log(message: String, details: Option<String>, app: AppHandle)
 }
 
 #[tauri::command]
-fn write_routing_log(message: String, details: Option<String>, app: AppHandle) -> Result<(), String> {
+pub(crate) fn write_routing_log(message: String, details: Option<String>, app: AppHandle) -> Result<(), String> {
     let line = details
         .filter(|value| !value.trim().is_empty())
         .map(|details| format!("{message} | {details}"))
@@ -17,13 +19,13 @@ fn write_routing_log(message: String, details: Option<String>, app: AppHandle) -
 }
 
 #[tauri::command]
-async fn public_ip_snapshot(mode: Option<String>) -> Result<String, String> {
+pub(crate) async fn public_ip_snapshot(mode: Option<String>) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || public_ip_snapshot_blocking(mode))
         .await
         .map_err(|error| format!("Проверка внешнего IP была прервана: {error}"))?
 }
 
-fn public_ip_snapshot_blocking(mode: Option<String>) -> Result<String, String> {
+pub(crate) fn public_ip_snapshot_blocking(mode: Option<String>) -> Result<String, String> {
     let normalized_mode = mode.unwrap_or_else(|| "direct".to_string()).to_lowercase();
 
     if normalized_mode == "runtime" {
@@ -39,7 +41,101 @@ fn public_ip_snapshot_blocking(mode: Option<String>) -> Result<String, String> {
     fetch_public_ip(&client)
 }
 
-fn secure_access_key_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) const CLIENT_STATE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const NATIVE_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
+pub(crate) const VKARMANI_ACCESS_KEY_PREFIX: &str = "https://sub.vkarmani.com/";
+
+pub(crate) fn atomic_write_text(path: &Path, payload: &str, context: &str) -> Result<(), String> {
+    if payload.len() as u64 > CLIENT_STATE_MAX_BYTES {
+        return Err(format!("{context}: файл настроек слишком большой"));
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{context}: не удалось определить папку для файла"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("{context}: не удалось создать папку для файла: {error}"))?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("client-state");
+    let write_nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let tmp_path = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        write_nonce
+    ));
+    let backup_path = parent.join(format!(".{file_name}.bak"));
+
+    {
+        let mut file = File::create(&tmp_path)
+            .map_err(|error| format!("{context}: не удалось создать временный файл: {error}"))?;
+        file.write_all(payload.as_bytes())
+            .map_err(|error| format!("{context}: не удалось записать временный файл: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("{context}: не удалось синхронизировать временный файл: {error}"))?;
+    }
+
+    let backup_created = if path.exists() {
+        fs::copy(path, &backup_path)
+            .map_err(|error| format!("{context}: не удалось создать резервную копию перед заменой файла: {error}"))?;
+        true
+    } else {
+        false
+    };
+
+    match fs::rename(&tmp_path, path) {
+        Ok(()) => {
+            if backup_created {
+                let _ = fs::remove_file(&backup_path);
+            }
+            Ok(())
+        }
+        Err(first_error) => {
+            // Windows не умеет rename поверх существующего файла через std::fs.
+            // Поэтому держим backup и делаем безопасный fallback remove + rename.
+            if path.exists() {
+                fs::remove_file(path)
+                    .map_err(|error| format!("{context}: не удалось заменить старый файл: {error}; первая ошибка rename: {first_error}"))?;
+            }
+
+            match fs::rename(&tmp_path, path) {
+                Ok(()) => {
+                    if backup_created {
+                        let _ = fs::remove_file(&backup_path);
+                    }
+                    Ok(())
+                }
+                Err(second_error) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    if backup_created && backup_path.exists() && !path.exists() {
+                        let _ = fs::rename(&backup_path, path);
+                    }
+                    Err(format!(
+                        "{context}: не удалось заменить файл настроек: {second_error}; первая ошибка rename: {first_error}"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn normalize_access_key_for_native(value: &str) -> Result<String, String> {
+    let normalized = value.trim().to_string();
+    if !normalized.to_ascii_lowercase().starts_with(VKARMANI_ACCESS_KEY_PREFIX) {
+        return Err("Ключ VKarmani должен начинаться с https://sub.vkarmani.com/.".to_string());
+    }
+    if normalized.len() < VKARMANI_ACCESS_KEY_PREFIX.len() + 8 {
+        return Err("Ключ VKarmani выглядит слишком коротким.".to_string());
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn secure_access_key_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_local_data_dir()
@@ -48,7 +144,7 @@ fn secure_access_key_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("access-key.dpapi"))
 }
 
-fn client_state_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn client_state_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_local_data_dir()
@@ -57,7 +153,7 @@ fn client_state_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("client-state-v1.json"))
 }
 
-fn is_allowed_client_state_key(key: &str) -> bool {
+pub(crate) fn is_allowed_client_state_key(key: &str) -> bool {
     matches!(
         key,
         "settings"
@@ -68,10 +164,16 @@ fn is_allowed_client_state_key(key: &str) -> bool {
     )
 }
 
-fn read_client_state_map(app: &AppHandle) -> Result<serde_json::Map<String, Value>, String> {
+pub(crate) fn read_client_state_map(app: &AppHandle) -> Result<serde_json::Map<String, Value>, String> {
     let path = client_state_path(app)?;
     if !path.exists() {
         return Ok(serde_json::Map::new());
+    }
+
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("Не удалось проверить сохранённые настройки клиента: {error}"))?;
+    if metadata.len() > CLIENT_STATE_MAX_BYTES {
+        return Err("Файл сохранённых настроек клиента слишком большой и не будет загружен.".to_string());
     }
 
     let raw = fs::read_to_string(&path)
@@ -81,14 +183,32 @@ fn read_client_state_map(app: &AppHandle) -> Result<serde_json::Map<String, Valu
         return Ok(serde_json::Map::new());
     }
 
-    let value: Value = serde_json::from_str(&raw)
-        .map_err(|error| format!("Не удалось разобрать сохранённые настройки клиента: {error}"))?;
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            let backup_name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(|name| format!("{name}.corrupt-{}", unix_timestamp_seconds()))
+                .unwrap_or_else(|| format!("client-state-v1.json.corrupt-{}", unix_timestamp_seconds()));
+            let backup_path = path.with_file_name(backup_name);
+            let _ = fs::copy(&path, &backup_path);
+            let _ = append_interface_event(
+                app,
+                &format!(
+                    "Сохранённые настройки клиента повреждены и не будут загружены: {error}. Backup: {}",
+                    backup_path.display()
+                ),
+            );
+            return Ok(serde_json::Map::new());
+        }
+    };
 
     Ok(value.as_object().cloned().unwrap_or_default())
 }
 
 #[tauri::command]
-fn save_client_state_value(key: String, value: String, app: AppHandle) -> Result<(), String> {
+pub(crate) fn save_client_state_value(key: String, value: String, app: AppHandle) -> Result<(), String> {
     let normalized_key = key.trim();
     if !is_allowed_client_state_key(normalized_key) {
         return Err("Недопустимый ключ клиентского состояния.".into());
@@ -107,12 +227,12 @@ fn save_client_state_value(key: String, value: String, app: AppHandle) -> Result
     let payload = serde_json::to_string_pretty(&Value::Object(map))
         .map_err(|error| format!("Не удалось подготовить настройки клиента к сохранению: {error}"))?;
 
-    fs::write(client_state_path(&app)?, payload)
-        .map_err(|error| format!("Не удалось сохранить настройки клиента: {error}"))
+    let path = client_state_path(&app)?;
+    atomic_write_text(&path, &payload, "Не удалось сохранить настройки клиента")
 }
 
 #[tauri::command]
-fn load_client_state_value(key: String, app: AppHandle) -> Result<Option<String>, String> {
+pub(crate) fn load_client_state_value(key: String, app: AppHandle) -> Result<Option<String>, String> {
     let normalized_key = key.trim();
     if !is_allowed_client_state_key(normalized_key) {
         return Err("Недопустимый ключ клиентского состояния.".into());
@@ -125,7 +245,7 @@ fn load_client_state_value(key: String, app: AppHandle) -> Result<Option<String>
 }
 
 #[tauri::command]
-fn clear_client_state_value(key: String, app: AppHandle) -> Result<(), String> {
+pub(crate) fn clear_client_state_value(key: String, app: AppHandle) -> Result<(), String> {
     let normalized_key = key.trim();
     if !is_allowed_client_state_key(normalized_key) {
         return Err("Недопустимый ключ клиентского состояния.".into());
@@ -138,72 +258,128 @@ fn clear_client_state_value(key: String, app: AppHandle) -> Result<(), String> {
     let payload = serde_json::to_string_pretty(&Value::Object(map))
         .map_err(|error| format!("Не удалось подготовить настройки клиента к сохранению: {error}"))?;
 
-    fs::write(client_state_path(&app)?, payload)
-        .map_err(|error| format!("Не удалось сохранить настройки клиента: {error}"))
+    let path = client_state_path(&app)?;
+    atomic_write_text(&path, &payload, "Не удалось сохранить настройки клиента")
 }
 
 
 #[cfg(target_os = "windows")]
-fn encrypt_access_key(value: &str) -> Result<String, String> {
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Security
-$plain = [Environment]::GetEnvironmentVariable('VKARMANI_ACCESS_KEY_PLAINTEXT', 'Process')
-$bytes = [System.Text.Encoding]::UTF8.GetBytes($plain)
-$encrypted = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-[Convert]::ToBase64String($encrypted)
-"#;
-    run_powershell_with_env(script, &[("VKARMANI_ACCESS_KEY_PLAINTEXT".to_string(), value.to_string())])
+pub(crate) fn encrypt_access_key(value: &str) -> Result<String, String> {
+    let mut input = DataBlob {
+        cb_data: value.as_bytes().len() as u32,
+        pb_data: value.as_bytes().as_ptr() as *mut u8,
+    };
+    let mut output = DataBlob {
+        cb_data: 0,
+        pb_data: null_mut(),
+    };
+
+    let ok = unsafe {
+        CryptProtectData(
+            &mut input,
+            null(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+
+    if ok == 0 {
+        return Err(format!("DPAPI CryptProtectData не смог зашифровать ключ: {}", std::io::Error::last_os_error()));
+    }
+
+    let encrypted = unsafe { slice::from_raw_parts(output.pb_data, output.cb_data as usize).to_vec() };
+    unsafe {
+        LocalFree(output.pb_data as *mut core::ffi::c_void);
+    }
+
+    Ok(general_purpose::STANDARD.encode(encrypted))
 }
 
 #[cfg(target_os = "windows")]
-fn decrypt_access_key(value: &str) -> Result<String, String> {
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Security
-$blob = [Environment]::GetEnvironmentVariable('VKARMANI_ACCESS_KEY_BLOB', 'Process')
-$encrypted = [Convert]::FromBase64String($blob)
-$bytes = [System.Security.Cryptography.ProtectedData]::Unprotect($encrypted, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-[System.Text.Encoding]::UTF8.GetString($bytes)
-"#;
-    run_powershell_with_env(script, &[("VKARMANI_ACCESS_KEY_BLOB".to_string(), value.to_string())])
+pub(crate) fn decrypt_access_key(value: &str) -> Result<String, String> {
+    let encrypted = general_purpose::STANDARD
+        .decode(value.trim())
+        .map_err(|error| format!("DPAPI blob повреждён или не является base64: {error}"))?;
+
+    let mut input = DataBlob {
+        cb_data: encrypted.len() as u32,
+        pb_data: encrypted.as_ptr() as *mut u8,
+    };
+    let mut output = DataBlob {
+        cb_data: 0,
+        pb_data: null_mut(),
+    };
+
+    let ok = unsafe {
+        CryptUnprotectData(
+            &mut input,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+
+    if ok == 0 {
+        return Err(format!("DPAPI CryptUnprotectData не смог расшифровать ключ: {}", std::io::Error::last_os_error()));
+    }
+
+    let decrypted = unsafe { slice::from_raw_parts(output.pb_data, output.cb_data as usize).to_vec() };
+    unsafe {
+        LocalFree(output.pb_data as *mut core::ffi::c_void);
+    }
+
+    String::from_utf8(decrypted)
+        .map_err(|error| format!("DPAPI вернул не UTF-8 ключ доступа: {error}"))
 }
 
 #[cfg(not(target_os = "windows"))]
-fn encrypt_access_key(value: &str) -> Result<String, String> {
+pub(crate) fn encrypt_access_key(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
 #[cfg(not(target_os = "windows"))]
-fn decrypt_access_key(value: &str) -> Result<String, String> {
+pub(crate) fn decrypt_access_key(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
 #[tauri::command]
-fn save_access_key_secure(value: String, app: AppHandle) -> Result<(), String> {
+pub(crate) fn save_access_key_secure(value: String, app: AppHandle) -> Result<(), String> {
     let normalized = value.trim();
     if normalized.is_empty() {
         return clear_access_key_secure(app);
     }
-    let encrypted = encrypt_access_key(normalized)?;
-    fs::write(secure_access_key_path(&app)?, encrypted)
-        .map_err(|error| format!("Не удалось сохранить ключ доступа в защищённое хранилище: {error}"))
+    let normalized = normalize_access_key_for_native(normalized)?;
+    let encrypted = encrypt_access_key(&normalized)?;
+    let path = secure_access_key_path(&app)?;
+    atomic_write_text(&path, &encrypted, "Не удалось сохранить ключ доступа в защищённое хранилище")
 }
 
 #[tauri::command]
-fn load_access_key_secure(app: AppHandle) -> Result<Option<String>, String> {
+pub(crate) fn load_access_key_secure(app: AppHandle) -> Result<Option<String>, String> {
     let path = secure_access_key_path(&app)?;
     if !path.exists() {
         return Ok(None);
     }
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("Не удалось проверить защищённый ключ доступа: {error}"))?;
+    if metadata.len() > 64 * 1024 {
+        return Err("Файл защищённого ключа выглядит слишком большим и не будет загружен.".to_string());
+    }
+
     let encrypted = fs::read_to_string(path)
         .map_err(|error| format!("Не удалось прочитать защищённый ключ доступа: {error}"))?;
     let value = decrypt_access_key(encrypted.trim())?;
-    Ok(Some(value))
+    Ok(Some(normalize_access_key_for_native(&value)?))
 }
 
 #[tauri::command]
-fn clear_access_key_secure(app: AppHandle) -> Result<(), String> {
+pub(crate) fn clear_access_key_secure(app: AppHandle) -> Result<(), String> {
     let path = secure_access_key_path(&app)?;
     if path.exists() {
         fs::remove_file(path).map_err(|error| format!("Не удалось удалить сохранённый ключ доступа: {error}"))?;
@@ -214,7 +390,7 @@ fn clear_access_key_secure(app: AppHandle) -> Result<(), String> {
 
 
 #[tauri::command]
-fn bootstrap_info() -> BootstrapInfo {
+pub(crate) fn bootstrap_info() -> BootstrapInfo {
     BootstrapInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         platform: std::env::consts::OS.to_string(),
@@ -222,18 +398,116 @@ fn bootstrap_info() -> BootstrapInfo {
 }
 
 
+pub(crate) fn clear_native_session_authorization(state: &tauri::State<AppState>) -> Result<(), String> {
+    *state
+        .session_authorized
+        .lock()
+        .map_err(|_| "Не удалось обновить состояние авторизации.".to_string())? = false;
+    *state
+        .session_authorization
+        .lock()
+        .map_err(|_| "Не удалось очистить native-сессию.".to_string())? = None;
+    Ok(())
+}
+
+pub(crate) fn ensure_native_session_authorized(app: &AppHandle, state: &tauri::State<AppState>) -> Result<(), String> {
+    let is_authorized = *state
+        .session_authorized
+        .lock()
+        .map_err(|_| "Не удалось проверить состояние авторизации.".to_string())?;
+    if !is_authorized {
+        return Err("Сначала войдите по ключу VKarmani, затем запускайте подключение.".into());
+    }
+
+    let auth = state
+        .session_authorization
+        .lock()
+        .map_err(|_| "Не удалось проверить native-сессию.".to_string())?
+        .clone()
+        .ok_or_else(|| "Native-сессия не подтверждена. Войдите по ключу ещё раз.".to_string())?;
+
+    let now = unix_timestamp_seconds();
+    if auth.expires_at <= now {
+        drop(auth);
+        clear_native_session_authorization(state)?;
+        refresh_tray_menu(app);
+        return Err("Native-сессия устарела. Войдите по ключу VKarmani ещё раз.".into());
+    }
+
+    if auth.access_key_hash.len() != 64 || !auth.access_key_hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("Native-сессия повреждена. Войдите по ключу VKarmani ещё раз.".into());
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
-fn set_session_authorized(authorized: bool, state: tauri::State<AppState>, app: AppHandle) -> Result<bool, String> {
-    if let Ok(mut guard) = state.session_authorized.lock() {
-        *guard = authorized;
+pub(crate) fn set_tray_update_state(
+    available: bool,
+    busy: bool,
+    state: tauri::State<AppState>,
+    app: AppHandle,
+) -> Result<bool, String> {
+    *state
+        .tray_update_available
+        .lock()
+        .map_err(|_| "Не удалось обновить состояние обновлений в трее.".to_string())? = available;
+    *state
+        .tray_update_busy
+        .lock()
+        .map_err(|_| "Не удалось обновить статус проверки обновлений в трее.".to_string())? = busy;
+
+    let _ = append_interface_event(
+        &app,
+        if busy {
+            "Tray updater: действие обновления выполняется, пункт меню временно заблокирован."
+        } else if available {
+            "Tray updater: найдено обновление, пункт меню изменён на установку."
+        } else {
+            "Tray updater: обновлений нет, пункт меню изменён на проверку."
+        },
+    );
+    refresh_tray_menu(&app);
+    Ok(true)
+}
+
+#[tauri::command]
+pub(crate) fn set_session_authorized(
+    authorized: bool,
+    access_key: Option<String>,
+    state: tauri::State<AppState>,
+    app: AppHandle,
+) -> Result<bool, String> {
+    if authorized {
+        let normalized_access_key = normalize_access_key_for_native(
+            access_key
+                .as_deref()
+                .ok_or_else(|| "Для подтверждения native-сессии нужен ключ доступа.".to_string())?,
+        )?;
+        let now = unix_timestamp_seconds();
+        let auth = NativeSessionAuthorization {
+            access_key_hash: sha256_hex_bytes(normalized_access_key.as_bytes()),
+            expires_at: now.saturating_add(NATIVE_SESSION_TTL_SECONDS),
+        };
+
+        *state
+            .session_authorized
+            .lock()
+            .map_err(|_| "Не удалось обновить состояние авторизации.".to_string())? = true;
+        *state
+            .session_authorization
+            .lock()
+            .map_err(|_| "Не удалось сохранить native-сессию.".to_string())? = Some(auth);
+    } else {
+        clear_native_session_authorization(&state)?;
     }
 
     let _ = append_interface_event(
         &app,
         if authorized {
-            "Сессия ЛК активна: обновляем меню трея."
+            "Сессия ЛК активна: native-сессия подтверждена и меню трея обновлено."
         } else {
-            "Сессия ЛК завершена: обновляем меню трея."
+            "Сессия ЛК завершена: native-сессия очищена и меню трея обновлено."
         },
     );
     refresh_tray_menu(&app);
@@ -241,7 +515,7 @@ fn set_session_authorized(authorized: bool, state: tauri::State<AppState>, app: 
 }
 
 #[tauri::command]
-async fn runtime_status(app: AppHandle) -> RuntimeStatus {
+pub(crate) async fn runtime_status(app: AppHandle) -> RuntimeStatus {
     let app_for_task = app.clone();
     match tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_task.state::<AppState>();
@@ -257,7 +531,7 @@ async fn runtime_status(app: AppHandle) -> RuntimeStatus {
     }
 }
 
-fn wait_for_xray_runtime_ready(
+pub(crate) fn wait_for_xray_runtime_ready(
     app: &AppHandle,
     state: &tauri::State<AppState>,
     child: &mut Child,
@@ -266,9 +540,9 @@ fn wait_for_xray_runtime_ready(
     network_mode: &str,
 ) -> Result<(), String> {
     let timeout = if network_mode == "tun" {
-        Duration::from_millis(6500)
+        Duration::from_millis(15_000)
     } else {
-        Duration::from_millis(4500)
+        Duration::from_millis(10_000)
     };
     let started_at = Instant::now();
     loop {
@@ -336,21 +610,29 @@ fn wait_for_xray_runtime_ready(
 }
 
 #[tauri::command]
-async fn request_connect(
+pub(crate) async fn request_connect(
     server_id: String,
     server_label: String,
+    server_fingerprint: Option<String>,
     runtime_template: RuntimeTemplate,
     network_mode: Option<String>,
+    ip_stack: Option<String>,
+    reconnect: Option<bool>,
     split_tunnel_entries: Option<Vec<SplitTunnelEntryPayload>>,
+    routing_exclusions: Option<RoutingExclusionSettingsPayload>,
     app: AppHandle,
 ) -> Result<RuntimeStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         request_connect_blocking(
             server_id,
             server_label,
+            server_fingerprint,
             runtime_template,
             network_mode,
+            ip_stack,
+            reconnect,
             split_tunnel_entries,
+            routing_exclusions,
             app,
         )
     })
@@ -358,31 +640,46 @@ async fn request_connect(
     .map_err(|error| format!("Подключение Xray было прервано: {error}"))?
 }
 
-fn request_connect_blocking(
+pub(crate) fn validate_xray_config_with_core(core_path: &Path, config_path: &Path) -> Result<(), String> {
+    let core_working_dir = core_path.parent().ok_or_else(|| {
+        "Не удалось определить рабочую папку Xray-core для проверки config.".to_string()
+    })?;
+
+    let mut command = Command::new(core_path);
+    command
+        .current_dir(core_working_dir)
+        .env("XRAY_LOCATION_ASSET", core_working_dir)
+        .env("XRAY_LOCATION_CONFIG", config_path.parent().unwrap_or(core_working_dir))
+        .arg("run")
+        .arg("-test")
+        .arg("-config")
+        .arg(config_path)
+        .stdin(Stdio::null());
+
+    run_command_with_timeout(command, Duration::from_secs(8), "xray config test")
+        .map(|_| ())
+        .map_err(|error| format!("Xray-core не принял runtime-конфиг. Подключение остановлено до запуска процесса: {error}"))
+}
+
+pub(crate) fn request_connect_blocking(
     server_id: String,
     server_label: String,
+    server_fingerprint: Option<String>,
     runtime_template: RuntimeTemplate,
     network_mode: Option<String>,
+    ip_stack: Option<String>,
+    reconnect: Option<bool>,
     split_tunnel_entries: Option<Vec<SplitTunnelEntryPayload>>,
+    routing_exclusions: Option<RoutingExclusionSettingsPayload>,
     app: AppHandle,
 ) -> Result<RuntimeStatus, String> {
     let state = app.state::<AppState>();
-    let authorized = state
-        .session_authorized
-        .lock()
-        .map_err(|_| "Не удалось проверить состояние авторизации.".to_string())
-        .map(|guard| *guard)?;
-    if !authorized {
-        return Err("Сначала войдите по ключу VKarmani, затем запускайте подключение.".into());
-    }
+    ensure_native_session_authorized(&app, &state)?;
 
     if runtime_template.family.to_lowercase() != "xray" {
         return Err("Сейчас поддерживается только Xray runtime family.".into());
     }
-    let _operation_guard = state
-        .operation_lock
-        .try_lock()
-        .map_err(|_| "Runtime уже выполняет другое действие. Повторите через несколько секунд.".to_string())?;
+    let _operation_guard = acquire_operation_lock(&state, Duration::from_secs(8), "connect")?;
 
 
     let core_path = resolve_core_path(&app)
@@ -398,7 +695,64 @@ fn request_connect_blocking(
         _ => "proxy".to_string(),
     };
 
+    let normalized_ip_stack = match ip_stack
+        .unwrap_or_else(|| "ipv4".to_string())
+        .trim()
+        .to_lowercase()
+        .as_str()
+    {
+        "ipv6" | "6" => "ipv6".to_string(),
+        _ => "ipv4".to_string(),
+    };
+
+    if normalized_network_mode == "tun" && normalized_ip_stack == "ipv6" {
+        return Err("IPv6 режим сейчас доступен только для Proxy. TUN оставлен IPv4-only, чтобы не получить IPv6 loop/leak при переключении маршрутов Windows. Выберите IPv4 или используйте Proxy режим.".into());
+    }
+
+    let reconnect_requested = reconnect.unwrap_or(false);
+
+    let active_split_tunnel_entries = split_tunnel_entries
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.enabled && !entry.value.trim().is_empty())
+        .collect::<Vec<_>>();
+
+    if normalized_network_mode == "tun" && active_split_tunnel_entries.is_empty() {
+        return Err("Для TUN режима нужно добавить хотя бы одну включённую программу или службу. Пустой TUN не запускается, чтобы случайно не пустить весь трафик мимо VPN.".into());
+    }
+
     let (outbound_host, outbound_port) = extract_outbound_address_and_port(&runtime_template);
+
+    if normalized_network_mode == "tun" && outbound_host.as_deref().map(|value| value.trim()).unwrap_or_default().is_empty() {
+        return Err("TUN режим не может стартовать: в runtime-конфиге не удалось определить адрес VPN-сервера. Выберите другой сервер или используйте Proxy режим.".into());
+    }
+
+    #[cfg(target_os = "windows")]
+    if normalized_network_mode == "tun" && !is_process_elevated()? {
+        return Err("TUN режим требует запуска VKarmani с правами администратора, иначе Windows не даст создать маршруты. Откройте настройки клиента и включите запуск от администратора или перезапустите приложение вручную от имени администратора.".into());
+    }
+
+    stop_existing_runtime(&app, &state, !reconnect_requested)?;
+    stop_orphan_xray_processes(&app, &core_path);
+    if let Err(first_release_error) = wait_for_runtime_ports_release(if reconnect_requested { Duration::from_secs(6) } else { Duration::from_secs(4) }) {
+        let _ = append_runtime_event(
+            &app,
+            &format!("Локальные порты не освободились с первой попытки, выполняю повторную очистку Xray перед стартом нового сервера: {first_release_error}"),
+        );
+        stop_orphan_xray_processes(&app, &core_path);
+        wait_for_runtime_ports_release(Duration::from_secs(4)).map_err(|second_release_error| {
+            format!("{first_release_error}; повторная очистка Xray не освободила порты: {second_release_error}")
+        })?;
+    }
+    if reconnect_requested {
+        let _ = append_runtime_event(&app, "Старый Xray остановлен, локальные порты освобождены, запускаем выбранный сервер без наложения процессов.");
+    }
+    ensure_runtime_ports_available()?;
+
+    // Важно: определяем outbound_ip/sendThrough только после остановки старого runtime.
+    // Иначе при переключении из активного TUN Windows могла вернуть TUN/виртуальный
+    // адрес как основной, новый Xray стартовал с неправильным sendThrough и мог
+    // загнать собственный outbound в петлю с высоким CPU.
     let outbound_ip = outbound_host
         .as_deref()
         .and_then(|host| resolve_ipv4_address(host, outbound_port));
@@ -408,48 +762,74 @@ fn request_connect_blocking(
         None
     };
 
-    #[cfg(target_os = "windows")]
-    if normalized_network_mode == "tun" && !is_process_elevated()? {
-        return Err("TUN режим требует запуска VKarmani с правами администратора, иначе Windows не даст создать маршруты. Откройте настройки клиента и включите запуск от администратора или перезапустите приложение вручную от имени администратора.".into());
+    if normalized_network_mode == "tun" && outbound_ip.is_none() {
+        return Err(format!(
+            "TUN режим пока поддерживает только серверы с IPv4 endpoint. Для сервера {} не удалось получить IPv4 адрес. Выберите другой сервер или используйте Proxy режим.",
+            outbound_host.as_deref().unwrap_or("—")
+        ));
     }
 
     if normalized_network_mode == "tun" && send_through_ip.is_none() {
         return Err("Не удалось определить локальный IPv4 адрес активного сетевого адаптера для TUN режима. Подключитесь к сети без VPN/виртуального адаптера и попробуйте снова.".into());
     }
 
-    stop_existing_runtime(&app, &state)?;
-    stop_orphan_xray_processes(&app, &core_path);
-    ensure_runtime_ports_available()?;
-
     let output_dir = runtime_output_dir(&app)?;
     let _ = cleanup_runtime_config_files(&app);
     let config_path = output_dir.join(format!("xray-config-{}-{}.json", std::process::id(), unix_now_string()));
-    let active_split_tunnel_entries = split_tunnel_entries.unwrap_or_default();
     let runtime_trace_path = runtime_log_path(&app)?;
     let _ = fs::write(&runtime_trace_path, "");
     let log_path = runtime_trace_path.clone();
 
-    let (config, split_tunnel_plan) = build_xray_config(
+    let (config, split_tunnel_plan, routing_exclusion_plan) = build_xray_config(
         &runtime_template,
         &normalized_network_mode,
+        &normalized_ip_stack,
         send_through_ip.as_deref(),
         &active_split_tunnel_entries,
+        routing_exclusions.as_ref(),
         Some(runtime_trace_path.as_path()),
     );
+
+    if normalized_network_mode == "tun" && split_tunnel_plan.process_matches.is_empty() {
+        for note in &split_tunnel_plan.skipped_notes {
+            let _ = append_runtime_event(&app, note);
+        }
+        return Err("TUN режим не запущен: выбранные программы/службы не удалось превратить в безопасные правила процессов. Добавьте обычный .exe файл приложения или выберите Proxy режим.".into());
+    }
+
     let config_text = serde_json::to_string_pretty(&config)
         .map_err(|error| format!("Не удалось сериализовать config: {error}"))?;
     fs::write(&config_path, config_text).map_err(|error| format!("Не удалось записать config: {error}"))?;
 
+    validate_xray_config_with_core(&core_path, &config_path).map_err(|error| {
+        let _ = append_runtime_event(&app, &error);
+        error
+    })?;
+
     if normalized_network_mode == "tun" {
         let core_dir = core_path.parent().map(|value| value.to_path_buf());
-        let geoip_exists = core_dir
+        let geoip_status = core_dir
             .as_ref()
-            .map(|dir| dir.join("geoip.dat").exists())
-            .unwrap_or(false);
-        let geosite_exists = core_dir
+            .map(|dir| {
+                let path = dir.join("geoip.dat");
+                if !path.exists() {
+                    "нет файла".to_string()
+                } else {
+                    verify_core_manifest_artifact(&path, "geoip.dat").map(|_| "ok".to_string()).unwrap_or_else(|error| error)
+                }
+            })
+            .unwrap_or_else(|| "не удалось определить папку core".to_string());
+        let geosite_status = core_dir
             .as_ref()
-            .map(|dir| dir.join("geosite.dat").exists())
-            .unwrap_or(false);
+            .map(|dir| {
+                let path = dir.join("geosite.dat");
+                if !path.exists() {
+                    "нет файла".to_string()
+                } else {
+                    verify_core_manifest_artifact(&path, "geosite.dat").map(|_| "ok".to_string()).unwrap_or_else(|error| error)
+                }
+            })
+            .unwrap_or_else(|| "не удалось определить папку core".to_string());
         let wintun_status = core_dir
             .as_ref()
             .map(|dir| {
@@ -457,7 +837,7 @@ fn request_connect_blocking(
                 if !path.exists() {
                     "нет файла".to_string()
                 } else {
-                    validate_pe_binary(&path, "wintun.dll").map(|_| "ok".to_string()).unwrap_or_else(|error| error)
+                    validate_core_sidecar_path(&path, "wintun.dll").map(|_| "ok".to_string()).unwrap_or_else(|error| error)
                 }
             })
             .unwrap_or_else(|| "не удалось определить папку core".to_string());
@@ -469,8 +849,8 @@ fn request_connect_blocking(
                 core_path.display(),
                 config_path.display(),
                 log_path.display(),
-                geoip_exists,
-                geosite_exists,
+                geoip_status,
+                geosite_status,
                 wintun_status,
                 outbound_host.as_deref().unwrap_or("—"),
                 outbound_ip.as_deref().unwrap_or("—"),
@@ -492,34 +872,43 @@ fn request_connect_blocking(
     append_runtime_event(
         &app,
         &format!(
-            "Запуск Xray runtime для {server_label} · mode={} · protocol={} · remarks={}",
+            "Запуск Xray runtime для {server_label} · mode={} · protocol={} · reconnect={} · remarks={}",
             normalized_network_mode,
             runtime_template.protocol,
+            reconnect_requested,
             runtime_template.remarks.unwrap_or_else(|| "—".into())
         ),
     )?;
 
     if normalized_network_mode == "tun" {
-        if split_tunnel_plan.process_matches.is_empty() {
-            let _ = append_runtime_event(
-                &app,
-                "TUN selective mode: список программ пуст, поэтому невыбранный трафик будет обходить VPN напрямую.",
-            );
-        } else {
-            let _ = append_runtime_event(
-                &app,
-                &format!(
-                    "TUN selective mode: {} app rule(s), {} service rule(s), total process matches {}.",
-                    split_tunnel_plan.resolved_apps,
-                    split_tunnel_plan.resolved_services,
-                    split_tunnel_plan.process_matches.len()
-                ),
-            );
-        }
+        let _ = append_runtime_event(
+            &app,
+            &format!(
+                "TUN selective mode: {} app rule(s), {} service rule(s), total process matches {}.",
+                split_tunnel_plan.resolved_apps,
+                split_tunnel_plan.resolved_services,
+                split_tunnel_plan.process_matches.len()
+            ),
+        );
 
         for note in &split_tunnel_plan.skipped_notes {
             let _ = append_runtime_event(&app, note);
         }
+    }
+
+    if !routing_exclusion_plan.domain_rules.is_empty() || !routing_exclusion_plan.ip_rules.is_empty() {
+        let _ = append_runtime_event(
+            &app,
+            &format!(
+                "Routing exclusions active: {} domain rule(s), {} IPv4/CIDR rule(s) routed direct outside VPN.",
+                routing_exclusion_plan.domain_rules.len(),
+                routing_exclusion_plan.ip_rules.len()
+            ),
+        );
+    }
+
+    for note in &routing_exclusion_plan.skipped_notes {
+        let _ = append_runtime_event(&app, note);
     }
 
     let stdout_file = OpenOptions::new()
@@ -552,14 +941,23 @@ fn request_connect_blocking(
         .spawn()
         .map_err(|error| format_xray_spawn_error(&error, &core_path))?;
 
-    wait_for_xray_runtime_ready(
+    if let Err(error) = wait_for_xray_runtime_ready(
         &app,
         &state,
         &mut child,
         &log_path,
         core_working_dir,
         &normalized_network_mode,
-    )?;
+    ) {
+        let _ = append_runtime_event(
+            &app,
+            &format!("Xray runtime не стал готовым после запуска, выполняю аварийную очистку: {error}"),
+        );
+        let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref());
+        let _ = restore_saved_proxy_state(&app, &state, "connect_readiness_failed");
+        let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+        return Err(error);
+    }
 
     if normalized_network_mode == "tun" {
         configure_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref()).map_err(|error| {
@@ -567,6 +965,19 @@ fn request_connect_blocking(
             let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
             format!("Не удалось подготовить Windows-маршруты для TUN режима: {error}")
         })?;
+        if let Err(error) = apply_tun_ipv6_route_guard(TUN_INTERFACE_NAME) {
+            let _ = append_runtime_event(
+                &app,
+                &format!("TUN IPv6 leak guard не применился, подключение остановлено для защиты от утечек IPv6: {error}"),
+            );
+            let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref());
+            let _ = restore_saved_proxy_state(&app, &state, "tun_ipv6_guard_failed");
+            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+            return Err(format!(
+                "Не удалось включить защиту TUN от IPv6-утечек: {error}. Подключение остановлено, чтобы не пропускать IPv6 мимо VPN."
+            ));
+        }
+        let _ = append_runtime_event(&app, "TUN IPv6 leak guard применён: IPv6 split-default направлен в TUN, Xray дополнительно блокирует IPv6 на tun-in.");
         let _ = append_runtime_event(&app, "TUN маршруты применены для текущего сеанса.");
     }
 
@@ -589,6 +1000,7 @@ fn request_connect_blocking(
             config_path: config_path.to_string_lossy().to_string(),
             log_path: log_path.to_string_lossy().to_string(),
             server_id: server_id.clone(),
+            server_fingerprint: server_fingerprint.clone().filter(|value| !value.trim().is_empty()),
             started_at: unix_now_string(),
             network_mode: normalized_network_mode.clone(),
             tun_interface_name: if normalized_network_mode == "tun" {
@@ -613,20 +1025,17 @@ fn request_connect_blocking(
 }
 
 #[tauri::command]
-async fn request_disconnect(app: AppHandle) -> Result<RuntimeStatus, String> {
+pub(crate) async fn request_disconnect(app: AppHandle) -> Result<RuntimeStatus, String> {
     tauri::async_runtime::spawn_blocking(move || request_disconnect_blocking(app))
         .await
         .map_err(|error| format!("Отключение Xray было прервано: {error}"))?
 }
 
-fn request_disconnect_blocking(app: AppHandle) -> Result<RuntimeStatus, String> {
+pub(crate) fn request_disconnect_blocking(app: AppHandle) -> Result<RuntimeStatus, String> {
     let state = app.state::<AppState>();
-    let _operation_guard = state
-        .operation_lock
-        .try_lock()
-        .map_err(|_| "Runtime уже выполняет другое действие. Повторите через несколько секунд.".to_string())?;
+    let _operation_guard = acquire_operation_lock(&state, Duration::from_secs(8), "runtime-operation")?;
 
-    stop_existing_runtime(&app, &state)?;
+    stop_existing_runtime(&app, &state, true)?;
 
     if let Ok(mut guard) = state.connected.lock() {
         *guard = false;
@@ -644,7 +1053,7 @@ fn request_disconnect_blocking(app: AppHandle) -> Result<RuntimeStatus, String> 
 }
 
 #[tauri::command]
-fn cache_profile_sync(profile_count: usize, source: String, state: tauri::State<AppState>, app: AppHandle) {
+pub(crate) fn cache_profile_sync(profile_count: usize, source: String, state: tauri::State<AppState>, app: AppHandle) {
     if let Ok(mut guard) = state.profile_count.lock() {
         *guard = profile_count;
     }
@@ -660,19 +1069,19 @@ fn cache_profile_sync(profile_count: usize, source: String, state: tauri::State<
 }
 
 #[tauri::command]
-fn request_show(app: AppHandle) {
+pub(crate) fn request_show(app: AppHandle) {
     let _ = append_interface_event(&app, "Окно приложения раскрыто пользователем.");
     reveal_main_window(&app);
 }
 
 #[tauri::command]
-fn window_minimize(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
+pub(crate) fn window_minimize(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
     let _ = append_interface_event(&app, "Главное окно свёрнуто.");
     window.minimize().map_err(|error| format!("Не удалось свернуть окно: {error}"))
 }
 
 #[tauri::command]
-fn window_toggle_maximize(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
+pub(crate) fn window_toggle_maximize(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
     let is_maximized = window
         .is_maximized()
         .map_err(|error| format!("Не удалось прочитать состояние окна: {error}"))?;
@@ -691,19 +1100,19 @@ fn window_toggle_maximize(window: tauri::WebviewWindow, app: AppHandle) -> Resul
 }
 
 #[tauri::command]
-fn window_close(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
+pub(crate) fn window_close(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
     let _ = append_interface_event(&app, "Главное окно закрыто.");
     window.close().map_err(|error| format!("Не удалось закрыть окно: {error}"))
 }
 
 #[tauri::command]
-fn window_hide(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
+pub(crate) fn window_hide(window: tauri::WebviewWindow, app: AppHandle) -> Result<(), String> {
     let _ = append_interface_event(&app, "Главное окно скрыто в трей.");
     window.hide().map_err(|error| format!("Не удалось скрыть окно: {error}"))
 }
 
 #[tauri::command]
-fn ensure_admin_launch(app: AppHandle) -> Result<bool, String> {
+pub(crate) fn ensure_admin_launch(app: AppHandle) -> Result<bool, String> {
     #[cfg(all(not(debug_assertions), target_os = "windows"))]
     {
         if is_process_elevated()? {
@@ -740,7 +1149,7 @@ fn ensure_admin_launch(app: AppHandle) -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn set_launch_on_startup(enabled: bool, app: AppHandle) -> Result<bool, String> {
+pub(crate) fn set_launch_on_startup(enabled: bool, app: AppHandle) -> Result<bool, String> {
     #[cfg(all(target_os = "windows", not(debug_assertions)))]
     {
         let executable = std::env::current_exe()
@@ -776,25 +1185,22 @@ fn set_launch_on_startup(enabled: bool, app: AppHandle) -> Result<bool, String> 
     }
 }
 #[tauri::command]
-async fn proxy_status() -> Result<ProxyStatus, String> {
+pub(crate) async fn proxy_status() -> Result<ProxyStatus, String> {
     tauri::async_runtime::spawn_blocking(current_proxy_snapshot)
         .await
         .map_err(|error| format!("Проверка Windows proxy была прервана: {error}"))?
 }
 
 #[tauri::command]
-async fn set_system_proxy(enabled: bool, app: AppHandle) -> Result<ProxyStatus, String> {
+pub(crate) async fn set_system_proxy(enabled: bool, app: AppHandle) -> Result<ProxyStatus, String> {
     tauri::async_runtime::spawn_blocking(move || set_system_proxy_blocking(enabled, app))
         .await
         .map_err(|error| format!("Изменение Windows proxy было прервано: {error}"))?
 }
 
-fn set_system_proxy_blocking(enabled: bool, app: AppHandle) -> Result<ProxyStatus, String> {
+pub(crate) fn set_system_proxy_blocking(enabled: bool, app: AppHandle) -> Result<ProxyStatus, String> {
     let state = app.state::<AppState>();
-    let _operation_guard = state
-        .operation_lock
-        .try_lock()
-        .map_err(|_| "Runtime уже выполняет другое действие. Повторите через несколько секунд.".to_string())?;
+    let _operation_guard = acquire_operation_lock(&state, Duration::from_secs(6), "runtime-operation")?;
 
     let is_connected = state.connected.lock().map(|value| *value).unwrap_or(false);
     if enabled && !is_connected {
@@ -831,13 +1237,38 @@ fn set_system_proxy_blocking(enabled: bool, app: AppHandle) -> Result<ProxyStatu
 
 
 #[tauri::command]
-async fn connectivity_probe() -> Result<ConnectivityProbe, String> {
+pub(crate) async fn repair_runtime_environment(app: AppHandle) -> Result<RuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || repair_runtime_environment_blocking(app))
+        .await
+        .map_err(|error| format!("Восстановление runtime окружения было прервано: {error}"))?
+}
+
+pub(crate) fn repair_runtime_environment_blocking(app: AppHandle) -> Result<RuntimeStatus, String> {
+    let state = app.state::<AppState>();
+    let _operation_guard = acquire_operation_lock(&state, Duration::from_secs(6), "runtime-operation")?;
+
+    let is_connected = state.connected.lock().map(|value| *value).unwrap_or(false);
+    if is_connected {
+        return Err("Сначала отключите VPN, затем запускайте восстановление runtime окружения.".into());
+    }
+
+    let _ = restore_saved_proxy_state(&app, &state, "manual_runtime_repair");
+    let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, None);
+    let _ = cleanup_runtime_config_files(&app);
+    let _ = append_runtime_event(&app, "Выполнено ручное восстановление runtime окружения: proxy/routes/runtime-config cleanup.");
+    refresh_tray_menu(&app);
+    drop(_operation_guard);
+    Ok(build_runtime_status(&app, state))
+}
+
+#[tauri::command]
+pub(crate) async fn connectivity_probe() -> Result<ConnectivityProbe, String> {
     tauri::async_runtime::spawn_blocking(connectivity_probe_blocking)
         .await
         .map_err(|error| format!("Проверка маршрута была прервана: {error}"))?
 }
 
-fn connectivity_probe_blocking() -> Result<ConnectivityProbe, String> {
+pub(crate) fn connectivity_probe_blocking() -> Result<ConnectivityProbe, String> {
     let checked_at = unix_now_string();
     let http_port_open = tcp_port_open("127.0.0.1", HTTP_PORT, 1200);
     let socks_port_open = tcp_port_open("127.0.0.1", SOCKS_PORT, 1200);
@@ -874,7 +1305,7 @@ fn connectivity_probe_blocking() -> Result<ConnectivityProbe, String> {
 
 
 
-fn collect_digits_after_marker(raw: &str, marker: &str) -> Vec<u128> {
+pub(crate) fn collect_digits_after_marker(raw: &str, marker: &str) -> Vec<u128> {
     let mut values = Vec::new();
     let lower = raw.to_lowercase();
     let mut offset = 0usize;
@@ -901,7 +1332,7 @@ fn collect_digits_after_marker(raw: &str, marker: &str) -> Vec<u128> {
     values
 }
 
-fn parse_ping_loss_percent(raw: &str) -> Option<u8> {
+pub(crate) fn parse_ping_loss_percent(raw: &str) -> Option<u8> {
     let lower = raw.to_lowercase();
     for marker in ["loss", "потер"] {
         if let Some(marker_index) = lower.find(marker) {
@@ -928,7 +1359,7 @@ fn parse_ping_loss_percent(raw: &str) -> Option<u8> {
     None
 }
 
-fn parse_ping_output(raw: &str) -> Option<(u128, u8)> {
+pub(crate) fn parse_ping_output(raw: &str) -> Option<(u128, u8)> {
     let mut samples = Vec::new();
     for marker in ["time=", "time<", "время=", "время<"] {
         samples.extend(collect_digits_after_marker(raw, marker));
@@ -962,7 +1393,7 @@ fn parse_ping_output(raw: &str) -> Option<(u128, u8)> {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_icmp_ping(host: &str) -> Option<(u128, u8)> {
+pub(crate) fn windows_icmp_ping(host: &str) -> Option<(u128, u8)> {
     let normalized_host = normalize_socket_host(host);
     if normalized_host.is_empty() {
         return None;
@@ -983,11 +1414,11 @@ fn windows_icmp_ping(host: &str) -> Option<(u128, u8)> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn windows_icmp_ping(_host: &str) -> Option<(u128, u8)> {
+pub(crate) fn windows_icmp_ping(_host: &str) -> Option<(u128, u8)> {
     None
 }
 
-fn tcp_connect_latency(addresses: &[std::net::SocketAddr], timeout: Duration) -> Option<u128> {
+pub(crate) fn tcp_connect_latency(addresses: &[std::net::SocketAddr], timeout: Duration) -> Option<u128> {
     let mut best: Option<u128> = None;
     let mut ordered = addresses.to_vec();
     ordered.sort_by_key(|address| if address.is_ipv4() { 0 } else { 1 });
@@ -1004,7 +1435,7 @@ fn tcp_connect_latency(addresses: &[std::net::SocketAddr], timeout: Duration) ->
 }
 
 
-fn run_tcp_ping_samples(addresses: &[std::net::SocketAddr], attempts: u8, timeout: Duration) -> (u8, Option<u128>, u8) {
+pub(crate) fn run_tcp_ping_samples(addresses: &[std::net::SocketAddr], attempts: u8, timeout: Duration) -> (u8, Option<u128>, u8) {
     let safe_attempts = attempts.max(1);
     let mut success_count: u8 = 0;
     let mut total_ms: u128 = 0;
@@ -1030,7 +1461,78 @@ fn run_tcp_ping_samples(addresses: &[std::net::SocketAddr], attempts: u8, timeou
     (success_count, latency_ms, packet_loss)
 }
 
-fn server_ping_blocking(host: String, port: u16) -> Result<ConnectivityProbe, String> {
+#[cfg(target_os = "windows")]
+pub(crate) fn active_tun_server_ip_for_ping(app: &AppHandle) -> Option<String> {
+    let state = app.state::<AppState>();
+    let connected = state.connected.lock().map(|value| *value).unwrap_or(false);
+    if !connected {
+        return None;
+    }
+
+    state.runtime.lock().ok().and_then(|runtime_guard| {
+        runtime_guard.as_ref().and_then(|runtime| {
+            if runtime.network_mode.eq_ignore_ascii_case("tun") {
+                runtime.tun_server_ip.clone()
+            } else {
+                None
+            }
+        })
+    })
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn add_temporary_direct_routes_for_ping(app: Option<&AppHandle>, addresses: &[std::net::SocketAddr]) -> Vec<String> {
+    let Some(app) = app else {
+        return Vec::new();
+    };
+
+    let Some(active_tun_server_ip) = active_tun_server_ip_for_ping(app) else {
+        return Vec::new();
+    };
+
+    let default_route = match default_route_snapshot() {
+        Ok(route) if !route.next_hop.trim().is_empty() && route.next_hop != "0.0.0.0" => route,
+        _ => return Vec::new(),
+    };
+
+    let mut added_routes: Vec<String> = Vec::new();
+    for address in addresses {
+        let ip = match address.ip() {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(_) => continue,
+        };
+
+        if ip == active_tun_server_ip || added_routes.iter().any(|item| item == &ip) {
+            continue;
+        }
+
+        // Во время активного TUN split-default отправляет все публичные IPv4 в Wintun.
+        // Для проверки ping других VPN-нод временно добавляем /32 escape route через
+        // физический gateway. Иначе зелёным обычно остаётся только текущий сервер.
+        if route_add(&ip, "255.255.255.255", &default_route.next_hop, 2, None).is_ok() {
+            added_routes.push(ip);
+        }
+    }
+
+    added_routes
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn add_temporary_direct_routes_for_ping(_app: Option<&AppHandle>, _addresses: &[std::net::SocketAddr]) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn cleanup_temporary_direct_routes_for_ping(added_routes: &[String]) {
+    for ip in added_routes {
+        route_delete(ip, "255.255.255.255", None, None);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn cleanup_temporary_direct_routes_for_ping(_added_routes: &[String]) {}
+
+pub(crate) fn server_ping_blocking(host: String, port: u16, app: Option<AppHandle>) -> Result<ConnectivityProbe, String> {
     let checked_at = unix_now_string();
     let normalized_host = normalize_socket_host(&host);
     if normalized_host.is_empty() {
@@ -1038,12 +1540,14 @@ fn server_ping_blocking(host: String, port: u16) -> Result<ConnectivityProbe, St
     }
 
     let addresses = resolve_socket_addresses(&normalized_host, port)?;
+    let temporary_direct_routes = add_temporary_direct_routes_for_ping(app.as_ref(), &addresses);
     let endpoint = format_endpoint_for_display(&normalized_host, port);
 
     // Для VPN-сервера важнее не ICMP, а доступность реального host:port.
     // Поэтому TCP-проверка идёт первой и с короткими timeout, чтобы UI не выглядел зависшим.
     let (success_count, latency_ms, packet_loss) = run_tcp_ping_samples(&addresses, 3, Duration::from_millis(850));
     if success_count > 0 {
+        cleanup_temporary_direct_routes_for_ping(&temporary_direct_routes);
         return Ok(ConnectivityProbe {
             success: true,
             checked_at,
@@ -1063,6 +1567,7 @@ fn server_ping_blocking(host: String, port: u16) -> Result<ConnectivityProbe, St
     // ICMP используем только как диагностику. Если ICMP отвечает, но TCP-порт закрыт,
     // сервер не считаем рабочим для подключения, чтобы не показывать ложный зелёный ping.
     if let Some((icmp_latency_ms, icmp_packet_loss)) = windows_icmp_ping(&normalized_host) {
+        cleanup_temporary_direct_routes_for_ping(&temporary_direct_routes);
         return Ok(ConnectivityProbe {
             success: false,
             checked_at,
@@ -1077,6 +1582,8 @@ fn server_ping_blocking(host: String, port: u16) -> Result<ConnectivityProbe, St
         });
     }
 
+    cleanup_temporary_direct_routes_for_ping(&temporary_direct_routes);
+
     Ok(ConnectivityProbe {
         success: false,
         checked_at,
@@ -1090,13 +1597,13 @@ fn server_ping_blocking(host: String, port: u16) -> Result<ConnectivityProbe, St
 }
 
 #[tauri::command]
-async fn server_ping(host: String, port: u16) -> Result<ConnectivityProbe, String> {
-    tauri::async_runtime::spawn_blocking(move || server_ping_blocking(host, port))
+pub(crate) async fn server_ping(host: String, port: u16, app: AppHandle) -> Result<ConnectivityProbe, String> {
+    tauri::async_runtime::spawn_blocking(move || server_ping_blocking(host, port, Some(app)))
         .await
         .map_err(|error| format!("Проверка пинга была прервана: {error}"))?
 }
 
-fn parse_xray_stat_value(raw: &str) -> Option<u64> {
+pub(crate) fn parse_xray_stat_value(raw: &str) -> Option<u64> {
     for line in raw.lines() {
         let trimmed = line.trim();
         if let Some(value) = trimmed.strip_prefix("value:") {
@@ -1109,7 +1616,7 @@ fn parse_xray_stat_value(raw: &str) -> Option<u64> {
     None
 }
 
-fn query_xray_stat(core_path: &str, stat_name: &str) -> Result<u64, String> {
+pub(crate) fn query_xray_stat(core_path: &str, stat_name: &str) -> Result<u64, String> {
     let mut command = Command::new(core_path);
     command
         .arg("api")
@@ -1125,7 +1632,7 @@ fn query_xray_stat(core_path: &str, stat_name: &str) -> Result<u64, String> {
     Ok(parse_xray_stat_value(&output).unwrap_or(0))
 }
 
-fn runtime_xray_stats_snapshot(state: &tauri::State<AppState>) -> Option<TrafficSnapshot> {
+pub(crate) fn runtime_xray_stats_snapshot(state: &tauri::State<AppState>) -> Option<TrafficSnapshot> {
     if !tcp_port_open("127.0.0.1", XRAY_API_PORT, 120) {
         return None;
     }
@@ -1148,7 +1655,7 @@ fn runtime_xray_stats_snapshot(state: &tauri::State<AppState>) -> Option<Traffic
 }
 
 #[cfg(target_os = "windows")]
-fn windows_tun_traffic_snapshot() -> Option<TrafficSnapshot> {
+pub(crate) fn windows_tun_traffic_snapshot() -> Option<TrafficSnapshot> {
     let script = format!(
         r#"
 $ErrorActionPreference = 'SilentlyContinue'
@@ -1174,18 +1681,18 @@ if ($stats) {{
 }
 
 #[cfg(not(target_os = "windows"))]
-fn windows_tun_traffic_snapshot() -> Option<TrafficSnapshot> {
+pub(crate) fn windows_tun_traffic_snapshot() -> Option<TrafficSnapshot> {
     None
 }
 
 #[tauri::command]
-async fn traffic_snapshot(app: AppHandle) -> Result<TrafficSnapshot, String> {
+pub(crate) async fn traffic_snapshot(app: AppHandle) -> Result<TrafficSnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || traffic_snapshot_blocking(app))
         .await
         .map_err(|error| format!("Получение статистики трафика было прервано: {error}"))?
 }
 
-fn traffic_snapshot_blocking(app: AppHandle) -> Result<TrafficSnapshot, String> {
+pub(crate) fn traffic_snapshot_blocking(app: AppHandle) -> Result<TrafficSnapshot, String> {
     let state = app.state::<AppState>();
     if let Some(snapshot) = runtime_xray_stats_snapshot(&state) {
         return Ok(snapshot);
@@ -1204,7 +1711,7 @@ fn traffic_snapshot_blocking(app: AppHandle) -> Result<TrafficSnapshot, String> 
 }
 
 #[cfg(target_os = "windows")]
-fn parse_wmic_process_list(raw: &str) -> Vec<RunningAppInfo> {
+pub(crate) fn parse_wmic_process_list(raw: &str) -> Vec<RunningAppInfo> {
     raw.lines()
         .skip(1)
         .filter_map(|line| {
@@ -1220,7 +1727,7 @@ fn parse_wmic_process_list(raw: &str) -> Vec<RunningAppInfo> {
 }
 
 #[cfg(target_os = "windows")]
-fn split_csv_line(line: &str) -> Vec<String> {
+pub(crate) fn split_csv_line(line: &str) -> Vec<String> {
     let mut values = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
@@ -1238,7 +1745,7 @@ fn split_csv_line(line: &str) -> Vec<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn parse_tasklist_process_list(raw: &str) -> Vec<RunningAppInfo> {
+pub(crate) fn parse_tasklist_process_list(raw: &str) -> Vec<RunningAppInfo> {
     raw.lines()
         .filter_map(|line| {
             let parts = split_csv_line(line);
@@ -1251,7 +1758,7 @@ fn parse_tasklist_process_list(raw: &str) -> Vec<RunningAppInfo> {
 }
 
 #[cfg(target_os = "windows")]
-fn parse_powershell_process_list(raw: &str) -> Vec<RunningAppInfo> {
+pub(crate) fn parse_powershell_process_list(raw: &str) -> Vec<RunningAppInfo> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -1295,7 +1802,7 @@ fn parse_powershell_process_list(raw: &str) -> Vec<RunningAppInfo> {
 }
 
 #[cfg(target_os = "windows")]
-fn dedupe_and_limit_running_apps(apps: Vec<RunningAppInfo>, limit: usize) -> Vec<RunningAppInfo> {
+pub(crate) fn dedupe_and_limit_running_apps(apps: Vec<RunningAppInfo>, limit: usize) -> Vec<RunningAppInfo> {
     let mut seen = std::collections::HashSet::<String>::new();
     let mut unique = apps
         .into_iter()
@@ -1329,7 +1836,7 @@ fn dedupe_and_limit_running_apps(apps: Vec<RunningAppInfo>, limit: usize) -> Vec
 }
 
 #[cfg(target_os = "windows")]
-fn list_running_apps_blocking() -> Result<Vec<RunningAppInfo>, String> {
+pub(crate) fn list_running_apps_blocking() -> Result<Vec<RunningAppInfo>, String> {
     let powershell_script = r#"
 $ErrorActionPreference = 'SilentlyContinue'
 $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -1399,7 +1906,7 @@ $items | Sort-Object @{Expression={ if ([string]::IsNullOrWhiteSpace($_.title)) 
 
 #[cfg(target_os = "windows")]
 #[tauri::command]
-async fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
+pub(crate) async fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
     tauri::async_runtime::spawn_blocking(list_running_apps_blocking)
         .await
         .map_err(|error| format!("Получение списка приложений было прервано: {error}"))?
@@ -1407,11 +1914,11 @@ async fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
 
 #[cfg(not(target_os = "windows"))]
 #[tauri::command]
-async fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
+pub(crate) async fn list_running_apps() -> Result<Vec<RunningAppInfo>, String> {
     Ok(Vec::new())
 }
 
-fn read_xray_version(app: &AppHandle) -> (String, Option<String>) {
+pub(crate) fn read_xray_version(app: &AppHandle) -> (String, Option<String>) {
     let Some(core_path) = resolve_core_path(app) else {
         return ("Не найден".to_string(), None);
     };
@@ -1456,7 +1963,7 @@ fn read_xray_version(app: &AppHandle) -> (String, Option<String>) {
     }
 }
 #[cfg(target_os = "windows")]
-fn read_windows_registry_value(key: &str, value_name: &str) -> Option<String> {
+pub(crate) fn read_windows_registry_value(key: &str, value_name: &str) -> Option<String> {
     let mut command = Command::new("reg");
     command.args(["query", key, "/v", value_name]);
     run_command_with_timeout(command, Duration::from_secs(4), &format!("reg query {value_name}"))
@@ -1467,7 +1974,7 @@ fn read_windows_registry_value(key: &str, value_name: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_device_info() -> (String, String, String, String, String, String) {
+pub(crate) fn windows_device_info() -> (String, String, String, String, String, String) {
     let current_version_key = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion";
     let hwid = read_windows_registry_value(r"HKLM\SOFTWARE\Microsoft\Cryptography", "MachineGuid")
         .unwrap_or_else(|| "—".to_string());
@@ -1487,7 +1994,7 @@ fn windows_device_info() -> (String, String, String, String, String, String) {
     (hwid, product_name, display_version, build, architecture, device_name)
 }
 #[cfg(not(target_os = "windows"))]
-fn windows_device_info() -> (String, String, String, String, String, String) {
+pub(crate) fn windows_device_info() -> (String, String, String, String, String, String) {
     (
         "—".to_string(),
         std::env::consts::OS.to_string(),
@@ -1499,7 +2006,7 @@ fn windows_device_info() -> (String, String, String, String, String, String) {
 }
 
 #[tauri::command]
-fn native_app_info(app: AppHandle) -> NativeAppInfo {
+pub(crate) fn native_app_info(app: AppHandle) -> NativeAppInfo {
     let (xray_version, core_path) = read_xray_version(&app);
     let (hwid, os_name, os_version, os_build, os_architecture, device_name) = windows_device_info();
 
@@ -1518,7 +2025,7 @@ fn native_app_info(app: AppHandle) -> NativeAppInfo {
 
 #[cfg(target_os = "windows")]
 #[tauri::command]
-fn pick_executable_path() -> Result<Option<String>, String> {
+pub(crate) fn pick_executable_path() -> Result<Option<String>, String> {
     let script = r#"
 Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.OpenFileDialog
@@ -1550,12 +2057,12 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
 
 #[cfg(not(target_os = "windows"))]
 #[tauri::command]
-fn pick_executable_path() -> Result<Option<String>, String> {
+pub(crate) fn pick_executable_path() -> Result<Option<String>, String> {
     Ok(None)
 }
 
 #[tauri::command]
-fn restart_application(app: AppHandle) -> Result<(), String> {
+pub(crate) fn restart_application(app: AppHandle) -> Result<(), String> {
     cleanup_application(&app, "restart_application");
     let current_exe = std::env::current_exe().map_err(|error| format!("Не удалось определить путь приложения: {error}"))?;
     let mut command = Command::new(current_exe);
@@ -1568,6 +2075,6 @@ fn restart_application(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn read_runtime_log(app: AppHandle, lines: Option<usize>) -> Result<Vec<String>, String> {
+pub(crate) fn read_runtime_log(app: AppHandle, lines: Option<usize>) -> Result<Vec<String>, String> {
     tail_runtime_log(&app, lines.unwrap_or(20).clamp(1, 200))
 }

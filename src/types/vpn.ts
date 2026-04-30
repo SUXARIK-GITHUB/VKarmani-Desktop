@@ -1,6 +1,6 @@
 export type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnecting';
 export type AppTab = 'overview' | 'support' | 'diagnostics' | 'settings';
-export type ReleaseChannel = 'stable' | 'beta';
+export type ReleaseChannel = 'stable';
 export type UiLanguage = 'ru' | 'en';
 export type AccessKeyKind = 'short-uuid' | 'uuid' | 'url' | 'raw';
 export type ProfileSyncState = 'idle' | 'syncing' | 'ready' | 'error';
@@ -9,8 +9,17 @@ export type RemnawaveSource = 'demo' | 'public-api' | 'panel-api';
 export type RuntimeLaunchMode = 'mock' | 'xray-sidecar';
 export type ProxyMethod = 'wininet-registry' | 'mock';
 export type TunnelMode = 'proxy' | 'tun';
+export type IpStack = 'ipv4' | 'ipv6';
 export type SplitTunnelEntryKind = 'app' | 'service';
 
+export interface RoutingExclusionSettings {
+  enabled: boolean;
+  bypassRuDomains: boolean;
+  bypassSuDomains: boolean;
+  bypassRfDomains: boolean;
+  domains: string[];
+  ips: string[];
+}
 
 export interface RunningAppInfo {
   pid: number;
@@ -153,6 +162,7 @@ export interface RuntimeStatus {
   socksPort?: number;
   httpPort?: number;
   lastPreparedServerId?: string;
+  lastPreparedServerFingerprint?: string;
   lastPreparedAt?: string;
   lastExitCode?: number;
   systemProxyEnabled?: boolean;
@@ -214,7 +224,9 @@ export interface AppSettings {
   useSystemProxy: boolean;
   probeOnConnect: boolean;
   tunnelMode: TunnelMode;
+  ipStack: IpStack;
   language: UiLanguage;
+  routingExclusions: RoutingExclusionSettings;
 }
 
 export interface ConnectResult {
@@ -223,6 +235,7 @@ export interface ConnectResult {
   transport: string;
   probe?: ConnectivityProbe | null;
   proxy?: ProxyStatus | null;
+  runtime?: RuntimeStatus;
 }
 
 export interface UpdateInfo {

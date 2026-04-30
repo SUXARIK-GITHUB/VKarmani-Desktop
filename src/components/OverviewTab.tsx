@@ -71,6 +71,10 @@ function formatLatency(server: VpnServer | null | undefined, language: UiLanguag
   }
 
   if (server?.latencyStatus === 'failed') {
+    const failedLatency = Number(server.latency);
+    if (server.latency !== null && server.latency !== undefined && Number.isFinite(failedLatency)) {
+      return `${Math.max(1, Math.round(failedLatency))} мс`;
+    }
     return tr(language, 'Нет ответа', 'No response');
   }
 
@@ -299,9 +303,18 @@ export function OverviewTab({
           </div>
           <strong className="vk-session-time">{isConnected ? sessionDurationText : '00:00:00'}</strong>
           <div className="vk-session-lines">
-            <span>{tr(language, 'Протокол', 'Protocol')}<strong>{selectedProtocol}</strong></span>
-            <span>{tr(language, 'IP-адрес', 'IP address')}<strong>{vpnExternalIp}</strong></span>
-            <span>{tr(language, 'Потеря пакетов', 'Packet loss')}<strong>{packetLossText}</strong></span>
+            <div className="vk-session-line">
+              <span className="vk-session-line-label">{tr(language, 'Протокол', 'Protocol')}</span>
+              <strong className="vk-session-line-value">{selectedProtocol}</strong>
+            </div>
+            <div className="vk-session-line">
+              <span className="vk-session-line-label">{tr(language, 'IP-адрес', 'IP address')}</span>
+              <strong className="vk-session-line-value">{vpnExternalIp}</strong>
+            </div>
+            <div className="vk-session-line">
+              <span className="vk-session-line-label">{tr(language, 'Потеря пакетов', 'Packet loss')}</span>
+              <strong className="vk-session-line-value">{packetLossText}</strong>
+            </div>
           </div>
         </article>
 

@@ -1,160 +1,191 @@
-struct ManagedCore {
-    child: Child,
-    core_path: String,
-    config_path: String,
-    log_path: String,
-    server_id: String,
-    started_at: String,
-    network_mode: String,
-    tun_interface_name: Option<String>,
-    tun_server_ip: Option<String>,
+use super::*;
+
+pub(crate) struct ManagedCore {
+    pub(crate) child: Child,
+    pub(crate) core_path: String,
+    pub(crate) config_path: String,
+    pub(crate) log_path: String,
+    pub(crate) server_id: String,
+    pub(crate) server_fingerprint: Option<String>,
+    pub(crate) started_at: String,
+    pub(crate) network_mode: String,
+    pub(crate) tun_interface_name: Option<String>,
+    pub(crate) tun_server_ip: Option<String>,
 }
 
 #[derive(Default)]
-struct AppState {
-    connected: Mutex<bool>,
-    active_server_label: Mutex<Option<String>>,
-    profile_count: Mutex<usize>,
-    last_sync_source: Mutex<Option<String>>,
-    runtime: Mutex<Option<ManagedCore>>,
-    last_exit_code: Mutex<Option<i32>>,
-    previous_proxy: Mutex<Option<ProxyStatus>>,
-    operation_lock: Mutex<()>, 
-    session_authorized: Mutex<bool>,
+pub(crate) struct AppState {
+    pub(crate) connected: Mutex<bool>,
+    pub(crate) active_server_label: Mutex<Option<String>>,
+    pub(crate) profile_count: Mutex<usize>,
+    pub(crate) last_sync_source: Mutex<Option<String>>,
+    pub(crate) runtime: Mutex<Option<ManagedCore>>,
+    pub(crate) last_exit_code: Mutex<Option<i32>>,
+    pub(crate) previous_proxy: Mutex<Option<ProxyStatus>>,
+    pub(crate) operation_lock: Mutex<()>, 
+    pub(crate) session_authorized: Mutex<bool>,
+    pub(crate) session_authorization: Mutex<Option<NativeSessionAuthorization>>,
+    pub(crate) tray_update_available: Mutex<bool>,
+    pub(crate) tray_update_busy: Mutex<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeSessionAuthorization {
+    pub(crate) access_key_hash: String,
+    pub(crate) expires_at: u64,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BootstrapInfo {
-    version: String,
-    platform: String,
+pub(crate) struct BootstrapInfo {
+    pub(crate) version: String,
+    pub(crate) platform: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RuntimeStatus {
-    bridge: String,
-    core_installed: bool,
-    tunnel_active: bool,
-    active_server_label: Option<String>,
-    profile_count: Option<usize>,
-    last_sync_source: Option<String>,
-    message: String,
-    core_path: Option<String>,
-    config_path: Option<String>,
-    log_path: Option<String>,
-    launch_mode: String,
-    socks_port: Option<u16>,
-    http_port: Option<u16>,
-    last_prepared_server_id: Option<String>,
-    last_prepared_at: Option<String>,
-    last_exit_code: Option<i32>,
-    system_proxy_enabled: Option<bool>,
-    proxy_server: Option<String>,
-    proxy_bypass: Option<String>,
-    network_mode: Option<String>,
-    tun_interface_name: Option<String>,
+pub(crate) struct RuntimeStatus {
+    pub(crate) bridge: String,
+    pub(crate) core_installed: bool,
+    pub(crate) tunnel_active: bool,
+    pub(crate) active_server_label: Option<String>,
+    pub(crate) profile_count: Option<usize>,
+    pub(crate) last_sync_source: Option<String>,
+    pub(crate) message: String,
+    pub(crate) core_path: Option<String>,
+    pub(crate) config_path: Option<String>,
+    pub(crate) log_path: Option<String>,
+    pub(crate) launch_mode: String,
+    pub(crate) socks_port: Option<u16>,
+    pub(crate) http_port: Option<u16>,
+    pub(crate) last_prepared_server_id: Option<String>,
+    pub(crate) last_prepared_server_fingerprint: Option<String>,
+    pub(crate) last_prepared_at: Option<String>,
+    pub(crate) last_exit_code: Option<i32>,
+    pub(crate) system_proxy_enabled: Option<bool>,
+    pub(crate) proxy_server: Option<String>,
+    pub(crate) proxy_bypass: Option<String>,
+    pub(crate) network_mode: Option<String>,
+    pub(crate) tun_interface_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProxyStatus {
-    enabled: bool,
-    server: Option<String>,
-    bypass: Option<String>,
-    method: String,
-    scope: String,
-    checked_at: String,
+pub(crate) struct ProxyStatus {
+    pub(crate) enabled: bool,
+    pub(crate) server: Option<String>,
+    pub(crate) bypass: Option<String>,
+    pub(crate) method: String,
+    pub(crate) scope: String,
+    pub(crate) checked_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RunningAppInfo {
-    pid: u32,
-    name: String,
-    path: Option<String>,
-    title: Option<String>,
+pub(crate) struct RunningAppInfo {
+    pub(crate) pid: u32,
+    pub(crate) name: String,
+    pub(crate) path: Option<String>,
+    pub(crate) title: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct NativeAppInfo {
-    app_version: String,
-    xray_version: String,
-    hwid: String,
-    os_name: String,
-    os_version: String,
-    os_build: String,
-    os_architecture: String,
-    device_name: String,
-    core_path: Option<String>,
+pub(crate) struct NativeAppInfo {
+    pub(crate) app_version: String,
+    pub(crate) xray_version: String,
+    pub(crate) hwid: String,
+    pub(crate) os_name: String,
+    pub(crate) os_version: String,
+    pub(crate) os_build: String,
+    pub(crate) os_architecture: String,
+    pub(crate) device_name: String,
+    pub(crate) core_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConnectivityProbe {
-    success: bool,
-    checked_at: String,
-    http_port_open: bool,
-    socks_port_open: bool,
-    public_ip: Option<String>,
-    latency_ms: Option<u128>,
-    packet_loss_pct: Option<u8>,
-    message: String,
+pub(crate) struct ConnectivityProbe {
+    pub(crate) success: bool,
+    pub(crate) checked_at: String,
+    pub(crate) http_port_open: bool,
+    pub(crate) socks_port_open: bool,
+    pub(crate) public_ip: Option<String>,
+    pub(crate) latency_ms: Option<u128>,
+    pub(crate) packet_loss_pct: Option<u8>,
+    pub(crate) message: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TrafficSnapshot {
-    received_bytes: u64,
-    sent_bytes: u64,
-    checked_at: String,
-    source: String,
+pub(crate) struct TrafficSnapshot {
+    pub(crate) received_bytes: u64,
+    pub(crate) sent_bytes: u64,
+    pub(crate) checked_at: String,
+    pub(crate) source: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RuntimeTemplate {
-    family: String,
-    protocol: String,
-    outbound: Value,
-    remarks: Option<String>,
+pub(crate) struct RuntimeTemplate {
+    pub(crate) family: String,
+    pub(crate) protocol: String,
+    pub(crate) outbound: Value,
+    pub(crate) remarks: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct SplitTunnelEntryPayload {
-    kind: String,
-    value: String,
-    enabled: bool,
+pub(crate) struct SplitTunnelEntryPayload {
+    pub(crate) kind: String,
+    pub(crate) value: String,
+    pub(crate) enabled: bool,
 }
 
-struct SplitTunnelRulePlan {
-    process_matches: Vec<String>,
-    resolved_apps: usize,
-    resolved_services: usize,
-    skipped_notes: Vec<String>,
+pub(crate) struct SplitTunnelRulePlan {
+    pub(crate) process_matches: Vec<String>,
+    pub(crate) resolved_apps: usize,
+    pub(crate) resolved_services: usize,
+    pub(crate) skipped_notes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
+pub(crate) struct RoutingExclusionSettingsPayload {
+    pub(crate) enabled: bool,
+    pub(crate) bypass_ru_domains: bool,
+    pub(crate) bypass_su_domains: bool,
+    pub(crate) bypass_rf_domains: bool,
+    pub(crate) domains: Vec<String>,
+    pub(crate) ips: Vec<String>,
+}
+
+pub(crate) struct RoutingExclusionRulePlan {
+    pub(crate) domain_rules: Vec<String>,
+    pub(crate) ip_rules: Vec<String>,
+    pub(crate) skipped_notes: Vec<String>,
 }
 
 #[cfg(target_os = "windows")]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ServiceLookupInfo {
-    name: String,
-    display_name: String,
-    exe_path: String,
-    is_shared_host: bool,
+pub(crate) struct ServiceLookupInfo {
+    pub(crate) name: String,
+    pub(crate) display_name: String,
+    pub(crate) exe_path: String,
+    pub(crate) is_shared_host: bool,
 }
 
 #[derive(Debug, Deserialize)]
-struct IpifyResponse {
-    ip: String,
+pub(crate) struct IpifyResponse {
+    pub(crate) ip: String,
 }
 
 #[cfg(target_os = "windows")]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct DefaultRouteSnapshot {
-    interface_index: u32,
-    next_hop: String,
+pub(crate) struct DefaultRouteSnapshot {
+    pub(crate) interface_index: u32,
+    pub(crate) next_hop: String,
 }

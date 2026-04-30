@@ -1,4 +1,6 @@
-fn validate_remote_fetch_url(raw_url: &str) -> Result<reqwest::Url, String> {
+use super::*;
+
+pub(crate) fn validate_remote_fetch_url(raw_url: &str) -> Result<reqwest::Url, String> {
     let parsed = reqwest::Url::parse(raw_url)
         .map_err(|_| "Некорректный URL для удалённого запроса.".to_string())?;
 
@@ -50,7 +52,7 @@ fn validate_remote_fetch_url(raw_url: &str) -> Result<reqwest::Url, String> {
     Ok(parsed)
 }
 
-fn build_remote_fetch_client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
+pub(crate) fn build_remote_fetch_client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
@@ -60,7 +62,7 @@ fn build_remote_fetch_client(timeout: Duration) -> Result<reqwest::blocking::Cli
         .map_err(|error| format!("Не удалось создать HTTP client: {error}"))
 }
 
-fn read_limited_remote_text(response: reqwest::blocking::Response) -> Result<String, String> {
+pub(crate) fn read_limited_remote_text(response: reqwest::blocking::Response) -> Result<String, String> {
     if let Some(length) = response.content_length() {
         if length > MAX_REMOTE_FETCH_BYTES {
             return Err(format!(
@@ -85,7 +87,7 @@ fn read_limited_remote_text(response: reqwest::blocking::Response) -> Result<Str
 }
 
 #[tauri::command]
-fn fetch_remote_text(url: String, accept: Option<String>) -> Result<String, String> {
+pub(crate) fn fetch_remote_text(url: String, accept: Option<String>) -> Result<String, String> {
     let client = build_remote_fetch_client(Duration::from_secs(8))?;
     let accept_header = accept.unwrap_or_else(|| "text/plain, application/json, text/html".to_string());
     let mut current_url = validate_remote_fetch_url(&url)?;
@@ -125,7 +127,7 @@ fn fetch_remote_text(url: String, accept: Option<String>) -> Result<String, Stri
     Err("Слишком много redirects при удалённом fetch.".into())
 }
 
-fn remnawave_api_token() -> Option<String> {
+pub(crate) fn remnawave_api_token() -> Option<String> {
     [
         "VKARMANI_REMNAWAVE_API_TOKEN",
         "REMNAWAVE_API_TOKEN",
@@ -137,7 +139,7 @@ fn remnawave_api_token() -> Option<String> {
 }
 
 #[tauri::command]
-fn revoke_hwid_device(
+pub(crate) fn revoke_hwid_device(
     panel_url: String,
     uuid: Option<String>,
     hwid: Option<String>,

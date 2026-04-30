@@ -41,7 +41,16 @@ function toSafeSettings(settings: AppSettings) {
     useSystemProxy: settings.useSystemProxy,
     probeOnConnect: settings.probeOnConnect,
     tunnelMode: settings.tunnelMode,
-    language: settings.language
+    ipStack: settings.ipStack,
+    language: settings.language,
+    routingExclusions: {
+      enabled: settings.routingExclusions.enabled,
+      bypassRuDomains: settings.routingExclusions.bypassRuDomains,
+      bypassSuDomains: settings.routingExclusions.bypassSuDomains,
+      bypassRfDomains: settings.routingExclusions.bypassRfDomains,
+      domainCount: settings.routingExclusions.domains.length,
+      ipCount: settings.routingExclusions.ips.length
+    }
   };
 }
 
@@ -64,6 +73,7 @@ function toSafeSession(session: RemnawaveSession | null) {
 export function createSafeDiagnosticsPayload(input: SafeDiagnosticsExportInput): string {
   const report = {
     generatedAt: new Date().toISOString(),
+    privacyNotice: 'Ключи, токены, UUID и subscription URL скрываются автоматически. Отчёт может содержать технические данные устройства: версия Windows, имя устройства, HWID и runtime-пути для поддержки.',
     appVersion: input.appVersion,
     runtimeStatus: input.runtimeStatus,
     proxyStatus: input.proxyStatus,

@@ -8,10 +8,13 @@ import type {
   RunningAppInfo,
   NativeAppInfo,
   SplitTunnelEntry,
+  RoutingExclusionSettings,
   TunnelMode,
+  IpStack,
   VpnServer,
   XrayRuntimeTemplate
 } from '../types/vpn';
+import { buildServerRuntimeFingerprint } from '../utils/serverIdentity';
 
 const tauriWindow = typeof window !== 'undefined'
   ? (window as Window & { __TAURI_INTERNALS__?: unknown; __TAURI__?: unknown })
@@ -21,7 +24,7 @@ export const isTauriRuntime = Boolean(
   tauriWindow && (tauriWindow.__TAURI_INTERNALS__ || tauriWindow.__TAURI__)
 );
 
-export const appVersion = String(import.meta.env.VITE_APP_VERSION ?? packageJson.version ?? '0.13.8');
+export const appVersion = String(import.meta.env.VITE_APP_VERSION ?? packageJson.version ?? '0.13.40');
 export const remnawavePanelUrl = import.meta.env.VITE_REMNAWAVE_PANEL_URL ?? '';
 export const remnawaveSubscriptionUrl = import.meta.env.VITE_REMNAWAVE_SUBSCRIPTION_URL ?? '';
 const envFlag = import.meta.env.VITE_ALLOW_DEMO_FALLBACK;
@@ -60,13 +63,14 @@ function validateWebRemoteFetchUrl(rawUrl: string) {
 export const allowDemoFallbackByEnv = String(envFlag ?? '').trim().toLowerCase() === 'true';
 
 const NATIVE_COMMAND_TIMEOUTS_MS: Record<string, number> = {
-  request_connect: 45000,
+  request_connect: 90000,
   request_disconnect: 25000,
   set_system_proxy: 18000,
   public_ip_snapshot: 12000,
   fetch_remote_text: 20000,
   revoke_hwid_device: 20000,
   connectivity_probe: 12000,
+  repair_runtime_environment: 18000,
   server_ping: 9000,
   traffic_snapshot: 7000,
   runtime_status: 9000,
@@ -79,7 +83,8 @@ const NATIVE_COMMAND_TIMEOUTS_MS: Record<string, number> = {
   clear_access_key_secure: 9000,
   native_app_info: 12000,
   pick_executable_path: 120000,
-  list_running_apps: 14000
+  list_running_apps: 14000,
+  set_tray_update_state: 3500
 };
 
 function commandTimeoutMessage(command: string, timeoutMs: number) {
@@ -112,6 +117,18 @@ function withClientTimeout<T>(operation: Promise<T>, timeoutMs: number, command:
 async function invokeTauri<T>(command: string, args: Record<string, unknown> = {}, timeoutMs = NATIVE_COMMAND_TIMEOUTS_MS[command] ?? 12000): Promise<T> {
   const { invoke } = await import('@tauri-apps/api/core');
   return withClientTimeout(invoke<T>(command, args), timeoutMs, command);
+}
+
+export async function setNativeTrayUpdateState(available: boolean, busy: boolean): Promise<boolean> {
+  if (!isTauriRuntime) {
+    return false;
+  }
+
+  try {
+    return await invokeTauri<boolean>('set_tray_update_state', { available, busy }, NATIVE_COMMAND_TIMEOUTS_MS.set_tray_update_state);
+  } catch {
+    return false;
+  }
 }
 
 
@@ -176,6 +193,31 @@ export function normalizeNativeError(error: unknown, fallback: string): Error {
   return new Error(message);
 }
 
+function readRuntimeEndpoint(server: VpnServer): { host: string; port: number } | null {
+  const hostFromServer = server.host?.trim();
+  const portFromServer = Number(server.port ?? 0);
+  if (hostFromServer && Number.isFinite(portFromServer) && portFromServer > 0 && portFromServer <= 65535) {
+    return { host: hostFromServer, port: Math.round(portFromServer) };
+  }
+
+  const settings = server.runtimeTemplate?.outbound?.settings as
+    | { vnext?: Array<{ address?: string; port?: number }>; servers?: Array<{ address?: string; port?: number }> }
+    | undefined;
+  const runtimeEndpoint = settings?.vnext?.[0] ?? settings?.servers?.[0];
+  const runtimeHost = runtimeEndpoint?.address?.trim();
+  const runtimePort = Number(runtimeEndpoint?.port ?? 443);
+
+  if (!runtimeHost || !Number.isFinite(runtimePort) || runtimePort <= 0 || runtimePort > 65535) {
+    return null;
+  }
+
+  return { host: runtimeHost, port: Math.round(runtimePort) };
+}
+
+export function getServerPingEndpoint(server: VpnServer): { host: string; port: number } | null {
+  return readRuntimeEndpoint(server);
+}
+
 function extractRuntimeTemplate(server: VpnServer): XrayRuntimeTemplate | null {
   return server.runtimeTemplate ?? null;
 }
@@ -205,7 +247,10 @@ export async function getNativeRuntimeStatus(): Promise<RuntimeStatus> {
 export async function requestNativeConnect(
   server: VpnServer,
   networkMode: TunnelMode = 'proxy',
-  splitTunnelEntries: SplitTunnelEntry[] = []
+  splitTunnelEntries: SplitTunnelEntry[] = [],
+  ipStack: IpStack = 'ipv4',
+  reconnect = false,
+  routingExclusions?: RoutingExclusionSettings
 ) {
   if (!isTauriRuntime) {
     return getNativeRuntimeStatus();
@@ -219,9 +264,13 @@ export async function requestNativeConnect(
   return invokeTauri<RuntimeStatus>('request_connect', {
     serverId: server.id,
     serverLabel: `${server.country}, ${server.city}`,
+    serverFingerprint: buildServerRuntimeFingerprint(server),
     runtimeTemplate,
     networkMode,
-    splitTunnelEntries
+    splitTunnelEntries,
+    ipStack,
+    reconnect,
+    routingExclusions
   });
 }
 
@@ -315,12 +364,13 @@ export async function setNativeSystemProxy(enabled: boolean): Promise<ProxyStatu
 
 
 export async function pingNativeServer(server: VpnServer): Promise<ConnectivityProbe> {
-  const host = server.host?.trim();
-  const port = Number(server.port ?? 443);
+  const endpoint = readRuntimeEndpoint(server);
 
-  if (!host || !Number.isFinite(port) || port <= 0) {
+  if (!endpoint) {
     throw new Error('У выбранного сервера нет host/port для проверки пинга. Обновите профиль серверов.');
   }
+
+  const { host, port } = endpoint;
 
   if (!isTauriRuntime) {
     const started = performance.now();
@@ -364,6 +414,14 @@ export async function runNativeConnectivityProbe(): Promise<ConnectivityProbe> {
   }
 
   return invokeTauri<ConnectivityProbe>('connectivity_probe');
+}
+
+export async function repairNativeRuntimeEnvironment(): Promise<RuntimeStatus> {
+  if (!isTauriRuntime) {
+    return getNativeRuntimeStatus();
+  }
+
+  return invokeTauri<RuntimeStatus>('repair_runtime_environment');
 }
 
 export async function readNativeRuntimeLog(lines = 20): Promise<string[]> {
@@ -549,14 +607,18 @@ export function getIntegrationMeta() {
   };
 }
 
-export async function setNativeSessionAuthorized(authorized: boolean) {
+export async function setNativeSessionAuthorized(authorized: boolean, accessKey?: string) {
   if (!isTauriRuntime) {
     return false;
   }
 
   try {
-    return await invokeTauri<boolean>('set_session_authorized', { authorized });
-  } catch {
+    return await invokeTauri<boolean>('set_session_authorized', { authorized, accessKey });
+  } catch (error) {
+    console.warn(
+      '[VKarmani] native session authorization failed:',
+      normalizeNativeError(error, 'Не удалось обновить native session.').message
+    );
     return false;
   }
 }

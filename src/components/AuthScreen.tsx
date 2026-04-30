@@ -37,7 +37,7 @@ function detectAccessKeyKind(value: string) {
     return 'empty' as const;
   }
 
-  if (normalized.startsWith('https://sub.vkarmani.com/')) {
+  if (normalized.toLowerCase().startsWith('https://sub.vkarmani.com/')) {
     return 'url' as const;
   }
 

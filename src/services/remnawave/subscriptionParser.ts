@@ -2,11 +2,29 @@ import type { VpnServer, XrayRuntimeTemplate } from '../../types/vpn';
 import { inferCountryCode, resolveServerFlag } from '../../utils/serverDisplay';
 import { decodeBase64Compat, maybeDecodeBase64, parsePort, splitHostPort } from './parserCore';
 
-function deepFindString(source: unknown, keys: string[]): string | undefined {
-  if (!source || typeof source !== 'object') {
+const MAX_SUBSCRIPTION_BYTES = 2 * 1024 * 1024;
+const MAX_IMPORTED_SERVERS = 1000;
+const MAX_URI_LENGTH = 8192;
+const MAX_JSON_WALK_DEPTH = 12;
+const MAX_JSON_WALK_NODES = 5000;
+const MAX_LABEL_LENGTH = 160;
+
+function trimLabel(value: string) {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  return normalized.length > MAX_LABEL_LENGTH ? normalized.slice(0, MAX_LABEL_LENGTH).trimEnd() : normalized;
+}
+
+function deepFindString(
+  source: unknown,
+  keys: string[],
+  depth = 0,
+  visited: { count: number } = { count: 0 }
+): string | undefined {
+  if (!source || typeof source !== 'object' || depth > MAX_JSON_WALK_DEPTH || visited.count > MAX_JSON_WALK_NODES) {
     return undefined;
   }
 
+  visited.count += 1;
   const record = source as Record<string, unknown>;
   for (const key of keys) {
     if (typeof record[key] === 'string' && record[key]) {
@@ -15,7 +33,7 @@ function deepFindString(source: unknown, keys: string[]): string | undefined {
   }
 
   for (const value of Object.values(record)) {
-    const nested = deepFindString(value, keys);
+    const nested = deepFindString(value, keys, depth + 1, visited);
     if (nested) {
       return nested;
     }
@@ -24,24 +42,45 @@ function deepFindString(source: unknown, keys: string[]): string | undefined {
   return undefined;
 }
 
-function deepCollectUris(source: unknown, collected: string[] = []): string[] {
+function deepCollectUris(
+  source: unknown,
+  collected: string[] = [],
+  depth = 0,
+  visited: { count: number } = { count: 0 }
+): string[] {
+  if (collected.length >= MAX_IMPORTED_SERVERS || depth > MAX_JSON_WALK_DEPTH || visited.count > MAX_JSON_WALK_NODES) {
+    return collected;
+  }
+
+  visited.count += 1;
+
   if (typeof source === 'string') {
     const matches = source.match(/(?:vless|vmess|trojan|ss|hy2|hysteria2):\/\/[^\s"'<>`]+/gi) ?? [];
     for (const match of matches) {
-      if (!collected.includes(match.trim())) {
-        collected.push(match.trim());
+      const candidate = match.trim();
+      if (candidate.length <= MAX_URI_LENGTH && !collected.includes(candidate)) {
+        collected.push(candidate);
+      }
+      if (collected.length >= MAX_IMPORTED_SERVERS) {
+        break;
       }
     }
     return collected;
   }
 
   if (Array.isArray(source)) {
-    for (const item of source) deepCollectUris(item, collected);
+    for (const item of source) {
+      deepCollectUris(item, collected, depth + 1, visited);
+      if (collected.length >= MAX_IMPORTED_SERVERS) break;
+    }
     return collected;
   }
 
   if (source && typeof source === 'object') {
-    for (const value of Object.values(source as Record<string, unknown>)) deepCollectUris(value, collected);
+    for (const value of Object.values(source as Record<string, unknown>)) {
+      deepCollectUris(value, collected, depth + 1, visited);
+      if (collected.length >= MAX_IMPORTED_SERVERS) break;
+    }
   }
 
   return collected;
@@ -59,7 +98,7 @@ function decodeHtmlEntities(value: string) {
 function extractUrisFromHtml(value: string) {
   const decoded = decodeHtmlEntities(value);
   const matches = decoded.match(/(?:vless|vmess|trojan|ss|hy2|hysteria2):\/\/[^\s"'<>`]+/gi) ?? [];
-  return [...new Set(matches.map((item) => item.trim()))];
+  return [...new Set(matches.map((item) => item.trim()).filter((item) => item.length <= MAX_URI_LENGTH))].slice(0, MAX_IMPORTED_SERVERS);
 }
 
 function extractRawText(body: string) {
@@ -91,16 +130,58 @@ function extractRawText(body: string) {
   return decodeHtmlEntities(trimmed);
 }
 
-function stableSubscriptionId(uri: string) {
-  const identity = uri.trim().replace(/#.*$/u, '');
+function fnv1aHex(value: string) {
   let hash = 0x811c9dc5;
 
-  for (let index = 0; index < identity.length; index += 1) {
-    hash ^= identity.charCodeAt(index);
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
     hash = Math.imul(hash, 0x01000193);
   }
 
-  return `subscription-${(hash >>> 0).toString(16).padStart(8, '0')}`;
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function stableSubscriptionId(uri: string) {
+  const identity = uri.trim().replace(/#.*$/u, '');
+  return `subscription-${fnv1aHex(identity)}`;
+}
+
+function runtimeIdentityFallback(server: VpnServer) {
+  return JSON.stringify({
+    host: server.host ?? '',
+    port: server.port ?? 0,
+    runtimeTemplate: server.runtimeTemplate ?? null,
+    rawLabel: server.rawLabel ?? ''
+  });
+}
+
+function withUniqueSubscriptionIds(items: VpnServer[]) {
+  const baseCounts = new Map<string, number>();
+  for (const item of items) {
+    baseCounts.set(item.id, (baseCounts.get(item.id) ?? 0) + 1);
+  }
+
+  const assignedCounts = new Map<string, number>();
+  return items.map((item) => {
+    if ((baseCounts.get(item.id) ?? 0) <= 1) {
+      return item;
+    }
+
+    // Некоторые подписки могут отдавать несколько строк с одинаковым URI без fragment
+    // или с одинаковым transport endpoint, но с разными названиями стран/нод. React key
+    // и selectedServerId должны быть уникальными, иначе пользователь кликает один ряд,
+    // а connect может взять первый сервер с таким же id. Для обычных серверов id остаётся
+    // прежним; suffix добавляется только при реальной коллизии.
+    const suffixSeed = item.rawUri?.trim() || runtimeIdentityFallback(item);
+    const candidateId = `${item.id}-${fnv1aHex(suffixSeed)}`;
+    const collisionIndex = assignedCounts.get(candidateId) ?? 0;
+    assignedCounts.set(candidateId, collisionIndex + 1);
+
+    return {
+      ...item,
+      id: collisionIndex === 0 ? candidateId : `${candidateId}-${collisionIndex + 1}`
+    };
+  });
 }
 
 function parseStrictPort(value: string | number | null | undefined, fallback = 443): number | null {
@@ -173,14 +254,14 @@ function compactObject<T>(value: T): T {
   if (Array.isArray(value)) {
     return value
       .map((item) => compactObject(item))
-      .filter((item) => item !== undefined && item !== null && item !== '') as T;
+      .filter((item) => item !== undefined && item !== null && item !== '' && !(Array.isArray(item) && item.length === 0)) as T;
   }
 
   if (value && typeof value === 'object') {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
         .map(([key, nested]) => [key, compactObject(nested)])
-        .filter(([, nested]) => nested !== undefined && nested !== null && nested !== '')
+        .filter(([, nested]) => nested !== undefined && nested !== null && nested !== '' && !(Array.isArray(nested) && nested.length === 0))
     ) as T;
   }
 
@@ -567,11 +648,15 @@ function parseHysteria2Runtime(url: URL, label: string): XrayRuntimeTemplate | n
   const obfsPassword = getFirstParam(searchParams, ['obfs-password', 'obfs_password', 'obfsPassword']) || undefined;
   const sni = getFirstParam(searchParams, ['sni', 'peer', 'serverName', 'servername']) || host;
   const insecure = searchParams.get('insecure') === '1' || searchParams.get('allowInsecure') === '1';
+  const alpn = splitCsv(searchParams.get('alpn'));
 
   if (!password || !host || port === null) {
     return null;
   }
 
+  // Xray-core exposes Hysteria2 through the hysteria outbound with version: 2.
+  // Keeping the display/runtime protocol as hysteria2 is fine for VKarmani UI,
+  // but the generated outbound itself must use Xray's real config schema.
   return {
     family: 'xray',
     protocol: 'hysteria2',
@@ -579,26 +664,35 @@ function parseHysteria2Runtime(url: URL, label: string): XrayRuntimeTemplate | n
     transport: 'udp',
     outbound: compactObject({
       tag: 'proxy',
-      protocol: 'hysteria2',
+      protocol: 'hysteria',
       settings: {
-        servers: [
-          compactObject({
-            address: host,
-            port,
-            password,
-            obfs: obfsType ? { type: obfsType, password: obfsPassword } : undefined
-          })
-        ]
+        version: 2,
+        address: host,
+        port
       },
       streamSettings: compactObject({
-        network: 'udp',
+        network: 'hysteria',
         security: 'tls',
         tlsSettings: compactObject({
           serverName: sni,
           fingerprint: getFirstParam(searchParams, ['fp', 'fingerprint']) ?? undefined,
-          alpn: splitCsv(searchParams.get('alpn')),
+          alpn: alpn.length > 0 ? alpn : ['h3'],
           allowInsecure: insecure
-        })
+        }),
+        hysteriaSettings: compactObject({
+          version: 2,
+          auth: password
+        }),
+        udpmasks: obfsType && obfsPassword
+          ? [
+              {
+                type: obfsType,
+                settings: {
+                  password: obfsPassword
+                }
+              }
+            ]
+          : undefined
       })
     })
   };
@@ -686,7 +780,7 @@ function buildImportedServer(line: string, index: number): VpnServer | null {
 
   try {
     const url = new URL(trimmed);
-    const label = decodeURIComponent(url.hash.replace(/^#/, '')).trim() || runtimeTemplate?.remarks?.trim() || '';
+    const label = trimLabel(decodeURIComponent(url.hash.replace(/^#/, '')) || runtimeTemplate?.remarks || '');
     const host = runtimeEndpoint.host || normalizeUrlHostname(url.hostname) || 'remote-host';
     const port = runtimeEndpoint.port || (url.port ? Number(url.port) : 443);
     const location = parseCountryLabel(label, host);
@@ -727,7 +821,7 @@ function buildImportedServer(line: string, index: number): VpnServer | null {
       return null;
     }
 
-    const label = runtimeTemplate.remarks?.trim() || '';
+    const label = trimLabel(runtimeTemplate.remarks ?? '');
     const host = runtimeEndpoint.host;
     const port = runtimeEndpoint.port || 443;
     const location = parseCountryLabel(label, host);
@@ -767,13 +861,20 @@ function buildImportedServer(line: string, index: number): VpnServer | null {
 }
 
 export function parseSubscriptionToServers(rawText: string): VpnServer[] {
-  const extracted = maybeDecodeBase64(extractRawText(rawText));
+  const safeRawText = rawText.length > MAX_SUBSCRIPTION_BYTES
+    ? rawText.slice(0, MAX_SUBSCRIPTION_BYTES)
+    : rawText;
+  const extracted = maybeDecodeBase64(extractRawText(safeRawText));
   const lines = extracted
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter(Boolean);
+    .filter((line) => Boolean(line) && line.length <= MAX_URI_LENGTH)
+    .slice(0, MAX_IMPORTED_SERVERS);
 
-  return lines
+  const importedServers = lines
     .map((line, index) => buildImportedServer(line, index))
-    .filter((item): item is VpnServer => Boolean(item));
+    .filter((item): item is VpnServer => Boolean(item))
+    .slice(0, MAX_IMPORTED_SERVERS);
+
+  return withUniqueSubscriptionIds(importedServers);
 }

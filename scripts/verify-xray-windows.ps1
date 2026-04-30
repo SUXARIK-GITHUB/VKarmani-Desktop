@@ -2,6 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot '..')
 $CoreDir = Join-Path $Root 'resources\core\windows'
+$ManifestPath = Join-Path $CoreDir 'core-manifest.json'
 $XrayPath = Join-Path $CoreDir 'xray.exe'
 $WintunPath = Join-Path $CoreDir 'wintun.dll'
 
@@ -70,6 +71,46 @@ function Assert-WindowsX64Pe([string]$Path, [string]$Label) {
 
   Write-Host "[xray-check] OK: $Label is Windows x64 PE32+ ($($item.Length) bytes)"
 }
+
+function Assert-CoreManifestFile([string]$FileName) {
+  if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+    throw "core-manifest.json is missing: $ManifestPath"
+  }
+
+  $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  $entry = @($manifest.files | Where-Object { $_.file -ieq $FileName } | Select-Object -First 1)
+  if (-not $entry -or -not $entry[0]) {
+    throw "core-manifest.json does not contain entry for $FileName"
+  }
+
+  $path = Join-Path $CoreDir $FileName
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+    throw "$FileName is missing: $path"
+  }
+
+  $item = Get-Item -LiteralPath $path
+  $expectedSize = [int64]$entry[0].size
+  if ($expectedSize -gt 0 -and $item.Length -ne $expectedSize) {
+    throw "$FileName size mismatch. Expected=$expectedSize Actual=$($item.Length)"
+  }
+
+  $expectedHash = ([string]$entry[0].sha256).Trim().ToLowerInvariant()
+  if ($expectedHash -notmatch '^[a-f0-9]{64}$') {
+    throw "core-manifest.json contains invalid sha256 for ${FileName}: $expectedHash"
+  }
+
+  $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actualHash -ne $expectedHash) {
+    throw "$FileName sha256 mismatch. Expected=$expectedHash Actual=$actualHash"
+  }
+
+  Write-Host "[xray-check] OK: $FileName matches core-manifest.json"
+}
+
+Assert-CoreManifestFile 'xray.exe'
+Assert-CoreManifestFile 'wintun.dll'
+Assert-CoreManifestFile 'geoip.dat'
+Assert-CoreManifestFile 'geosite.dat'
 
 Assert-WindowsX64Pe $XrayPath 'xray.exe'
 Assert-WindowsX64Pe $WintunPath 'wintun.dll'

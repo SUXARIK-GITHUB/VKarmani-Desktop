@@ -199,7 +199,7 @@ let manifest = null;
 if (!fs.existsSync(manifestPath)) {
   fail('resources/core/windows/core-manifest.json is missing');
 } else {
-  manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8').replace(/^\uFEFF/, ''));
   ok('core manifest exists');
 
   if (manifest.version && manifest.version !== pkg.version) {

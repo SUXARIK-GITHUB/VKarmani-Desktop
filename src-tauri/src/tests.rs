@@ -1,3 +1,5 @@
+use super::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +90,80 @@ mod tests {
         assert!(candidates.iter().any(|item| item.eq_ignore_ascii_case("app.exe")));
         assert!(candidates.iter().any(|item| item.eq_ignore_ascii_case("app")));
         assert!(!candidates.iter().any(|item| item.contains("--flag")));
+    }
+
+
+    #[test]
+    fn routing_exclusions_build_direct_domain_and_ip_rules() {
+        let exclusions = RoutingExclusionSettingsPayload {
+            enabled: true,
+            bypass_ru_domains: true,
+            bypass_su_domains: false,
+            bypass_rf_domains: true,
+            domains: vec!["*.example.ru".into(), "https://bank.ru/path".into()],
+            ips: vec!["1.2.3.4".into(), "5.6.7.0/24".into()],
+        };
+
+        let plan = build_routing_exclusion_rule_plan(Some(&exclusions));
+        assert!(plan.domain_rules.iter().any(|item| item == "regexp:(^|\\.)ru$"));
+        assert!(plan.domain_rules.iter().any(|item| item == "regexp:(^|\\.)xn--p1ai$"));
+        assert!(plan.domain_rules.iter().any(|item| item == "regexp:(^|\\.)example\\.ru$"));
+        assert!(plan.domain_rules.iter().any(|item| item == "domain:bank.ru"));
+        assert!(plan.ip_rules.iter().any(|item| item == "1.2.3.4"));
+        assert!(plan.ip_rules.iter().any(|item| item == "5.6.7.0/24"));
+    }
+
+    #[test]
+    fn hysteria2_template_builds_xray_hysteria_v2_without_tcp_sockopt() {
+        let template = RuntimeTemplate {
+            family: "xray".into(),
+            protocol: "hysteria2".into(),
+            remarks: Some("HY2 fixture".into()),
+            outbound: json!({
+                "tag": "proxy",
+                "protocol": "hysteria",
+                "settings": {
+                    "version": 2,
+                    "address": "hy2.example.com",
+                    "port": 443
+                },
+                "streamSettings": {
+                    "network": "hysteria",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "hy2.example.com",
+                        "fingerprint": "chrome",
+                        "alpn": ["h3"]
+                    },
+                    "hysteriaSettings": {
+                        "version": 2,
+                        "auth": "secret"
+                    },
+                    "udpmasks": [
+                        {
+                            "type": "salamander",
+                            "settings": {
+                                "password": "obfs-pass"
+                            }
+                        }
+                    ]
+                }
+            }),
+        };
+
+        let (config, _, _) = build_xray_config(&template, "proxy", "ipv4", None, &[], None, None);
+        let outbound = config
+            .get("outbounds")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .expect("proxy outbound must exist");
+
+        assert_eq!(outbound.get("protocol").and_then(Value::as_str), Some("hysteria"));
+        assert_eq!(outbound.pointer("/settings/version").and_then(Value::as_i64), Some(2));
+        assert_eq!(outbound.pointer("/streamSettings/network").and_then(Value::as_str), Some("hysteria"));
+        assert!(outbound.pointer("/streamSettings/hysteriaSettings/auth").is_some());
+        assert!(outbound.pointer("/streamSettings/udpmasks/0/settings/password").is_some());
+        assert!(outbound.pointer("/streamSettings/sockopt").is_none());
     }
 
 }

@@ -50,6 +50,89 @@ function Test-WindowsX64Pe([string]$Path, [string]$Label) {
   }
 }
 
+function Get-PackageVersionSafe {
+  $packagePath = Join-Path $ProjectDir 'package.json'
+  try {
+    if (Test-Path -LiteralPath $packagePath -PathType Leaf) {
+      return ([string]((Get-Content -LiteralPath $packagePath -Raw -Encoding UTF8 | ConvertFrom-Json).version))
+    }
+  } catch {
+    Write-WarnLine "Could not read package.json version: $($_.Exception.Message)"
+  }
+  return '0.13.40'
+}
+
+function Write-CoreManifestNoBom {
+  foreach ($file in $required) {
+    $path = Join-Path $coreDir $file
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+      throw "$file is missing, cannot regenerate core-manifest.json"
+    }
+    $item = Get-Item -LiteralPath $path
+    if ($item.Length -le 0) {
+      throw "$file is empty, cannot regenerate core-manifest.json"
+    }
+  }
+
+  $xrayPath = Join-Path $coreDir 'xray.exe'
+  $wintunPath = Join-Path $coreDir 'wintun.dll'
+  if (-not (Test-WindowsX64Pe $xrayPath 'xray.exe')) {
+    throw 'xray.exe is not a valid Windows x64 PE file, cannot regenerate manifest'
+  }
+  if (-not (Test-WindowsX64Pe $wintunPath 'wintun.dll')) {
+    throw 'wintun.dll is not a valid Windows x64 PE file, cannot regenerate manifest'
+  }
+
+  $files = @()
+  foreach ($file in $required) {
+    $path = Join-Path $coreDir $file
+    $item = Get-Item -LiteralPath $path
+    $files += [ordered]@{
+      file = $file
+      size = [int64]$item.Length
+      sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+  }
+
+  $manifest = [ordered]@{
+    version = (Get-PackageVersionSafe)
+    generatedFor = 'VKarmani Desktop bundled core artifacts'
+    files = $files
+  }
+
+  $json = ($manifest | ConvertTo-Json -Depth 6) + "`n"
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($manifestPath, $json, $utf8NoBom)
+}
+
+function Test-ManifestHasUtf8Bom {
+  if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return $false }
+  try {
+    $stream = [System.IO.File]::OpenRead($manifestPath)
+    try {
+      if ($stream.Length -lt 3) { return $false }
+      $buffer = New-Object byte[] 3
+      [void]$stream.Read($buffer, 0, 3)
+      return ($buffer[0] -eq 0xEF -and $buffer[1] -eq 0xBB -and $buffer[2] -eq 0xBF)
+    } finally {
+      $stream.Dispose()
+    }
+  } catch {
+    return $false
+  }
+}
+
+function Try-RegenerateManifestNoBom {
+  try {
+    Write-Info 'Regenerating core-manifest.json as UTF-8 without BOM...'
+    Write-CoreManifestNoBom
+    return $true
+  } catch {
+    Write-WarnLine "Manifest regeneration failed: $($_.Exception.Message)"
+    return $false
+  }
+}
+
 function Test-CoreFiles {
   $problems = New-Object System.Collections.Generic.List[string]
   $manifest = $null
@@ -158,8 +241,31 @@ if (-not (Test-Path -LiteralPath $coreDir)) {
 
 $problems = Test-CoreFiles
 if ($problems.Count -eq 0) {
+  if (Test-ManifestHasUtf8Bom) {
+    Write-Info 'core-manifest.json has UTF-8 BOM; rewriting without BOM for Rust serde_json compatibility.'
+    if (-not (Try-RegenerateManifestNoBom)) {
+      Write-ErrLine 'Could not rewrite core-manifest.json without BOM.'
+      exit 1
+    }
+    $problems = Test-CoreFiles
+    if ($problems.Count -ne 0) {
+      Write-WarnLine 'Xray-core validation failed after manifest rewrite:'
+      $problems | ForEach-Object { Write-WarnLine " - $_" }
+      exit 1
+    }
+  }
   Write-Info 'Xray-core files are present and pass manifest/PE/launch validation.'
   exit 0
+}
+
+if ($problems | Where-Object { $_ -like 'core-manifest.json cannot be parsed*' -or $_ -eq 'core-manifest.json is missing' }) {
+  if (Try-RegenerateManifestNoBom) {
+    $problems = Test-CoreFiles
+    if ($problems.Count -eq 0) {
+      Write-Info 'Xray-core manifest repaired successfully.'
+      exit 0
+    }
+  }
 }
 
 Write-Info 'Preparing Xray-core runtime files; automatic repair will be attempted if needed.'
@@ -170,6 +276,7 @@ if ($env:VKARMANI_VERBOSE_REPAIR -eq '1') {
 if (Try-AutomaticFetchRepair) {
   $problems = Test-CoreFiles
   if ($problems.Count -eq 0) {
+    if (Test-ManifestHasUtf8Bom) { [void](Try-RegenerateManifestNoBom) }
     Write-Info 'Xray-core files repaired successfully.'
     exit 0
   }
@@ -178,6 +285,7 @@ if (Try-AutomaticFetchRepair) {
 if (Try-GitRestoreRepair) {
   $problems = Test-CoreFiles
   if ($problems.Count -eq 0) {
+    if (Test-ManifestHasUtf8Bom) { [void](Try-RegenerateManifestNoBom) }
     Write-Info 'Xray-core files restored successfully.'
     exit 0
   }
@@ -189,5 +297,5 @@ $problems | ForEach-Object { Write-WarnLine " - $_" }
 Write-ErrLine 'Xray-core files are still missing, corrupted, or not valid Windows x64 files.'
 Write-ErrLine "Expected directory: $coreDir"
 Write-ErrLine 'Required files: xray.exe, geoip.dat, geosite.dat, wintun.dll'
-Write-ErrLine 'Fix: run scripts/fetch-xray-windows.ps1 or use the GitHub Actions release artifact built from v0.13.30 or newer.'
+Write-ErrLine 'Fix: run scripts/fetch-xray-windows.ps1 or use the GitHub Actions release artifact built from v0.13.40 or newer.'
 exit 1

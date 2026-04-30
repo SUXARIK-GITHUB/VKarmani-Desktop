@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { __remnawaveTest } from '../src/services/remnawave';
+import { rankServersForDisplay } from '../src/utils/serverSorting';
+import { normalizeRoutingDomainInput, normalizeRoutingIpInput, sanitizeRoutingExclusions } from '../src/utils/routingExclusions';
+import type { VpnServer } from '../src/types/vpn';
 
 const uuid = '123e4567-e89b-12d3-a456-426614174000';
 
@@ -128,6 +131,11 @@ describe('Remnawave subscription parser', () => {
     expect(server?.runtimeTemplate?.protocol).toBe('hysteria2');
     expect(server?.host).toBe('hy2.example.com');
     expect(server?.port).toBe(443);
+    const outbound = server?.runtimeTemplate?.outbound as Record<string, unknown>;
+    expect(outbound.protocol).toBe('hysteria');
+    expect(JSON.stringify(outbound)).toContain('"version":2');
+    expect(JSON.stringify(outbound)).toContain('hysteriaSettings');
+    expect(JSON.stringify(outbound)).toContain('udpmasks');
   });
 
   it('parses Hysteria2 aliases and IPv6 hosts', () => {
@@ -138,6 +146,7 @@ describe('Remnawave subscription parser', () => {
     expect(server?.runtimeTemplate?.protocol).toBe('hysteria2');
     expect(server?.host).toBe('2001:4860:4860::8888');
     expect(JSON.stringify(server?.runtimeTemplate?.outbound)).toContain('obfs-pass');
+    expect(JSON.stringify(server?.runtimeTemplate?.outbound)).toContain('"network":"hysteria"');
   });
 
   it('rejects malformed and invalid-port links', () => {
@@ -158,6 +167,17 @@ describe('Remnawave subscription parser', () => {
       .toBe(reordered.find((server) => server.host === 'second.example.com')?.id);
   });
 
+
+  it('adds hidden unique suffixes only when subscription ids collide', () => {
+    const base = `vless://${uuid}@same.example.com:443?security=tls&sni=same.example.com&type=tcp`;
+    const servers = __remnawaveTest.parseSubscriptionToServers(`${base}#US%20One\n${base}#NL%20Two`);
+
+    expect(servers).toHaveLength(2);
+    expect(new Set(servers.map((server) => server.id)).size).toBe(2);
+    expect(servers[0].id.startsWith('subscription-')).toBe(true);
+    expect(servers[1].id.startsWith('subscription-')).toBe(true);
+  });
+
   it('rejects incomplete VLESS, Reality, VMess, Trojan, Shadowsocks and Hysteria2 links', () => {
     const invalidLinks = [
       'vless://not-a-uuid@broken.example.com:443?security=tls#Broken',
@@ -173,4 +193,97 @@ describe('Remnawave subscription parser', () => {
     expect(__remnawaveTest.parseSubscriptionToServers(invalidLinks.join('\n'))).toHaveLength(0);
   });
 
+  it('decodes UTF-8 base64 subscription labels without mojibake', () => {
+    const utf8Subscription = `vless://${uuid}@utf8.example.com:443?security=tls&sni=utf8.example.com&type=tcp#🇫🇮%20Хельсинки`;
+    const encoded = btoa(unescape(encodeURIComponent(utf8Subscription)));
+
+    const [server] = __remnawaveTest.parseSubscriptionToServers(encoded);
+
+    expect(server?.host).toBe('utf8.example.com');
+    expect(server?.rawLabel).toContain('Хельсинки');
+  });
+
+  it('caps imported subscription servers and ignores oversized URIs', () => {
+    const manyServers = Array.from({ length: 1105 }, (_, index) =>
+      `vless://${uuid}@node-${index}.example.com:443?security=tls&sni=node-${index}.example.com&type=tcp#Node-${index}`
+    );
+    const oversized = `vless://${uuid}@oversized.example.com:443?security=tls&sni=oversized.example.com&type=tcp#${'x'.repeat(9000)}`;
+    const servers = __remnawaveTest.parseSubscriptionToServers([...manyServers, oversized].join('\n'));
+
+    expect(servers).toHaveLength(1000);
+    expect(servers.some((server) => server.host === 'oversized.example.com')).toBe(false);
+  });
+
+
+});
+
+
+describe('Server display ranking', () => {
+  function server(id: string, latency: number | null, latencyStatus: VpnServer['latencyStatus'] = 'ok'): VpnServer {
+    return {
+      id,
+      country: id.toUpperCase(),
+      city: 'Node',
+      flag: '🌐',
+      latency,
+      latencyStatus,
+      load: 0,
+      protocol: 'Xray',
+      runtimeTemplate: {
+        family: 'xray',
+        protocol: 'vless',
+        transport: 'tcp',
+        outbound: {}
+      }
+    };
+  }
+
+  it('keeps favorite servers first and sorts the rest by best successful ping', () => {
+    const ranked = rankServersForDisplay([
+      server('slow', 180),
+      server('favorite', 500),
+      server('failed', null, 'failed'),
+      server('fast', 25),
+      server('unchecked', null, 'unchecked')
+    ], 'auto', ['favorite']);
+
+    expect(ranked.map((item) => item.id)).toEqual(['favorite', 'fast', 'slow', 'unchecked', 'failed']);
+  });
+
+  it('sorts all servers by best successful ping when there is no favorite server', () => {
+    const ranked = rankServersForDisplay([
+      server('middle', 80),
+      server('fast', 15),
+      server('slow', 140)
+    ], 'auto');
+
+    expect(ranked.map((item) => item.id)).toEqual(['fast', 'middle', 'slow']);
+  });
+});
+
+
+describe('Routing exclusions settings', () => {
+  it('normalizes user domains and IPv4 CIDR rules safely', () => {
+    expect(normalizeRoutingDomainInput('https://Example.RU/path')).toBe('example.ru');
+    expect(normalizeRoutingDomainInput('*.bank.ru')).toBe('.bank.ru');
+    expect(normalizeRoutingDomainInput('домен.рф')).toBe('xn--d1acufc.xn--p1ai');
+    expect(normalizeRoutingDomainInput('bad_domain.local')).toBeNull();
+    expect(normalizeRoutingIpInput('1.2.3.4')).toBe('1.2.3.4');
+    expect(normalizeRoutingIpInput('5.6.7.0/24')).toBe('5.6.7.0/24');
+    expect(normalizeRoutingIpInput('5.6.7.0/33')).toBeNull();
+  });
+
+  it('deduplicates and keeps stored routing exclusions backward-compatible', () => {
+    const normalized = sanitizeRoutingExclusions({
+      enabled: true,
+      bypassRuDomains: true,
+      domains: ['Example.ru', 'example.ru', 'https://ya.ru/search'],
+      ips: ['1.2.3.4', '1.2.3.4', 'bad']
+    });
+
+    expect(normalized.enabled).toBe(true);
+    expect(normalized.bypassSuDomains).toBe(true);
+    expect(normalized.domains).toEqual(['example.ru', 'ya.ru']);
+    expect(normalized.ips).toEqual(['1.2.3.4']);
+  });
 });

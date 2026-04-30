@@ -105,6 +105,7 @@ interface DiagnosticsTabProps {
   onEnableSystemProxy: () => void;
   onDisableSystemProxy: () => void;
   onRunConnectivityProbe: () => void;
+  onRepairRuntimeEnvironment?: () => void;
   onSyncProfile: () => void;
   onCheckUpdates: () => void;
   onInstallUpdate?: () => void;
@@ -116,6 +117,7 @@ interface DiagnosticsTabProps {
   onLanguageChange: (value: AppSettings['language']) => void;
   isProxyBusy?: boolean;
   isProbeBusy?: boolean;
+  isRepairBusy?: boolean;
   isLogoutBusy?: boolean;
   isSyncingProfile?: boolean;
   isExportingDiagnostics?: boolean;
@@ -136,6 +138,7 @@ export function DiagnosticsTab({
   onEnableSystemProxy,
   onDisableSystemProxy,
   onRunConnectivityProbe,
+  onRepairRuntimeEnvironment,
   onSyncProfile,
   onCheckUpdates,
   onInstallUpdate,
@@ -147,6 +150,7 @@ export function DiagnosticsTab({
   onLanguageChange,
   isProxyBusy = false,
   isProbeBusy = false,
+  isRepairBusy = false,
   isLogoutBusy = false,
   isSyncingProfile = false,
   isExportingDiagnostics = false
@@ -295,13 +299,27 @@ export function DiagnosticsTab({
             <button className="ghost-button" onClick={onRunConnectivityProbe} disabled={isProbeBusy || !runtimeActive}><Radar size={15} />{isProbeBusy ? tr(language, 'Проверяем…', 'Checking…') : tr(language, 'Запустить probe', 'Run probe')}</button>
           </article>
 
+          {onRepairRuntimeEnvironment ? (
+            <article className="action-card">
+              <div className="action-card-head">
+                <span className="micro-pill">Repair</span>
+                <strong>{tr(language, 'Восстановление runtime', 'Runtime repair')}</strong>
+              </div>
+              <p>{tr(language, 'Очищает временные Xray-конфиги, TUN-маршруты и возвращает сохранённое состояние Windows proxy. Запускайте только когда VPN отключён.', 'Cleans temporary Xray configs and TUN routes, then restores saved Windows proxy state. Run it only when VPN is disconnected.')}</p>
+              <button className="ghost-button" onClick={onRepairRuntimeEnvironment} disabled={isRepairBusy || runtimeActive}>
+                <RefreshCcw size={15} />
+                {isRepairBusy ? tr(language, 'Чиним…', 'Repairing…') : tr(language, 'Восстановить', 'Repair')}
+              </button>
+            </article>
+          ) : null}
+
           {onExportDiagnostics ? (
             <article className="action-card">
               <div className="action-card-head">
                 <span className="micro-pill active">JSON</span>
                 <strong>{tr(language, 'Экспорт диагностики', 'Diagnostics export')}</strong>
               </div>
-              <p>{tr(language, 'Собирает безопасный отчёт без ключей, токенов и subscription URL.', 'Collects a safe report without keys, tokens, or subscription URLs.')}</p>
+              <p>{tr(language, 'Собирает отчёт без ключей, токенов и subscription URL. Может включать версию Windows, имя устройства и HWID для поддержки.', 'Collects a report without keys, tokens, or subscription URLs. It may include Windows version, device name, and HWID for support.')}</p>
               <button className="ghost-button" onClick={onExportDiagnostics} disabled={isExportingDiagnostics}>
                 <Download size={15} />
                 {isExportingDiagnostics ? tr(language, 'Готовим…', 'Preparing…') : tr(language, 'Скачать отчёт', 'Download report')}
@@ -462,7 +480,6 @@ export function DiagnosticsTab({
             <span>{tr(language, 'Канал обновлений', 'Release channel')}</span>
             <select value={settings.releaseChannel} onChange={(event: ChangeEvent<HTMLSelectElement>) => onReleaseChannelChange(event.target.value as AppSettings['releaseChannel'])}>
               <option value="stable">Stable</option>
-              <option value="beta">Beta</option>
             </select>
           </label>
 

@@ -20,3 +20,20 @@
 .vk-favorite-star {
   pointer-events: auto;
 }
+
+/* Favorite star visual cleanup: no extra circle around the icon. */
+.vk-favorite-star,
+.vk-favorite-star:hover,
+.vk-favorite-star.active,
+.app-shell.ping-background-active .vk-favorite-star {
+  width: 30px !important;
+  height: 30px !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.vk-favorite-star:hover {
+  transform: translateY(-1px);
+}

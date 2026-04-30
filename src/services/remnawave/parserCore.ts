@@ -1,9 +1,19 @@
+function decodeBase64Utf8(normalized: string) {
+  const binary = atob(normalized);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  try {
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  } catch {
+    return binary;
+  }
+}
+
 export function decodeBase64Compat(value: string) {
   let normalized = value.replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
   while (normalized.length % 4 !== 0) {
     normalized += '=';
   }
-  return atob(normalized);
+  return decodeBase64Utf8(normalized);
 }
 
 export function maybeDecodeBase64(value: string) {
@@ -22,7 +32,7 @@ export function maybeDecodeBase64(value: string) {
   }
 
   try {
-    const decoded = atob(normalized);
+    const decoded = decodeBase64Utf8(normalized);
     return decoded.includes('://') || decoded.includes('\n') ? decoded : value;
   } catch {
     return value;

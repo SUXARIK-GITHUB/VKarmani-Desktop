@@ -4454,11 +4454,13 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vkarmani-desktop"
-version = "0.13.37"
+version = "0.13.40"
 dependencies = [
+ "base64 0.22.1",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-updater",
