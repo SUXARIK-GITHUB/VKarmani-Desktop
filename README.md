@@ -253,18 +253,9 @@ VKarmani-Desktop/
 
 ---
 
-## 🧪 Проверки и сборка
+## 📸 Скриншоты
 
-```bash
-npm ci
-npm run build
-npm run test:parsers
-npm run verify:updater
-npm run verify:xray:manifest
-npm run tauri:build
-```
-
-Для Windows-проверок Xray и runtime используются PowerShell-скрипты из папки `scripts/`.
+👉 [Посмотреть скриншоты VKarmani Desktop](./Screenshots.md)
 
 ---
 
