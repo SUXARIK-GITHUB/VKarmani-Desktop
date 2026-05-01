@@ -1,26 +1,27 @@
 {
-  "version": "0.13.41",
-  "generatedFor": "VKarmani Desktop bundled core artifacts",
-  "files": [
-    {
-      "file": "xray.exe",
-      "size": 19070976,
-      "sha256": "ff15e43034664de7904b131d56bc617c79b2d466c021d36165949ba74d5ba6cb"
-    },
-    {
-      "file": "wintun.dll",
-      "size": 427552,
-      "sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
-    },
-    {
-      "file": "geoip.dat",
-      "size": 20226649,
-      "sha256": "8cf3dac7d99e428a380bd3aa1330f57718a794d45fe4f9dd20077c010dc0bcdb"
-    },
-    {
-      "file": "geosite.dat",
-      "size": 9976949,
-      "sha256": "1cef268aba784cf84196b6576698c0308e6e8bde8bc27a3e7d5b7c4983e06bf8"
-    }
-  ]
+    "version":  "0.13.42",
+    "xrayCoreVersion":  "v26.4.25",
+    "generatedFor":  "VKarmani Desktop bundled core artifacts",
+    "files":  [
+                  {
+                      "file":  "xray.exe",
+                      "size":  35782144,
+                      "sha256":  "38b0c5ca2a619ce772d6150c9bbfc3a4324f7ef76ed1fdd55d1058a22e9b29c2"
+                  },
+                  {
+                      "file":  "wintun.dll",
+                      "size":  427552,
+                      "sha256":  "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+                  },
+                  {
+                      "file":  "geoip.dat",
+                      "size":  19532468,
+                      "sha256":  "b4120c887f2c812e5f57551c83417ec6f668ee16999cb2c620221d0c063ccdf4"
+                  },
+                  {
+                      "file":  "geosite.dat",
+                      "size":  10636085,
+                      "sha256":  "27f9ddad030a1cddda4505badff25b6a27356ea0cb4451ebf0d79c172e96a24d"
+                  }
+              ]
 }

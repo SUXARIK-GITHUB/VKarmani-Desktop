@@ -229,23 +229,23 @@ function parseCountryLabel(label: string, host: string) {
     };
   }
 
-  const parts = cleaned.split(/[|/]/).map((item) => item.trim()).filter(Boolean);
-  const countryPart = parts[0] ?? cleaned;
-  const codeMatch = countryPart.match(/^([A-Z]{2})\s+(.+)$/);
+  const firstSegment = cleaned.split(/[|/]/)[0]?.trim() || cleaned;
+  const codeMatch = firstSegment.match(/^([A-Z]{2})\s+(.+)$/);
   const explicitCode = codeMatch?.[1];
-  const country = (codeMatch?.[2] ?? countryPart).trim();
+  const countryForCode = (codeMatch?.[2] ?? firstSegment).trim();
   const countryCode = inferCountryCode({
-    country,
+    country: countryForCode,
     rawLabel: label,
     host,
     explicitCode
   });
-
-  const cityPart = parts.length >= 2 ? parts[1] : '';
+  const country = explicitCode
+    ? cleaned.replace(new RegExp(`^${explicitCode}\\s+`, 'i'), '').trim()
+    : cleaned;
 
   return {
     country,
-    city: cityPart && cityPart !== host ? cityPart : '',
+    city: '',
     countryCode
   };
 }

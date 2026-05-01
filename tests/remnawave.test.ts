@@ -32,6 +32,17 @@ describe('Remnawave subscription parser', () => {
     expect(JSON.stringify(server?.runtimeTemplate?.outbound)).toContain('/ws');
   });
 
+  it('keeps subscription server labels after pipe separators', () => {
+    const [server] = __remnawaveTest.parseSubscriptionToServers(
+      `vless://${uuid}@pl-adguard.example.com:443?security=tls&sni=pl-adguard.example.com&type=tcp#Poland%20%7C%20AdGuard`
+    );
+
+    expect(server?.rawLabel).toBe('Poland | AdGuard');
+    expect(server?.country).toBe('Poland | AdGuard');
+    expect(server?.city).toBe('');
+    expect(server?.countryCode).toBe('PL');
+  });
+
   it('parses VMess links from base64url subscriptions', () => {
     const vmessPayload = btoa(JSON.stringify({
       v: '2',
