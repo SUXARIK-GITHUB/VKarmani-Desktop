@@ -1,11 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VKarmani",
-<<<<<<< HEAD
-  "version": "0.13.45",
-=======
-  "version": "0.13.44",
->>>>>>> 9e1a43a9f2673100e424fca65a80abb1315d39d6
+  "version": "0.13.46",
   "identifier": "com.vkarmani.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
