@@ -487,7 +487,11 @@ export async function fetchRemoteText(url: string, accept = 'text/plain, applica
 
 export async function fetchRemoteJson<T = unknown>(url: string, accept = 'application/json, text/plain, text/html') {
   const raw = await fetchRemoteText(url, accept);
-  return JSON.parse(raw) as T;
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+    throw new Error('Remnawave endpoint вернул subscription-шаблон, а не JSON-профиль. Пробуем raw/template импорт серверов.');
+  }
+  return JSON.parse(trimmed) as T;
 }
 
 

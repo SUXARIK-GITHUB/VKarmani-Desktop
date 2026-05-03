@@ -45,6 +45,8 @@ const delay = (value: number) => new Promise<void>((resolve) => window.setTimeou
 const previewDelay = (value: number) => isTauriRuntime ? Promise.resolve() : delay(value);
 const REQUEST_TIMEOUT_MS = 6500;
 const VKARMANI_SUBSCRIPTION_PREFIX = 'https://sub.vkarmani.com/';
+const REMNAWAVE_TEMPLATE_SLUGS = ['raw', 'xray-json', 'xray', 'singbox', 'sing-box', 'mihomo', 'stash', 'clash'];
+const REMNAWAVE_TEMPLATE_QUERY_PARAMS = ['template', 'format', 'app'];
 
 function withRequestTimeout<T>(operation: Promise<T>, url: string): Promise<T> {
   let timer: number | undefined;
@@ -406,7 +408,7 @@ function makeProvisionalSession(accessKey: string, key: ResolvedAccessKey): Remn
 }
 
 function looksLikeUuid(value: string) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
 function looksLikeShortUuid(value: string) {
@@ -450,6 +452,28 @@ function resolveAccessKey(rawInput: string): ResolvedAccessKey {
   };
 }
 
+function appendTemplateCandidates(candidates: string[], base: string) {
+  const normalizedBase = base.replace(/\/+$/g, '');
+
+  for (const slug of REMNAWAVE_TEMPLATE_SLUGS) {
+    if (!normalizedBase.toLowerCase().endsWith(`/${slug}`)) {
+      candidates.push(`${normalizedBase}/${slug}`);
+    }
+  }
+
+  for (const slug of REMNAWAVE_TEMPLATE_SLUGS.filter((item) => item !== 'raw')) {
+    for (const param of REMNAWAVE_TEMPLATE_QUERY_PARAMS) {
+      try {
+        const withQuery = new URL(normalizedBase);
+        withQuery.searchParams.set(param, slug);
+        candidates.push(withQuery.toString());
+      } catch {
+        // Ignore malformed URL variants; the original URL is validated earlier.
+      }
+    }
+  }
+}
+
 function buildUrlDerivedCandidates(rawUrl: string, shortUuid?: string) {
   const candidates: string[] = [];
 
@@ -463,6 +487,7 @@ function buildUrlDerivedCandidates(rawUrl: string, shortUuid?: string) {
     if (!base.endsWith('/raw')) {
       candidates.push(`${base}/raw`);
     }
+    appendTemplateCandidates(candidates, base);
     if (!base.endsWith('/info')) {
       candidates.push(`${base}/info`);
     }
@@ -580,15 +605,19 @@ async function fetchJsonCandidates(urls: string[]): Promise<CandidateResult<unkn
   throw new Error(lastError);
 }
 
-async function fetchTextCandidates(urls: string[]): Promise<CandidateResult<string>> {
-  let lastError = 'Не удалось получить raw subscription.';
+async function fetchParsedSubscriptionCandidates(urls: string[]): Promise<CandidateResult<string> & { servers: VpnServer[] }> {
+  let lastError = 'Не удалось получить subscription-шаблон Remnawave.';
 
   for (const url of urls) {
     try {
-      return {
-        value: await withRequestTimeout(fetchRemoteText(url), url),
-        url
-      };
+      const value = await withRequestTimeout(fetchRemoteText(url), url);
+      const servers = parseSubscriptionToServers(value);
+
+      if (servers.length) {
+        return { value, url, servers };
+      }
+
+      lastError = 'Subscription-шаблон получен, но VKarmani пока не нашёл в нём готовые узлы Xray/VLESS/VMess/Trojan/SS/Hysteria2.';
     } catch (error) {
       lastError = error instanceof Error ? error.message : 'Ошибка сети.';
     }
@@ -822,12 +851,8 @@ export class RemnawaveClient {
       // Такой ключ допускается только как ограниченный raw-only режим: сервера импортируются,
       // но статус подписки/лимитов/устройств не считается подтверждённым panel info endpoint.
       try {
-        const rawResult = await fetchTextCandidates(buildRawCandidates(key, provisionalSession));
-        const importedServers = parseSubscriptionToServers(rawResult.value);
-
-        if (!importedServers.length) {
-          throw new Error('Raw subscription получен, но серверы в нём не распознаны.');
-        }
+        const rawResult = await fetchParsedSubscriptionCandidates(buildRawCandidates(key, provisionalSession));
+        const importedServers = rawResult.servers;
 
         this.cachedSession = provisionalSession;
         this.cachedDevices = [buildLocalDeviceRecord()];
@@ -875,12 +900,8 @@ export class RemnawaveClient {
     }
 
     try {
-      const rawResult = await fetchTextCandidates(candidates);
-      const importedServers = parseSubscriptionToServers(rawResult.value);
-
-      if (!importedServers.length) {
-        throw new Error('Raw subscription получен, но распознать узлы пока не удалось.');
-      }
+      const rawResult = await fetchParsedSubscriptionCandidates(candidates);
+      const importedServers = rawResult.servers;
 
       this.cachedServers = importedServers;
       const readyCount = importedServers.filter((item) => item.runtimeTemplate).length;

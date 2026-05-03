@@ -32,6 +32,94 @@ describe('Remnawave subscription parser', () => {
     expect(JSON.stringify(server?.runtimeTemplate?.outbound)).toContain('/ws');
   });
 
+  it('parses UUIDv7 VLESS links from base64 Remnawave subscriptions', () => {
+    const uuidV7 = '01890f3a-a123-7abc-b456-426614174000';
+    const raw = `vless://${uuidV7}@uuid7.example.com:443?security=reality&sni=uuid7.example.com&fp=chrome&pbk=PUBKEY&sid=abcd&type=tcp#FI%20UUIDv7`;
+    const [server] = __remnawaveTest.parseSubscriptionToServers(btoa(raw));
+
+    expect(server?.runtimeTemplate?.protocol).toBe('vless');
+    expect(server?.host).toBe('uuid7.example.com');
+    expect(JSON.stringify(server?.runtimeTemplate?.outbound)).toContain('realitySettings');
+  });
+
+  it('parses Xray JSON template outbounds from Remnawave templates', () => {
+    const raw = JSON.stringify({
+      outbounds: [
+        {
+          tag: 'DE Xray JSON',
+          protocol: 'vless',
+          settings: {
+            vnext: [
+              {
+                address: 'xray-json.example.com',
+                port: 443,
+                users: [{ id: uuid, encryption: 'none' }]
+              }
+            ]
+          },
+          streamSettings: {
+            network: 'ws',
+            security: 'tls',
+            tlsSettings: { serverName: 'xray-json.example.com' },
+            wsSettings: { path: '/ws' }
+          }
+        }
+      ]
+    });
+
+    const [server] = __remnawaveTest.parseSubscriptionToServers(raw);
+
+    expect(server?.runtimeTemplate?.protocol).toBe('vless');
+    expect(server?.runtimeTemplate?.transport).toBe('ws');
+    expect(server?.host).toBe('xray-json.example.com');
+  });
+
+  it('parses Sing-box JSON template outbounds from Remnawave templates', () => {
+    const raw = JSON.stringify({
+      outbounds: [
+        {
+          type: 'vless',
+          tag: 'NL Singbox',
+          server: 'singbox-template.example.com',
+          server_port: 443,
+          uuid,
+          tls: { enabled: true, server_name: 'singbox-template.example.com', utls: { fingerprint: 'chrome' } },
+          transport: { type: 'ws', path: '/ws', headers: { Host: 'singbox-template.example.com' } }
+        }
+      ]
+    });
+
+    const [server] = __remnawaveTest.parseSubscriptionToServers(raw);
+
+    expect(server?.runtimeTemplate?.protocol).toBe('vless');
+    expect(server?.runtimeTemplate?.transport).toBe('ws');
+    expect(server?.host).toBe('singbox-template.example.com');
+  });
+
+  it('parses Mihomo/Clash YAML template proxies from Remnawave templates', () => {
+    const raw = `proxies:
+  - name: US Clash
+    type: vless
+    server: clash-template.example.com
+    port: 443
+    uuid: ${uuid}
+    tls: true
+    servername: clash-template.example.com
+    client-fingerprint: chrome
+    network: ws
+    ws-opts:
+      path: /ws
+      headers:
+        Host: clash-template.example.com
+`;
+
+    const [server] = __remnawaveTest.parseSubscriptionToServers(raw);
+
+    expect(server?.runtimeTemplate?.protocol).toBe('vless');
+    expect(server?.runtimeTemplate?.transport).toBe('ws');
+    expect(server?.host).toBe('clash-template.example.com');
+  });
+
   it('keeps subscription server labels after pipe separators', () => {
     const [server] = __remnawaveTest.parseSubscriptionToServers(
       `vless://${uuid}@pl-adguard.example.com:443?security=tls&sni=pl-adguard.example.com&type=tcp#Poland%20%7C%20AdGuard`
