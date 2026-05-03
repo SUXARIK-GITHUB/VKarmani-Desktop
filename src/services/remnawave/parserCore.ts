@@ -33,7 +33,10 @@ export function maybeDecodeBase64(value: string) {
 
   try {
     const decoded = decodeBase64Utf8(normalized);
-    return decoded.includes('://') || decoded.includes('\n') ? decoded : value;
+    const trimmedDecoded = decoded.replace(/^\uFEFF/u, '').trimStart();
+    return decoded.includes('://') || decoded.includes('\n') || trimmedDecoded.startsWith('{') || trimmedDecoded.startsWith('[') || /^proxies\s*:/i.test(trimmedDecoded)
+      ? decoded
+      : value;
   } catch {
     return value;
   }

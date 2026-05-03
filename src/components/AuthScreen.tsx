@@ -18,6 +18,7 @@ import {
   Zap
 } from 'lucide-react';
 import { tr, type UiLanguage } from '../i18n';
+import { openExternalUrl } from '../services/runtime';
 import type { IntegrationMeta } from '../types/vpn';
 
 interface AuthScreenProps {
@@ -111,6 +112,11 @@ export function AuthScreen({
     : accessKeyKind === 'invalid'
       ? tr(language, 'Неверный формат', 'Invalid format')
       : tr(language, 'Ключ не введён', 'No key entered');
+
+  const openSupportLink = (event: React.MouseEvent<HTMLAnchorElement>, url: string) => {
+    event.preventDefault();
+    void openExternalUrl(url);
+  };
 
   const onKeyDown = async (event: React.KeyboardEvent<HTMLInputElement>) => {
     const input = inputRef.current;
@@ -306,8 +312,8 @@ export function AuthScreen({
         <div className="auth-support-inline auth-support-inline-v5">
           <LockKeyhole size={16} />
           <span>{tr(language, 'Нет ключа?', 'No key?')}</span>
-          <a href="https://t.me/VKarmani_VPN_bot" target="_blank" rel="noreferrer">Telegram</a>
-          <a href="https://www.vkarmani.com/" target="_blank" rel="noreferrer">
+          <a href="https://t.me/VKarmani_VPN_bot" target="_blank" rel="noreferrer" onClick={(event) => openSupportLink(event, 'https://t.me/VKarmani_VPN_bot')}>Telegram</a>
+          <a href="https://www.vkarmani.com/" target="_blank" rel="noreferrer" onClick={(event) => openSupportLink(event, 'https://www.vkarmani.com/')}>
             {tr(language, 'Перейти на сайт', 'Open website')}
             <ArrowUpRight size={14} />
           </a>

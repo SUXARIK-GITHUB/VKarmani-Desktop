@@ -476,10 +476,17 @@ pub(crate) fn build_xray_config(
 }
 
 pub(crate) fn value_as_valid_port(value: &Value) -> Option<u16> {
-    value
+    if let Some(port) = value
         .as_u64()
         .filter(|port| (1..=65535).contains(port))
-        .map(|port| port as u16)
+    {
+        return Some(port as u16);
+    }
+
+    value
+        .as_str()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
 }
 
 pub(crate) fn extract_outbound_address_and_port(template: &RuntimeTemplate) -> (Option<String>, u16) {
@@ -516,6 +523,26 @@ pub(crate) fn extract_outbound_address_and_port(template: &RuntimeTemplate) -> (
             .and_then(value_as_valid_port)
             .unwrap_or(default_port);
         return (address, port);
+    }
+
+    if let Some(settings) = settings.and_then(|value| value.as_object()) {
+        let address = settings
+            .get("address")
+            .or_else(|| settings.get("server"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+
+        if address.is_some() {
+            let port = settings
+                .get("port")
+                .or_else(|| settings.get("server_port"))
+                .or_else(|| settings.get("serverPort"))
+                .and_then(value_as_valid_port)
+                .unwrap_or(default_port);
+            return (address, port);
+        }
     }
 
     (None, default_port)

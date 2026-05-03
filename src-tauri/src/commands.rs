@@ -1,5 +1,63 @@
 use super::*;
 
+
+#[tauri::command]
+pub(crate) fn open_external_url(url: String) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url.trim())
+        .map_err(|_| "Некорректная внешняя ссылка.".to_string())?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+
+    let allowed = scheme == "https"
+        && matches!(
+            host.as_str(),
+            "t.me" | "telegram.me" | "vkarmani.com" | "www.vkarmani.com"
+        );
+
+    if !allowed {
+        return Err("Эту внешнюю ссылку нельзя открыть из приложения.".to_string());
+    }
+
+    let target = parsed.to_string();
+
+    #[cfg(target_os = "windows")]
+    {
+        let status = Command::new("cmd")
+            .args(["/C", "start", "", target.as_str()])
+            .creation_flags(0x08000000)
+            .status()
+            .map_err(|error| format!("Не удалось открыть ссылку в браузере: {error}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(format!("Windows не смог открыть ссылку: {status}"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("open")
+            .arg(target.as_str())
+            .status()
+            .map_err(|error| format!("Не удалось открыть ссылку: {error}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(format!("macOS не смогла открыть ссылку: {status}"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let status = Command::new("xdg-open")
+            .arg(target.as_str())
+            .status()
+            .map_err(|error| format!("Не удалось открыть ссылку: {error}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(format!("xdg-open не смог открыть ссылку: {status}"));
+    }
+}
+
 #[tauri::command]
 pub(crate) fn write_interface_log(message: String, details: Option<String>, app: AppHandle) -> Result<(), String> {
     let line = details

@@ -68,6 +68,7 @@ const NATIVE_COMMAND_TIMEOUTS_MS: Record<string, number> = {
   set_system_proxy: 18000,
   public_ip_snapshot: 12000,
   fetch_remote_text: 20000,
+  open_external_url: 7000,
   revoke_hwid_device: 20000,
   connectivity_probe: 12000,
   repair_runtime_environment: 18000,
@@ -449,9 +450,9 @@ export async function writeNativeRoutingLog(message: string, details?: string) {
 }
 
 
-export async function fetchRemoteText(url: string, accept = 'text/plain, application/json, text/html') {
+export async function fetchRemoteText(url: string, accept = 'text/plain, application/json, text/html', userAgent?: string) {
   if (isTauriRuntime) {
-    return invokeTauri<string>('fetch_remote_text', { url, accept });
+    return invokeTauri<string>('fetch_remote_text', { url, accept, userAgent });
   }
 
   const safeUrl = validateWebRemoteFetchUrl(url);
@@ -485,11 +486,30 @@ export async function fetchRemoteText(url: string, accept = 'text/plain, applica
   }
 }
 
-export async function fetchRemoteJson<T = unknown>(url: string, accept = 'application/json, text/plain, text/html') {
-  const raw = await fetchRemoteText(url, accept);
-  return JSON.parse(raw) as T;
+export async function fetchRemoteJson<T = unknown>(url: string, accept = 'application/json, text/plain, text/html', userAgent?: string) {
+  const raw = await fetchRemoteText(url, accept, userAgent);
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+    throw new Error('Remnawave endpoint вернул subscription-шаблон, а не JSON-профиль. Пробуем raw/template импорт серверов.');
+  }
+  return JSON.parse(trimmed) as T;
 }
 
+
+
+export async function openExternalUrl(url: string): Promise<void> {
+  const parsed = new URL(url);
+  if (!['https:', 'tg:'].includes(parsed.protocol)) {
+    throw new Error('Можно открыть только безопасную внешнюю ссылку.');
+  }
+
+  if (isTauriRuntime) {
+    await invokeTauri('open_external_url', { url }, NATIVE_COMMAND_TIMEOUTS_MS.open_external_url);
+    return;
+  }
+
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
 
 
 export async function revokeNativeHwidDevice(

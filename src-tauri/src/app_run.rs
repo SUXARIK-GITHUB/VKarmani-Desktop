@@ -227,6 +227,7 @@ pub fn run() {
             cache_profile_sync,
             write_interface_log,
             write_routing_log,
+            open_external_url,
             request_show,
             window_minimize,
             window_toggle_maximize,

@@ -86,17 +86,63 @@ pub(crate) fn read_limited_remote_text(response: reqwest::blocking::Response) ->
     Ok(text)
 }
 
+fn normalize_remote_user_agent(user_agent: Option<String>) -> Result<String, String> {
+    let user_agent = user_agent
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| APP_USER_AGENT.to_string());
+
+    if user_agent.len() > 160 || user_agent.chars().any(|ch| ch == '\r' || ch == '\n') {
+        return Err("Некорректный User-Agent для subscription-запроса.".to_string());
+    }
+
+    Ok(user_agent)
+}
+
+fn should_attach_remnawave_device_headers(url: &reqwest::Url) -> bool {
+    url.host_str()
+        .map(|host| host.eq_ignore_ascii_case("sub.vkarmani.com"))
+        .unwrap_or(false)
+}
+
+fn attach_remnawave_device_headers(
+    request: reqwest::blocking::RequestBuilder,
+    url: &reqwest::Url,
+) -> reqwest::blocking::RequestBuilder {
+    if !should_attach_remnawave_device_headers(url) {
+        return request;
+    }
+
+    let (hwid, os_name, os_version, os_build, os_architecture, device_name) = windows_device_info();
+    let mut request = request
+        .header("x-device-os", os_name)
+        .header("x-ver-os", format!("{} {}", os_version, os_build).trim().to_string())
+        .header("x-device-model", if device_name.trim().is_empty() || device_name == "—" {
+            format!("VKarmani Desktop {os_architecture}")
+        } else {
+            device_name
+        });
+
+    if !hwid.trim().is_empty() && hwid != "—" {
+        request = request.header("x-hwid", hwid);
+    }
+
+    request
+}
+
 #[tauri::command]
-pub(crate) fn fetch_remote_text(url: String, accept: Option<String>) -> Result<String, String> {
+pub(crate) fn fetch_remote_text(url: String, accept: Option<String>, user_agent: Option<String>) -> Result<String, String> {
     let client = build_remote_fetch_client(Duration::from_secs(8))?;
     let accept_header = accept.unwrap_or_else(|| "text/plain, application/json, text/html".to_string());
+    let user_agent_header = normalize_remote_user_agent(user_agent)?;
     let mut current_url = validate_remote_fetch_url(&url)?;
 
     for redirect_count in 0..=MAX_REMOTE_FETCH_REDIRECTS {
-        let response = client
+        let request = client
             .get(current_url.clone())
-            .header(reqwest::header::USER_AGENT, APP_USER_AGENT)
-            .header(reqwest::header::ACCEPT, accept_header.as_str())
+            .header(reqwest::header::USER_AGENT, user_agent_header.as_str())
+            .header(reqwest::header::ACCEPT, accept_header.as_str());
+        let response = attach_remnawave_device_headers(request, &current_url)
             .send()
             .map_err(|error| format!("Не удалось получить ответ от {current_url}: {error}"))?;
 
