@@ -42,6 +42,7 @@ describe('Remnawave subscription parser', () => {
     expect(JSON.stringify(server?.runtimeTemplate?.outbound)).toContain('realitySettings');
   });
 
+<<<<<<< HEAD
   it('parses base64 encoded Xray JSON template without confusing it with raw URI base64', () => {
     const raw = JSON.stringify({
       outbounds: [
@@ -75,6 +76,8 @@ describe('Remnawave subscription parser', () => {
     expect(JSON.stringify(server?.runtimeTemplate?.outbound)).toContain('realitySettings');
   });
 
+=======
+>>>>>>> 9e1a43a9f2673100e424fca65a80abb1315d39d6
   it('parses Xray JSON template outbounds from Remnawave templates', () => {
     const raw = JSON.stringify({
       outbounds: [

@@ -1,6 +1,10 @@
 [package]
 name = "vkarmani-desktop"
+<<<<<<< HEAD
 version = "0.13.45"
+=======
+version = "0.13.44"
+>>>>>>> 9e1a43a9f2673100e424fca65a80abb1315d39d6
 edition = "2021"
 rust-version = "1.77.2"
 

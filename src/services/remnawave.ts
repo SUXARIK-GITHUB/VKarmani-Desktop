@@ -699,6 +699,7 @@ async function fetchParsedSubscriptionCandidates(urls: string[]): Promise<Candid
 
   for (const candidate of buildSubscriptionFetchCandidates(urls)) {
     try {
+<<<<<<< HEAD
       const value = await withRequestTimeout(
         fetchRemoteText(candidate.url, candidate.accept, candidate.userAgent),
         candidate.url
@@ -716,6 +717,16 @@ async function fetchParsedSubscriptionCandidates(urls: string[]): Promise<Candid
       }
 
       lastError = `Subscription-шаблон получен (${candidate.formatHint}), но VKarmani пока не нашёл в нём готовые узлы Xray/VLESS/VMess/Trojan/SS/Hysteria2.`;
+=======
+      const value = await withRequestTimeout(fetchRemoteText(url), url);
+      const servers = parseSubscriptionToServers(value);
+
+      if (servers.length) {
+        return { value, url, servers };
+      }
+
+      lastError = 'Subscription-шаблон получен, но VKarmani пока не нашёл в нём готовые узлы Xray/VLESS/VMess/Trojan/SS/Hysteria2.';
+>>>>>>> 9e1a43a9f2673100e424fca65a80abb1315d39d6
     } catch (error) {
       lastError = error instanceof Error ? error.message : 'Ошибка сети.';
     }
