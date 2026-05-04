@@ -6,215 +6,176 @@ import type { VpnServer } from '../src/types/vpn';
 
 const uuid = '123e4567-e89b-12d3-a456-426614174000';
 
-function base64Url(value: string) {
-  return btoa(value).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-}
+describe('Remnawave Xray JSON profile parser', () => {
+  it('builds only Xray JSON profile endpoint candidates', () => {
+    const candidates = __remnawaveTest.buildXrayJsonUrlCandidates('https://sub.vkarmani.com/1NJDc37GHnsdRnvX', '1NJDc37GHnsdRnvX');
 
-describe('Remnawave subscription parser', () => {
-  it('parses VLESS Reality links', () => {
-    const [server] = __remnawaveTest.parseSubscriptionToServers(
-      `vless://${uuid}@reality.example.com:443?security=reality&sni=reality.example.com&fp=chrome&pbk=PUBKEY&sid=abcd&type=tcp#NL%20Reality`
-    );
-
-    expect(server?.runtimeTemplate?.protocol).toBe('vless');
-    expect(server?.host).toBe('reality.example.com');
-    expect(server?.port).toBe(443);
-    expect(JSON.stringify(server?.runtimeTemplate?.outbound)).toContain('realitySettings');
+    expect(candidates).toEqual([
+      'https://sub.vkarmani.com/1NJDc37GHnsdRnvX/json',
+      'https://sub.vkarmani.com/api/sub/1NJDc37GHnsdRnvX/json',
+      'https://sub.vkarmani.com/api/subscriptions/by-short-uuid/1NJDc37GHnsdRnvX/json'
+    ]);
+    expect(candidates.every((url) => url.endsWith('/json'))).toBe(true);
   });
 
-  it('parses VLESS WebSocket TLS links', () => {
-    const [server] = __remnawaveTest.parseSubscriptionToServers(
-      `vless://${uuid}@ws.example.com:8443?security=tls&sni=cdn.example.com&type=ws&host=cdn.example.com&path=%2Fws#US%20WS`
-    );
-
-    expect(server?.runtimeTemplate?.protocol).toBe('vless');
-    expect(server?.runtimeTemplate?.transport).toBe('ws');
-    expect(JSON.stringify(server?.runtimeTemplate?.outbound)).toContain('/ws');
+  it('uses a single Xray JSON profile identity during production sync', () => {
+    expect(__remnawaveTest.XRAY_JSON_SUBSCRIPTION_PROFILE.name).toBe('Xray JSON');
+    expect(__remnawaveTest.XRAY_JSON_SUBSCRIPTION_PROFILE.accept).toContain('application/json');
+    expect(__remnawaveTest.XRAY_JSON_SUBSCRIPTION_PROFILE.userAgent).toContain('Xray/');
+    expect(__remnawaveTest.XRAY_JSON_SUBSCRIPTION_PROFILE.userAgent).toContain('VKarmani-Desktop');
   });
 
-  it('parses VMess links from base64url subscriptions', () => {
-    const vmessPayload = btoa(JSON.stringify({
-      v: '2',
-      ps: 'DE VMess',
-      add: 'vmess.example.com',
+  it('parses standard Xray JSON config arrays', () => {
+    const payload = [
+      {
+        remarks: 'VKarmani Smart / RU Moscow',
+        outbounds: [
+          {
+            tag: 'proxy',
+            protocol: 'vless',
+            settings: {
+              vnext: [{ address: 'smart-ru.example.com', port: 443, users: [{ id: uuid, encryption: 'none' }] }]
+            },
+            streamSettings: { network: 'tcp', security: 'tls', tlsSettings: { serverName: 'smart-ru.example.com' } }
+          },
+          { tag: 'direct', protocol: 'freedom' }
+        ]
+      },
+      {
+        remarks: 'Netherland | All',
+        outbounds: [
+          {
+            tag: 'proxy',
+            protocol: 'trojan',
+            settings: { servers: [{ address: 'nl.example.com', port: 443, password: 'secret' }] },
+            streamSettings: { network: 'tcp', security: 'tls', tlsSettings: { serverName: 'nl.example.com' } }
+          }
+        ]
+      }
+    ];
+
+    const servers = __remnawaveTest.parseXrayJsonSubscriptionToServers(JSON.stringify(payload));
+
+    expect(servers.map((server) => server.rawLabel)).toEqual(['VKarmani Smart / RU Moscow', 'Netherland | All']);
+    expect(servers[0].runtimeTemplate?.protocol).toBe('vless');
+    expect(servers[1].runtimeTemplate?.protocol).toBe('trojan');
+  });
+
+  it('rejects non-JSON profile bodies in the production parser', () => {
+    expect(__remnawaveTest.parseXrayJsonSubscriptionToServers('vless://id@example.com:443#OldTextFormat')).toHaveLength(0);
+    expect(__remnawaveTest.parseXrayJsonSubscriptionToServers('not a json document')).toHaveLength(0);
+  });
+
+  it('keeps top-level Xray JSON config remarks instead of showing generic proxy labels', () => {
+    const payload = {
+      remarks: 'Single Xray JSON Node',
+      outbounds: [
+        {
+          tag: 'proxy',
+          protocol: 'vless',
+          settings: {
+            vnext: [{ address: 'single-xray.example.com', port: 443, users: [{ id: uuid, encryption: 'none' }] }]
+          },
+          streamSettings: { network: 'tcp', security: 'tls', tlsSettings: { serverName: 'single-xray.example.com' } }
+        },
+        { tag: 'direct', protocol: 'freedom' }
+      ]
+    };
+
+    const [server] = __remnawaveTest.parseXrayJsonSubscriptionToServers(JSON.stringify(payload));
+
+    expect(server?.rawLabel).toBe('Single Xray JSON Node');
+    expect(server?.host).toBe('single-xray.example.com');
+    expect(server?.runtimeTemplate?.protocol).toBe('vless');
+  });
+
+  it('uses Remnawave structured display names inside Xray JSON payloads', () => {
+    const payload = {
+      response: {
+        rawHosts: [
+          {
+            protocol: 'vless',
+            host: 'smart-ru.example.com',
+            port: 443,
+            uuid,
+            security: 'tls',
+            serverDescription: 'VKarmani Smart / RU Moscow',
+            rawInbound: { remark: 'Poland | No ADS' }
+          },
+          {
+            protocol: 'vless',
+            host: 'nl.example.com',
+            port: 443,
+            uuid,
+            security: 'tls',
+            name: 'Netherland | All'
+          }
+        ]
+      }
+    };
+
+    const servers = __remnawaveTest.parseXrayJsonSubscriptionToServers(JSON.stringify(payload));
+
+    expect(servers.map((server) => server.rawLabel)).toEqual(['VKarmani Smart / RU Moscow', 'Netherland | All']);
+    expect(servers[0].country).toBe('VKarmani Smart / RU Moscow');
+    expect(servers[0].countryCode).toBe('PL');
+  });
+
+  it('hides backend cascade members when a public aggregate is present in Xray JSON', () => {
+    const host = (name: string, label: string) => ({
+      protocol: 'vless',
+      host: `${name}.example.com`,
       port: 443,
-      id: uuid,
-      aid: 0,
-      net: 'ws',
-      type: 'none',
-      host: 'vmess.example.com',
-      path: '/ray',
-      tls: 'tls',
-      sni: 'vmess.example.com'
-    }));
+      uuid,
+      security: 'tls',
+      serverDescription: label
+    });
+    const payload = {
+      response: {
+        rawHosts: [
+          host('pl-public', 'Poland | No ADS'),
+          host('pl-s1', 'Poland S1 | mallard'),
+          host('pl-s2', 'Poland S2 | badger'),
+          host('se-public', 'Sweden S1 | All')
+        ]
+      }
+    };
 
-    const subscription = base64Url(`vmess://${vmessPayload}`);
-    const [server] = __remnawaveTest.parseSubscriptionToServers(subscription);
+    const servers = __remnawaveTest.parseXrayJsonSubscriptionToServers(JSON.stringify(payload));
 
-    expect(server?.runtimeTemplate?.protocol).toBe('vmess');
-    expect(server?.host).toBe('vmess.example.com');
-    expect(server?.port).toBe(443);
+    expect(servers.map((server) => server.rawLabel)).toEqual(['Poland | No ADS', 'Sweden S1 | All']);
+    expect(servers.some((server) => /mallard|badger/i.test(server.rawLabel ?? ''))).toBe(false);
   });
 
+  it('keeps server ids stable when Xray JSON config order changes', () => {
+    const config = (label: string, host: string) => ({
+      remarks: label,
+      outbounds: [
+        {
+          tag: 'proxy',
+          protocol: 'vless',
+          settings: {
+            vnext: [{ address: host, port: 443, users: [{ id: uuid, encryption: 'none' }] }]
+          },
+          streamSettings: { network: 'tcp', security: 'tls', tlsSettings: { serverName: host } }
+        }
+      ]
+    });
 
-  it('parses VMess payload encoded as base64url without padding', () => {
-    const vmessPayload = base64Url(JSON.stringify({
-      v: '2',
-      ps: 'NL VMess URL-safe',
-      add: 'vmess-ipv6.example.com',
-      port: '8443',
-      id: uuid,
-      aid: '0',
-      net: 'tcp',
-      type: 'none',
-      tls: 'tls',
-      sni: 'vmess-ipv6.example.com'
-    }));
-
-    const [server] = __remnawaveTest.parseSubscriptionToServers(`vmess://${vmessPayload}`);
-
-    expect(server?.runtimeTemplate?.protocol).toBe('vmess');
-    expect(server?.host).toBe('vmess-ipv6.example.com');
-    expect(server?.port).toBe(8443);
-  });
-
-  it('parses Trojan links', () => {
-    const [server] = __remnawaveTest.parseSubscriptionToServers(
-      'trojan://secret@example.net:443?security=tls&sni=example.net&type=tcp#Trojan'
-    );
-
-    expect(server?.runtimeTemplate?.protocol).toBe('trojan');
-    expect(server?.host).toBe('example.net');
-    expect(server?.port).toBe(443);
-  });
-
-  it('parses Shadowsocks IPv4 and IPv6 endpoints', () => {
-    const ipv4 = 'ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNzQDEuMi4zLjQ6ODM4OA#SS%20IPv4';
-    const ipv6 = 'ss://chacha20-ietf-poly1305:pass@[2001:4860:4860::8888]:8388#SS%20IPv6';
-    const servers = __remnawaveTest.parseSubscriptionToServers(`${ipv4}\n${ipv6}`);
-
-    expect(servers).toHaveLength(2);
-    expect(servers[0].host).toBe('1.2.3.4');
-    expect(servers[0].port).toBe(8388);
-    expect(servers[1].host).toBe('2001:4860:4860::8888');
-    expect(servers[1].port).toBe(8388);
-  });
-
-  it('parses VLESS XHTTP links', () => {
-    const [server] = __remnawaveTest.parseSubscriptionToServers(
-      `vless://${uuid}@xhttp.example.com:443?security=tls&sni=xhttp.example.com&type=xhttp&host=cdn.example.com&path=%2Fxhttp&mode=auto#US%20XHTTP`
-    );
-
-    expect(server?.runtimeTemplate?.protocol).toBe('vless');
-    expect(server?.runtimeTemplate?.transport).toBe('xhttp');
-    expect(JSON.stringify(server?.runtimeTemplate?.outbound)).toContain('xhttpSettings');
-  });
-
-  it('parses VLESS XHTTP aliases and extra JSON', () => {
-    const extra = encodeURIComponent(JSON.stringify({ scMaxEachPostBytes: 65536 }));
-    const [server] = __remnawaveTest.parseSubscriptionToServers(
-      `vless://${uuid}@xhttp-extra.example.com:443?security=tls&sni=xhttp-extra.example.com&type=splithttp&authority=cdn.example.com&pathPrefix=%2Fxhttp&mode=packet-up&extra=${extra}#US%20XHTTP%20Extra`
-    );
-
-    const outbound = JSON.stringify(server?.runtimeTemplate?.outbound);
-    expect(server?.runtimeTemplate?.transport).toBe('xhttp');
-    expect(outbound).toContain('xhttpSettings');
-    expect(outbound).toContain('scMaxEachPostBytes');
-  });
-
-  it('parses Hysteria2 links', () => {
-    const [server] = __remnawaveTest.parseSubscriptionToServers(
-      'hy2://secret@hy2.example.com:443?sni=hy2.example.com&obfs=salamander&obfs-password=obfs-pass#NL%20HY2'
-    );
-
-    expect(server?.protocol).toBe('Hysteria2');
-    expect(server?.runtimeTemplate?.protocol).toBe('hysteria2');
-    expect(server?.host).toBe('hy2.example.com');
-    expect(server?.port).toBe(443);
-    const outbound = server?.runtimeTemplate?.outbound as Record<string, unknown>;
-    expect(outbound.protocol).toBe('hysteria');
-    expect(JSON.stringify(outbound)).toContain('"version":2');
-    expect(JSON.stringify(outbound)).toContain('hysteriaSettings');
-    expect(JSON.stringify(outbound)).toContain('udpmasks');
-  });
-
-  it('parses Hysteria2 aliases and IPv6 hosts', () => {
-    const [server] = __remnawaveTest.parseSubscriptionToServers(
-      'hysteria2://secret@[2001:4860:4860::8888]:8443?peer=hy2.example.com&obfs_type=salamander&obfsPassword=obfs-pass#HY2%20IPv6'
-    );
-
-    expect(server?.runtimeTemplate?.protocol).toBe('hysteria2');
-    expect(server?.host).toBe('2001:4860:4860::8888');
-    expect(JSON.stringify(server?.runtimeTemplate?.outbound)).toContain('obfs-pass');
-    expect(JSON.stringify(server?.runtimeTemplate?.outbound)).toContain('"network":"hysteria"');
-  });
-
-  it('rejects malformed and invalid-port links', () => {
-    expect(__remnawaveTest.parseSubscriptionToServers('not-a-link')).toHaveLength(0);
-    expect(__remnawaveTest.parsePort('70000', 443)).toBe(443);
-  });
-
-  it('keeps server ids stable when subscription order changes', () => {
-    const first = `vless://${uuid}@first.example.com:443?security=tls&sni=first.example.com&type=tcp#NL%20First`;
-    const second = `trojan://secret@second.example.com:443?security=tls&sni=second.example.com&type=tcp#US%20Second`;
-
-    const original = __remnawaveTest.parseSubscriptionToServers(`${first}\n${second}`);
-    const reordered = __remnawaveTest.parseSubscriptionToServers(`${second}\n${first}`);
+    const original = __remnawaveTest.parseXrayJsonSubscriptionToServers(JSON.stringify([
+      config('First', 'first.example.com'),
+      config('Second', 'second.example.com')
+    ]));
+    const reordered = __remnawaveTest.parseXrayJsonSubscriptionToServers(JSON.stringify([
+      config('Second', 'second.example.com'),
+      config('First', 'first.example.com')
+    ]));
 
     expect(original.find((server) => server.host === 'first.example.com')?.id)
       .toBe(reordered.find((server) => server.host === 'first.example.com')?.id);
     expect(original.find((server) => server.host === 'second.example.com')?.id)
       .toBe(reordered.find((server) => server.host === 'second.example.com')?.id);
   });
-
-
-  it('adds hidden unique suffixes only when subscription ids collide', () => {
-    const base = `vless://${uuid}@same.example.com:443?security=tls&sni=same.example.com&type=tcp`;
-    const servers = __remnawaveTest.parseSubscriptionToServers(`${base}#US%20One\n${base}#NL%20Two`);
-
-    expect(servers).toHaveLength(2);
-    expect(new Set(servers.map((server) => server.id)).size).toBe(2);
-    expect(servers[0].id.startsWith('subscription-')).toBe(true);
-    expect(servers[1].id.startsWith('subscription-')).toBe(true);
-  });
-
-  it('rejects incomplete VLESS, Reality, VMess, Trojan, Shadowsocks and Hysteria2 links', () => {
-    const invalidLinks = [
-      'vless://not-a-uuid@broken.example.com:443?security=tls#Broken',
-      `vless://${uuid}@reality-broken.example.com:443?security=reality&sni=reality-broken.example.com#RealityNoPublicKey`,
-      `vless://${uuid}@bad-port.example.com:70000?security=tls#BadPort`,
-      `vmess://${base64Url(JSON.stringify({ v: '2', ps: 'No host', port: 443, id: uuid, net: 'tcp' }))}`,
-      `vmess://${base64Url(JSON.stringify({ v: '2', ps: 'Bad UUID', add: 'vmess.example.com', port: 443, id: 'bad', net: 'tcp' }))}`,
-      'trojan://@trojan.example.com:443?security=tls#NoPassword',
-      'ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNQ@ss.example.com:8388#NoPassword',
-      'hy2://@hy2.example.com:443?sni=hy2.example.com#NoPassword'
-    ];
-
-    expect(__remnawaveTest.parseSubscriptionToServers(invalidLinks.join('\n'))).toHaveLength(0);
-  });
-
-  it('decodes UTF-8 base64 subscription labels without mojibake', () => {
-    const utf8Subscription = `vless://${uuid}@utf8.example.com:443?security=tls&sni=utf8.example.com&type=tcp#🇫🇮%20Хельсинки`;
-    const encoded = btoa(unescape(encodeURIComponent(utf8Subscription)));
-
-    const [server] = __remnawaveTest.parseSubscriptionToServers(encoded);
-
-    expect(server?.host).toBe('utf8.example.com');
-    expect(server?.rawLabel).toContain('Хельсинки');
-  });
-
-  it('caps imported subscription servers and ignores oversized URIs', () => {
-    const manyServers = Array.from({ length: 1105 }, (_, index) =>
-      `vless://${uuid}@node-${index}.example.com:443?security=tls&sni=node-${index}.example.com&type=tcp#Node-${index}`
-    );
-    const oversized = `vless://${uuid}@oversized.example.com:443?security=tls&sni=oversized.example.com&type=tcp#${'x'.repeat(9000)}`;
-    const servers = __remnawaveTest.parseSubscriptionToServers([...manyServers, oversized].join('\n'));
-
-    expect(servers).toHaveLength(1000);
-    expect(servers.some((server) => server.host === 'oversized.example.com')).toBe(false);
-  });
-
-
 });
 
 

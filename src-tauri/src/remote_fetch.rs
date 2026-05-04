@@ -62,6 +62,126 @@ pub(crate) fn build_remote_fetch_client(timeout: Duration) -> Result<reqwest::bl
         .map_err(|error| format!("Не удалось создать HTTP client: {error}"))
 }
 
+fn is_blank_device_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty() || trimmed == "—" || trimmed.eq_ignore_ascii_case("unknown")
+}
+
+pub(crate) fn remnawave_hwid_from_seed(seed: &str) -> Option<String> {
+    if is_blank_device_value(seed) {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"vkarmani-remnawave-hwid-v1:");
+    hasher.update(seed.trim().as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+
+    Some(format!("vkarmani-{hex}"))
+}
+
+fn current_remnawave_device_identity() -> (String, String, String, String, String, String) {
+    let (raw_hwid, os_name, os_version, os_build, os_architecture, device_name) = windows_device_info();
+    let fallback_seed = [
+        os_name.as_str(),
+        os_version.as_str(),
+        os_build.as_str(),
+        os_architecture.as_str(),
+        device_name.as_str(),
+    ]
+    .iter()
+    .filter(|value| !is_blank_device_value(value))
+    .copied()
+    .collect::<Vec<_>>()
+    .join("|");
+
+    let hwid = remnawave_hwid_from_seed(&raw_hwid)
+        .or_else(|| remnawave_hwid_from_seed(&fallback_seed))
+        .unwrap_or_else(|| "vkarmani-unknown-device".to_string());
+
+    (hwid, os_name, os_version, os_build, os_architecture, device_name)
+}
+
+fn clean_header_value(value: &str, fallback: &str) -> String {
+    let cleaned = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii() && !matches!(ch, '\r' | '\n' | '\0') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches('-')
+        .trim()
+        .to_string();
+
+    if cleaned.is_empty() || cleaned == "—" {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
+}
+
+pub(crate) fn current_remnawave_hwid() -> String {
+    let (hwid, _, _, _, _, _) = current_remnawave_device_identity();
+    hwid
+}
+
+fn header_is_true(headers: &reqwest::header::HeaderMap, name: &'static str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "true" || normalized == "1" || normalized == "yes"
+        })
+        .unwrap_or(false)
+}
+
+fn remnawave_hwid_status_error(response: &reqwest::blocking::Response) -> Option<String> {
+    let headers = response.headers();
+    if header_is_true(headers, "x-hwid-max-devices-reached") || header_is_true(headers, "x-hwid-limit") {
+        return Some("Remnawave отклонил подписку: достигнут лимит HWID-устройств для этого ключа. Удалите старое устройство в панели/личном кабинете или увеличьте лимит.".to_string());
+    }
+
+    if header_is_true(headers, "x-hwid-not-supported") {
+        return Some("Remnawave отклонил подписку: сервер считает, что клиент не передал HWID. Перезапустите VKarmani Desktop и попробуйте обновить профиль ещё раз.".to_string());
+    }
+
+    None
+}
+
+fn apply_remnawave_subscription_headers(request: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+    let (hwid, os_name, os_version, os_build, os_architecture, device_name) = current_remnawave_device_identity();
+    let version_label = if !is_blank_device_value(&os_version) {
+        os_version
+    } else {
+        os_build
+    };
+    let model = if !is_blank_device_value(&device_name) {
+        device_name
+    } else {
+        format!("VKarmani Desktop {os_architecture}")
+    };
+
+    request
+        .header("x-hwid", clean_header_value(&hwid, "vkarmani-unknown-device"))
+        .header("x-device-os", clean_header_value(&os_name, "Desktop"))
+        .header("x-ver-os", clean_header_value(&version_label, "unknown"))
+        .header("x-device-model", clean_header_value(&model, "VKarmani Desktop"))
+        .header("x-app-version", env!("CARGO_PKG_VERSION"))
+}
+
 pub(crate) fn read_limited_remote_text(response: reqwest::blocking::Response) -> Result<String, String> {
     if let Some(length) = response.content_length() {
         if length > MAX_REMOTE_FETCH_BYTES {
@@ -86,17 +206,23 @@ pub(crate) fn read_limited_remote_text(response: reqwest::blocking::Response) ->
     Ok(text)
 }
 
-#[tauri::command]
-pub(crate) fn fetch_remote_text(url: String, accept: Option<String>) -> Result<String, String> {
+fn fetch_remote_text_blocking(url: String, accept: Option<String>, user_agent: Option<String>) -> Result<String, String> {
     let client = build_remote_fetch_client(Duration::from_secs(8))?;
     let accept_header = accept.unwrap_or_else(|| "text/plain, application/json, text/html".to_string());
+    let user_agent_header = user_agent
+        .as_deref()
+        .map(|value| clean_header_value(value, APP_USER_AGENT))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| APP_USER_AGENT.to_string());
     let mut current_url = validate_remote_fetch_url(&url)?;
 
     for redirect_count in 0..=MAX_REMOTE_FETCH_REDIRECTS {
-        let response = client
-            .get(current_url.clone())
-            .header(reqwest::header::USER_AGENT, APP_USER_AGENT)
-            .header(reqwest::header::ACCEPT, accept_header.as_str())
+        let response = apply_remnawave_subscription_headers(
+            client
+                .get(current_url.clone())
+                .header(reqwest::header::USER_AGENT, user_agent_header.as_str())
+                .header(reqwest::header::ACCEPT, accept_header.as_str()),
+        )
             .send()
             .map_err(|error| format!("Не удалось получить ответ от {current_url}: {error}"))?;
 
@@ -118,6 +244,10 @@ pub(crate) fn fetch_remote_text(url: String, accept: Option<String>) -> Result<S
         }
 
         if !response.status().is_success() {
+            if let Some(hwid_error) = remnawave_hwid_status_error(&response) {
+                return Err(hwid_error);
+            }
+
             return Err(format!("HTTP {}", response.status()));
         }
 
@@ -125,6 +255,13 @@ pub(crate) fn fetch_remote_text(url: String, accept: Option<String>) -> Result<S
     }
 
     Err("Слишком много redirects при удалённом fetch.".into())
+}
+
+#[tauri::command]
+pub(crate) async fn fetch_remote_text(url: String, accept: Option<String>, user_agent: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || fetch_remote_text_blocking(url, accept, user_agent))
+        .await
+        .map_err(|error| format!("Удалённый fetch был прерван: {error}"))?
 }
 
 pub(crate) fn remnawave_api_token() -> Option<String> {
@@ -138,8 +275,7 @@ pub(crate) fn remnawave_api_token() -> Option<String> {
     .filter(|value| !value.is_empty())
 }
 
-#[tauri::command]
-pub(crate) fn revoke_hwid_device(
+fn revoke_hwid_device_blocking(
     panel_url: String,
     uuid: Option<String>,
     hwid: Option<String>,
@@ -201,4 +337,16 @@ pub(crate) fn revoke_hwid_device(
     }
 
     serde_json::from_str(&body_text).map_err(|error| format!("Remnawave вернул невалидный JSON после HWID revoke: {error}"))
+}
+
+#[tauri::command]
+pub(crate) async fn revoke_hwid_device(
+    panel_url: String,
+    uuid: Option<String>,
+    hwid: Option<String>,
+    user_uuid: Option<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || revoke_hwid_device_blocking(panel_url, uuid, hwid, user_uuid))
+        .await
+        .map_err(|error| format!("Отзыв HWID-устройства был прерван: {error}"))?
 }

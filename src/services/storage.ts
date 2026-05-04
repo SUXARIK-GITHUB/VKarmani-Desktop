@@ -126,9 +126,40 @@ function safeLocalStorageRemove(key: string) {
   }
 }
 
+const STORAGE_COMMAND_TIMEOUTS_MS: Record<string, number> = {
+  save_client_state_value: 7000,
+  load_client_state_value: 7000,
+  clear_client_state_value: 7000,
+  save_access_key_secure: 12000,
+  load_access_key_secure: 9000,
+  clear_access_key_secure: 9000
+};
+
+function storageTimeoutMessage(command: string, timeoutMs: number) {
+  return `Локальная команда ${command} не ответила за ${Math.round(timeoutMs / 1000)} секунд.`;
+}
+
+function withStorageTimeout<T>(operation: Promise<T>, timeoutMs: number, command: string): Promise<T> {
+  let timer: number | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(storageTimeoutMessage(command, timeoutMs))), timeoutMs);
+  });
+
+  operation.catch(() => {
+    // Поздняя ошибка после timeout не должна оставлять unhandled rejection.
+  });
+
+  return Promise.race([operation, timeoutPromise]).finally(() => {
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+    }
+  }) as Promise<T>;
+}
+
 async function invokeTauri<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   const { invoke } = await import('@tauri-apps/api/core');
-  return invoke<T>(command, args);
+  const timeoutMs = STORAGE_COMMAND_TIMEOUTS_MS[command] ?? 8000;
+  return withStorageTimeout(invoke<T>(command, args), timeoutMs, command);
 }
 
 async function saveNativeClientStateValue(key: string, value: unknown): Promise<boolean> {

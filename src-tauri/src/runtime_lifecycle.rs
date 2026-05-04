@@ -4,8 +4,7 @@ use super::*;
 pub(crate) fn force_kill_process_tree(pid: u32) {
     let mut command = Command::new("taskkill");
     command.args(["/PID", &pid.to_string(), "/T", "/F"]);
-    hide_child_console(&mut command);
-    let _ = command.output();
+    let _ = run_command_with_timeout(command, Duration::from_secs(4), "taskkill xray process tree");
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -708,10 +707,8 @@ pub(crate) fn recover_orphaned_system_proxy(app: &AppHandle, state: &tauri::Stat
 pub(crate) fn is_process_elevated() -> Result<bool, String> {
     // `fltmc` exits successfully only in an elevated process. It is much lighter than
     // spinning up PowerShell just to ask WindowsPrincipal for the admin role.
-    let mut command = Command::new("fltmc");
-    hide_child_console(&mut command);
-    let output = command.output().map_err(|error| format!("Не удалось проверить права администратора: {error}"))?;
-    Ok(output.status.success())
+    let command = Command::new("fltmc");
+    Ok(run_command_with_timeout(command, Duration::from_secs(3), "check admin rights").is_ok())
 }
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn is_process_elevated() -> Result<bool, String> {

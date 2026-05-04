@@ -63,14 +63,14 @@ function validateWebRemoteFetchUrl(rawUrl: string) {
 export const allowDemoFallbackByEnv = String(envFlag ?? '').trim().toLowerCase() === 'true';
 
 const NATIVE_COMMAND_TIMEOUTS_MS: Record<string, number> = {
-  request_connect: 90000,
-  request_disconnect: 25000,
+  request_connect: 60000,
+  request_disconnect: 22000,
   set_system_proxy: 18000,
   public_ip_snapshot: 12000,
   fetch_remote_text: 20000,
   revoke_hwid_device: 20000,
   connectivity_probe: 12000,
-  repair_runtime_environment: 18000,
+  repair_runtime_environment: 30000,
   server_ping: 9000,
   traffic_snapshot: 7000,
   runtime_status: 9000,
@@ -107,6 +107,11 @@ function withClientTimeout<T>(operation: Promise<T>, timeoutMs: number, command:
     timer = window.setTimeout(() => reject(new Error(commandTimeoutMessage(command, timeoutMs))), timeoutMs);
   });
 
+  operation.catch(() => {
+    // Поздняя ошибка после клиентского timeout уже обработана Promise.race.
+    // Не даём ей превратиться в unhandled rejection и подвесить UI-логику.
+  });
+
   return Promise.race([operation, timeoutPromise]).finally(() => {
     if (timer !== undefined) {
       window.clearTimeout(timer);
@@ -129,6 +134,22 @@ export async function setNativeTrayUpdateState(available: boolean, busy: boolean
   } catch {
     return false;
   }
+}
+
+
+
+export async function openExternalUrl(url: string): Promise<void> {
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'https:') {
+    throw new Error('Открывать можно только HTTPS-ссылки.');
+  }
+
+  if (isTauriRuntime) {
+    await invokeTauri<void>('open_external_url', { url: parsed.toString() }, 5000);
+    return;
+  }
+
+  window.open(parsed.toString(), '_blank', 'noopener,noreferrer');
 }
 
 
@@ -449,9 +470,9 @@ export async function writeNativeRoutingLog(message: string, details?: string) {
 }
 
 
-export async function fetchRemoteText(url: string, accept = 'text/plain, application/json, text/html') {
+export async function fetchRemoteText(url: string, accept = 'text/plain, application/json, text/html', userAgent?: string) {
   if (isTauriRuntime) {
-    return invokeTauri<string>('fetch_remote_text', { url, accept });
+    return invokeTauri<string>('fetch_remote_text', { url, accept, userAgent });
   }
 
   const safeUrl = validateWebRemoteFetchUrl(url);
@@ -461,7 +482,7 @@ export async function fetchRemoteText(url: string, accept = 'text/plain, applica
   try {
     const response = await fetch(safeUrl, {
       method: 'GET',
-      headers: { Accept: accept },
+      headers: { Accept: accept, ...(userAgent ? { 'User-Agent': userAgent } : {}) },
       signal: controller.signal
     });
 
@@ -485,9 +506,31 @@ export async function fetchRemoteText(url: string, accept = 'text/plain, applica
   }
 }
 
+function looksLikeRawSubscriptionText(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  if (/(?:vless|vmess|trojan|ss|hy2|hysteria2):\/\//i.test(trimmed)) {
+    return true;
+  }
+
+  const compact = trimmed.replace(/\s+/g, '');
+  return compact.length >= 16 && /^[A-Za-z0-9+/_-]+={0,2}$/.test(compact);
+}
+
 export async function fetchRemoteJson<T = unknown>(url: string, accept = 'application/json, text/plain, text/html') {
   const raw = await fetchRemoteText(url, accept);
-  return JSON.parse(raw) as T;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    if (looksLikeRawSubscriptionText(raw)) {
+      throw new Error('Endpoint вернул не Xray JSON профиль. Продолжаем проверку через Xray JSON профиль.');
+    }
+
+    throw new Error('Ответ Remnawave не является валидным JSON-профилем. Продолжаем проверку через Xray JSON профиль.');
+  }
 }
 
 

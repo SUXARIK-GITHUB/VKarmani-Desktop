@@ -1960,16 +1960,37 @@ export default function App() {
       void writeNativeInterfaceLog('Авторизация по ключу доступа завершена успешно.');
 
       overviewAutoRefreshAtRef.current = Date.now();
-      let serverPool = serversRef.current;
-      let preferredServerForAutoConnect = selectedServer;
+      let serverPool = await remnawaveClient.loadServers();
+      if (serverPool.length) {
+        serversRef.current = serverPool;
+        setServers(serverPool);
+        setFavoriteServerIds((current) => current.filter((id) => serverPool.some((server: VpnServer) => server.id === id)));
+        setProfileSyncInfo(remnawaveClient.getProfileSyncInfo());
 
-      const syncResult = currentSettings.profileSyncOnLogin
+        const preferredServer = pickPreferredServer(serverPool, currentSettings.protocolStrategy);
+        setSelectedServerId((current: string) => {
+          const nextId = serverPool.some((item: VpnServer) => item.id === current)
+            ? current
+            : preferredServer?.id ?? current;
+          selectedServerIdRef.current = nextId;
+          return nextId;
+        });
+      } else {
+        serverPool = serversRef.current;
+      }
+
+      let preferredServerForAutoConnect = serverPool.find((server: VpnServer) => server.id === selectedServerIdRef.current)
+        ?? pickPreferredServer(serverPool, currentSettings.protocolStrategy)
+        ?? selectedServer;
+
+      const shouldRunLoginSync = currentSettings.profileSyncOnLogin && !serverPool.length;
+      const syncResult = shouldRunLoginSync
         ? await handleSyncProfile(true, normalizedAccessKey)
         : null;
       if (syncResult?.servers) {
         serverPool = syncResult.servers;
         preferredServerForAutoConnect = pickPreferredServer(syncResult.servers, currentSettings.protocolStrategy);
-      } else if (!currentSettings.profileSyncOnLogin && !connectFavoriteAfterLaunch) {
+      } else if (!currentSettings.profileSyncOnLogin && !connectFavoriteAfterLaunch && !serverPool.length) {
         setProfileSyncInfo((current: ProfileSyncInfo) => ({
           ...current,
           status: 'idle',

@@ -1,7 +1,6 @@
 use super::*;
 
-#[tauri::command]
-pub(crate) fn write_interface_log(message: String, details: Option<String>, app: AppHandle) -> Result<(), String> {
+fn write_interface_log_blocking(message: String, details: Option<String>, app: AppHandle) -> Result<(), String> {
     let line = details
         .filter(|value| !value.trim().is_empty())
         .map(|details| format!("{message} | {details}"))
@@ -10,12 +9,25 @@ pub(crate) fn write_interface_log(message: String, details: Option<String>, app:
 }
 
 #[tauri::command]
-pub(crate) fn write_routing_log(message: String, details: Option<String>, app: AppHandle) -> Result<(), String> {
+pub(crate) async fn write_interface_log(message: String, details: Option<String>, app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || write_interface_log_blocking(message, details, app))
+        .await
+        .map_err(|error| format!("Запись interface-лога была прервана: {error}"))?
+}
+
+fn write_routing_log_blocking(message: String, details: Option<String>, app: AppHandle) -> Result<(), String> {
     let line = details
         .filter(|value| !value.trim().is_empty())
         .map(|details| format!("{message} | {details}"))
         .unwrap_or(message);
     append_runtime_event(&app, &line)
+}
+
+#[tauri::command]
+pub(crate) async fn write_routing_log(message: String, details: Option<String>, app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || write_routing_log_blocking(message, details, app))
+        .await
+        .map_err(|error| format!("Запись runtime-лога была прервана: {error}"))?
 }
 
 #[tauri::command]
@@ -207,8 +219,7 @@ pub(crate) fn read_client_state_map(app: &AppHandle) -> Result<serde_json::Map<S
     Ok(value.as_object().cloned().unwrap_or_default())
 }
 
-#[tauri::command]
-pub(crate) fn save_client_state_value(key: String, value: String, app: AppHandle) -> Result<(), String> {
+fn save_client_state_value_blocking(key: String, value: String, app: AppHandle) -> Result<(), String> {
     let normalized_key = key.trim();
     if !is_allowed_client_state_key(normalized_key) {
         return Err("Недопустимый ключ клиентского состояния.".into());
@@ -231,8 +242,7 @@ pub(crate) fn save_client_state_value(key: String, value: String, app: AppHandle
     atomic_write_text(&path, &payload, "Не удалось сохранить настройки клиента")
 }
 
-#[tauri::command]
-pub(crate) fn load_client_state_value(key: String, app: AppHandle) -> Result<Option<String>, String> {
+fn load_client_state_value_blocking(key: String, app: AppHandle) -> Result<Option<String>, String> {
     let normalized_key = key.trim();
     if !is_allowed_client_state_key(normalized_key) {
         return Err("Недопустимый ключ клиентского состояния.".into());
@@ -244,8 +254,7 @@ pub(crate) fn load_client_state_value(key: String, app: AppHandle) -> Result<Opt
         .and_then(|value| serde_json::to_string(value).ok()))
 }
 
-#[tauri::command]
-pub(crate) fn clear_client_state_value(key: String, app: AppHandle) -> Result<(), String> {
+fn clear_client_state_value_blocking(key: String, app: AppHandle) -> Result<(), String> {
     let normalized_key = key.trim();
     if !is_allowed_client_state_key(normalized_key) {
         return Err("Недопустимый ключ клиентского состояния.".into());
@@ -262,7 +271,26 @@ pub(crate) fn clear_client_state_value(key: String, app: AppHandle) -> Result<()
     atomic_write_text(&path, &payload, "Не удалось сохранить настройки клиента")
 }
 
+#[tauri::command]
+pub(crate) async fn save_client_state_value(key: String, value: String, app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_client_state_value_blocking(key, value, app))
+        .await
+        .map_err(|error| format!("Сохранение настроек клиента было прервано: {error}"))?
+}
 
+#[tauri::command]
+pub(crate) async fn load_client_state_value(key: String, app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || load_client_state_value_blocking(key, app))
+        .await
+        .map_err(|error| format!("Загрузка настроек клиента была прервана: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn clear_client_state_value(key: String, app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || clear_client_state_value_blocking(key, app))
+        .await
+        .map_err(|error| format!("Очистка настроек клиента была прервана: {error}"))?
+}
 #[cfg(target_os = "windows")]
 pub(crate) fn encrypt_access_key(value: &str) -> Result<String, String> {
     let mut input = DataBlob {
@@ -348,11 +376,10 @@ pub(crate) fn decrypt_access_key(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-#[tauri::command]
-pub(crate) fn save_access_key_secure(value: String, app: AppHandle) -> Result<(), String> {
+fn save_access_key_secure_blocking(value: String, app: AppHandle) -> Result<(), String> {
     let normalized = value.trim();
     if normalized.is_empty() {
-        return clear_access_key_secure(app);
+        return clear_access_key_secure_blocking(app);
     }
     let normalized = normalize_access_key_for_native(normalized)?;
     let encrypted = encrypt_access_key(&normalized)?;
@@ -360,8 +387,7 @@ pub(crate) fn save_access_key_secure(value: String, app: AppHandle) -> Result<()
     atomic_write_text(&path, &encrypted, "Не удалось сохранить ключ доступа в защищённое хранилище")
 }
 
-#[tauri::command]
-pub(crate) fn load_access_key_secure(app: AppHandle) -> Result<Option<String>, String> {
+fn load_access_key_secure_blocking(app: AppHandle) -> Result<Option<String>, String> {
     let path = secure_access_key_path(&app)?;
     if !path.exists() {
         return Ok(None);
@@ -378,8 +404,7 @@ pub(crate) fn load_access_key_secure(app: AppHandle) -> Result<Option<String>, S
     Ok(Some(normalize_access_key_for_native(&value)?))
 }
 
-#[tauri::command]
-pub(crate) fn clear_access_key_secure(app: AppHandle) -> Result<(), String> {
+fn clear_access_key_secure_blocking(app: AppHandle) -> Result<(), String> {
     let path = secure_access_key_path(&app)?;
     if path.exists() {
         fs::remove_file(path).map_err(|error| format!("Не удалось удалить сохранённый ключ доступа: {error}"))?;
@@ -387,8 +412,26 @@ pub(crate) fn clear_access_key_secure(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+pub(crate) async fn save_access_key_secure(value: String, app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_access_key_secure_blocking(value, app))
+        .await
+        .map_err(|error| format!("Сохранение ключа доступа было прервано: {error}"))?
+}
 
+#[tauri::command]
+pub(crate) async fn load_access_key_secure(app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || load_access_key_secure_blocking(app))
+        .await
+        .map_err(|error| format!("Загрузка ключа доступа была прервана: {error}"))?
+}
 
+#[tauri::command]
+pub(crate) async fn clear_access_key_secure(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || clear_access_key_secure_blocking(app))
+        .await
+        .map_err(|error| format!("Очистка ключа доступа была прервана: {error}"))?
+}
 #[tauri::command]
 pub(crate) fn bootstrap_info() -> BootstrapInfo {
     BootstrapInfo {
@@ -1111,8 +1154,79 @@ pub(crate) fn window_hide(window: tauri::WebviewWindow, app: AppHandle) -> Resul
     window.hide().map_err(|error| format!("Не удалось скрыть окно: {error}"))
 }
 
+fn validate_external_url(raw_url: &str) -> Result<String, String> {
+    let parsed = reqwest::Url::parse(raw_url)
+        .map_err(|_| "Некорректная внешняя ссылка.".to_string())?;
+
+    if parsed.scheme() != "https" {
+        return Err("Открывать можно только HTTPS-ссылки.".to_string());
+    }
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("Внешние ссылки с userinfo запрещены.".to_string());
+    }
+
+    let host = parsed
+        .host_str()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let allowed = matches!(
+        host.as_str(),
+        "t.me" | "telegram.me" | "vkarmani.com" | "www.vkarmani.com"
+    );
+
+    if !allowed {
+        return Err("Эта внешняя ссылка не входит в список разрешённых VKarmani-ссылок.".to_string());
+    }
+
+    Ok(parsed.to_string())
+}
+
+fn open_external_url_blocking(url: String) -> Result<(), String> {
+    let safe_url = validate_external_url(&url)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", safe_url.as_str()]);
+        hide_child_console(&mut command);
+        command
+            .spawn()
+            .map_err(|error| format!("Не удалось открыть ссылку в браузере: {error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(safe_url.as_str())
+            .spawn()
+            .map_err(|error| format!("Не удалось открыть ссылку в браузере: {error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(safe_url.as_str())
+            .spawn()
+            .map_err(|error| format!("Не удалось открыть ссылку в браузере: {error}"))?;
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err("Открытие внешних ссылок не поддерживается на этой платформе.".to_string())
+}
+
 #[tauri::command]
-pub(crate) fn ensure_admin_launch(app: AppHandle) -> Result<bool, String> {
+pub(crate) async fn open_external_url(url: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || open_external_url_blocking(url))
+        .await
+        .map_err(|error| format!("Открытие внешней ссылки было прервано: {error}"))?
+}
+
+fn ensure_admin_launch_blocking(app: AppHandle) -> Result<bool, String> {
     #[cfg(all(not(debug_assertions), target_os = "windows"))]
     {
         if is_process_elevated()? {
@@ -1149,7 +1263,13 @@ pub(crate) fn ensure_admin_launch(app: AppHandle) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub(crate) fn set_launch_on_startup(enabled: bool, app: AppHandle) -> Result<bool, String> {
+pub(crate) async fn ensure_admin_launch(app: AppHandle) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || ensure_admin_launch_blocking(app))
+        .await
+        .map_err(|error| format!("Проверка запуска от администратора была прервана: {error}"))?
+}
+
+fn set_launch_on_startup_blocking(enabled: bool, app: AppHandle) -> Result<bool, String> {
     #[cfg(all(target_os = "windows", not(debug_assertions)))]
     {
         let executable = std::env::current_exe()
@@ -1183,6 +1303,13 @@ pub(crate) fn set_launch_on_startup(enabled: bool, app: AppHandle) -> Result<boo
         let _ = (enabled, app);
         Ok(false)
     }
+}
+
+#[tauri::command]
+pub(crate) async fn set_launch_on_startup(enabled: bool, app: AppHandle) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || set_launch_on_startup_blocking(enabled, app))
+        .await
+        .map_err(|error| format!("Изменение автозапуска было прервано: {error}"))?
 }
 #[tauri::command]
 pub(crate) async fn proxy_status() -> Result<ProxyStatus, String> {
@@ -1931,35 +2058,27 @@ pub(crate) fn read_xray_version(app: &AppHandle) -> (String, Option<String>) {
 
     let mut command = Command::new(&core_path);
     command.arg("version");
+    command.stdin(Stdio::null());
     hide_child_console(&mut command);
 
-    match command.output() {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let first_line = stdout
+    match run_command_with_timeout(command, Duration::from_secs(4), "xray version") {
+        Ok(raw_output) => {
+            let first_line = raw_output
                 .lines()
-                .chain(stderr.lines())
                 .map(str::trim)
                 .find(|line| !line.is_empty())
                 .unwrap_or("Версия не определена")
                 .to_string();
             (first_line, Some(core_path_string))
         }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let message = if stderr.is_empty() { stdout } else { stderr };
-            (if message.is_empty() { "Не удалось запустить xray.exe".to_string() } else { message }, Some(core_path_string))
-        }
         Err(error) => {
-            let friendly = if error.raw_os_error() == Some(193) {
+            let friendly = if error.contains("os error 193") || error.contains("%1 is not a valid Win32 application") {
                 "Ошибка запуска Xray: файл не запускается как Windows x64-приложение (os error 193). Запустите START_VKarmani.bat — он проверит и восстановит core.".to_string()
             } else {
                 format!("Не удалось запустить Xray-core: {error}")
             };
             (friendly, Some(core_path_string))
-        },
+        }
     }
 }
 #[cfg(target_os = "windows")]
@@ -2005,15 +2124,14 @@ pub(crate) fn windows_device_info() -> (String, String, String, String, String, 
     )
 }
 
-#[tauri::command]
-pub(crate) fn native_app_info(app: AppHandle) -> NativeAppInfo {
+fn native_app_info_blocking(app: AppHandle) -> NativeAppInfo {
     let (xray_version, core_path) = read_xray_version(&app);
-    let (hwid, os_name, os_version, os_build, os_architecture, device_name) = windows_device_info();
+    let (_, os_name, os_version, os_build, os_architecture, device_name) = windows_device_info();
 
     NativeAppInfo {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         xray_version,
-        hwid,
+        hwid: current_remnawave_hwid(),
         os_name,
         os_version,
         os_build,
@@ -2023,9 +2141,15 @@ pub(crate) fn native_app_info(app: AppHandle) -> NativeAppInfo {
     }
 }
 
-#[cfg(target_os = "windows")]
 #[tauri::command]
-pub(crate) fn pick_executable_path() -> Result<Option<String>, String> {
+pub(crate) async fn native_app_info(app: AppHandle) -> Result<NativeAppInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || native_app_info_blocking(app))
+        .await
+        .map_err(|error| format!("Получение информации о приложении было прервано: {error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn pick_executable_path_blocking() -> Result<Option<String>, String> {
     let script = r#"
 Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.OpenFileDialog
@@ -2055,12 +2179,19 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     Ok(if value.is_empty() { None } else { Some(value) })
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "windows")]
 #[tauri::command]
-pub(crate) fn pick_executable_path() -> Result<Option<String>, String> {
-    Ok(None)
+pub(crate) async fn pick_executable_path() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(pick_executable_path_blocking)
+        .await
+        .map_err(|error| format!("Выбор приложения был прерван: {error}"))?
 }
 
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub(crate) async fn pick_executable_path() -> Result<Option<String>, String> {
+    Ok(None)
+}
 #[tauri::command]
 pub(crate) fn restart_application(app: AppHandle) -> Result<(), String> {
     cleanup_application(&app, "restart_application");
@@ -2074,7 +2205,13 @@ pub(crate) fn restart_application(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub(crate) fn read_runtime_log(app: AppHandle, lines: Option<usize>) -> Result<Vec<String>, String> {
+fn read_runtime_log_blocking(app: AppHandle, lines: Option<usize>) -> Result<Vec<String>, String> {
     tail_runtime_log(&app, lines.unwrap_or(20).clamp(1, 200))
+}
+
+#[tauri::command]
+pub(crate) async fn read_runtime_log(app: AppHandle, lines: Option<usize>) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || read_runtime_log_blocking(app, lines))
+        .await
+        .map_err(|error| format!("Чтение runtime-лога было прервано: {error}"))?
 }

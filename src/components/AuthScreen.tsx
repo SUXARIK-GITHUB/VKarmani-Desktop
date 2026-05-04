@@ -18,6 +18,7 @@ import {
   Zap
 } from 'lucide-react';
 import { tr, type UiLanguage } from '../i18n';
+import { openExternalUrl } from '../services/runtime';
 import type { IntegrationMeta } from '../types/vpn';
 
 interface AuthScreenProps {
@@ -173,6 +174,12 @@ export function AuthScreen({
     }
   };
 
+  const handleExternalLinkClick = (event: React.MouseEvent<HTMLAnchorElement>, url: string) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void openExternalUrl(url);
+  };
+
   return (
     <div className="auth-redesign-screen">
       <section className="auth-redesign-hero">
@@ -306,8 +313,8 @@ export function AuthScreen({
         <div className="auth-support-inline auth-support-inline-v5">
           <LockKeyhole size={16} />
           <span>{tr(language, 'Нет ключа?', 'No key?')}</span>
-          <a href="https://t.me/VKarmani_VPN_bot" target="_blank" rel="noreferrer">Telegram</a>
-          <a href="https://www.vkarmani.com/" target="_blank" rel="noreferrer">
+          <a href="https://t.me/VKarmani_VPN_bot" target="_blank" rel="noreferrer" onClick={(event) => handleExternalLinkClick(event, 'https://t.me/VKarmani_VPN_bot')}>Telegram</a>
+          <a href="https://www.vkarmani.com/" target="_blank" rel="noreferrer" onClick={(event) => handleExternalLinkClick(event, 'https://www.vkarmani.com/')}>
             {tr(language, 'Перейти на сайт', 'Open website')}
             <ArrowUpRight size={14} />
           </a>

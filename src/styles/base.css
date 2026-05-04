@@ -328,7 +328,7 @@ a { color: inherit; text-decoration: none; }
 .auth-info-grid strong { margin-top: 10px; font-size: 13px; }
 .auth-info-grid span { margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.4; }
 .auth-support-inline { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; color: var(--muted); font-size: 13px; }
-.auth-support-inline a { color: #7fc7ff; font-weight: 850; display: inline-flex; align-items: center; gap: 5px; }
+.auth-support-inline a { color: #7fc7ff; font-weight: 850; display: inline-flex; align-items: center; gap: 5px; -webkit-app-region: no-drag; pointer-events: auto; }
 
 .settings-screen-redesign { display: flex; flex-direction: column; gap: 18px; }
 .settings-hero-line { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; }

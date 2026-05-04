@@ -65,8 +65,7 @@ function toSafeSession(session: RemnawaveSession | null) {
     source: session.source,
     plan: session.plan,
     shortUuid: session.shortUuid ? '[redacted-uuid]' : undefined,
-    subscriptionUrl: session.subscriptionUrl ? '[redacted-url]' : undefined,
-    rawSubscriptionUrl: session.rawSubscriptionUrl ? '[redacted-url]' : undefined
+    subscriptionUrl: session.subscriptionUrl ? '[redacted-url]' : undefined
   };
 }
 

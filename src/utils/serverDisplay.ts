@@ -221,8 +221,8 @@ export function inferCountryCode({
     return flagCode;
   }
 
-  const labelCode = rawLabel?.trim().match(/^[^A-Z]*([A-Z]{2})\b/);
-  if (labelCode?.[1]) {
+  const labelCode = rawLabel?.trim().match(/(?:^|[^A-Z0-9])([A-Z]{2})(?=\b)/);
+  if (labelCode?.[1] && COUNTRY_CODE_TO_NAME[labelCode[1]]) {
     return labelCode[1];
   }
 

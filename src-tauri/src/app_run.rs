@@ -232,6 +232,7 @@ pub fn run() {
             window_toggle_maximize,
             window_close,
             window_hide,
+            open_external_url,
             ensure_admin_launch,
             set_launch_on_startup,
             proxy_status,

@@ -15,6 +15,19 @@ mod tests {
     }
 
     #[test]
+    fn remnawave_hwid_is_stable_hashed_and_not_raw_device_id() {
+        let raw = "123e4567-e89b-12d3-a456-426614174000";
+        let first = remnawave_hwid_from_seed(raw).expect("valid seed should produce hwid");
+        let second = remnawave_hwid_from_seed(raw).expect("valid seed should produce hwid");
+
+        assert_eq!(first, second);
+        assert!(first.starts_with("vkarmani-"));
+        assert_eq!(first.len(), "vkarmani-".len() + 32);
+        assert!(!first.contains(raw));
+        assert!(remnawave_hwid_from_seed("—").is_none());
+    }
+
+    #[test]
     fn redaction_masks_vpn_links_and_long_tokens() {
         let input = "connecting vless://123e4567-e89b-12d3-a456-426614174000@example.com:443?security=reality token=abcdefghijklmnopqrstuvwxyz1234567890";
         let output = redact_sensitive(input);

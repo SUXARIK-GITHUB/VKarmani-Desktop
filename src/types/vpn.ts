@@ -65,7 +65,7 @@ export interface VpnServer {
   latencyCheckedAt?: string;
   latencyStatus?: 'unchecked' | 'checking' | 'ok' | 'failed';
   load: number;
-  protocol: 'Xray' | 'Reality' | 'VLESS' | 'Sing-box' | 'Hysteria2';
+  protocol: 'Xray' | 'Reality' | 'VLESS' | 'Hysteria2';
   isRecommended?: boolean;
   tags?: string[];
   ipPool?: string;
@@ -97,7 +97,6 @@ export interface RemnawaveSession {
   source: RemnawaveSource;
   shortUuid?: string;
   subscriptionUrl?: string;
-  rawSubscriptionUrl?: string;
 }
 
 export interface DeviceRecord {
