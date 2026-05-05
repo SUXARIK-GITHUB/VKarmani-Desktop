@@ -47,10 +47,14 @@ function validateWebRemoteFetchUrl(rawUrl: string) {
     throw new Error('URL с userinfo запрещены для удалённого fetch.');
   }
 
-  const host = parsed.hostname.trim().toLowerCase();
+  const host = parsed.hostname.trim().toLowerCase().replace(/\.$/, '');
   const forbiddenHosts = new Set(['localhost', 'localhost.', '0.0.0.0', '127.0.0.1', '::1', '[::1]']);
   if (forbiddenHosts.has(host) || host.endsWith('.localhost')) {
     throw new Error('Локальные hostnames запрещены для удалённого fetch.');
+  }
+
+  if (host !== 'vkarmani.com' && !host.endsWith('.vkarmani.com')) {
+    throw new Error('Удалённый fetch разрешён только для доменов VKarmani (*.vkarmani.com).');
   }
 
   if (/^(10|127)\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) || /^169\.254\./.test(host)) {
@@ -482,7 +486,7 @@ export async function fetchRemoteText(url: string, accept = 'text/plain, applica
   try {
     const response = await fetch(safeUrl, {
       method: 'GET',
-      headers: { Accept: accept, ...(userAgent ? { 'User-Agent': userAgent } : {}) },
+      headers: { Accept: accept },
       signal: controller.signal
     });
 

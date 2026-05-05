@@ -1,5 +1,16 @@
 use super::*;
 
+pub(crate) struct StartingCore {
+    pub(crate) pid: u32,
+    pub(crate) core_path: String,
+    pub(crate) config_path: String,
+    pub(crate) log_path: String,
+    pub(crate) network_mode: String,
+    pub(crate) tun_interface_name: Option<String>,
+    pub(crate) tun_server_ip: Option<String>,
+    pub(crate) started_at: String,
+}
+
 pub(crate) struct ManagedCore {
     pub(crate) child: Child,
     pub(crate) core_path: String,
@@ -20,6 +31,7 @@ pub(crate) struct AppState {
     pub(crate) profile_count: Mutex<usize>,
     pub(crate) last_sync_source: Mutex<Option<String>>,
     pub(crate) runtime: Mutex<Option<ManagedCore>>,
+    pub(crate) starting_runtime: Mutex<Option<StartingCore>>,
     pub(crate) last_exit_code: Mutex<Option<i32>>,
     pub(crate) previous_proxy: Mutex<Option<ProxyStatus>>,
     pub(crate) operation_lock: Mutex<()>, 
@@ -132,6 +144,8 @@ pub(crate) struct RuntimeTemplate {
     pub(crate) protocol: String,
     pub(crate) outbound: Value,
     pub(crate) remarks: Option<String>,
+    pub(crate) full_config: Option<Value>,
+    pub(crate) primary_outbound_tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

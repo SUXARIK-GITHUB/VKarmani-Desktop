@@ -45,6 +45,7 @@ import {
   normalizeNativeError
 } from './services/runtime';
 import {
+  clearLastKnownServers,
   clearStoredAccessKey,
   loadFavoriteServerIds,
   loadFavoriteServerIdsBackup,
@@ -54,9 +55,12 @@ import {
   loadSettingsBackup,
   loadSplitTunnelEntries,
   loadSplitTunnelEntriesBackup,
+  loadLastKnownServers,
+  loadLastKnownServersBackup,
   loadStoredAccessKey,
   loadStoredAccessKeySecure,
   saveFavoriteServerIds,
+  saveLastKnownServers,
   saveSelectedServerId,
   saveSettings,
   saveSplitTunnelEntries,
@@ -155,6 +159,7 @@ export default function App() {
   const hasTriedAdminLaunch = useRef(false);
   const lastRuntimeTunnelActive = useRef(false);
   const lostRuntimePollCount = useRef(0);
+  const lastNativeRuntimeStopToastAt = useRef(0);
   const lastAppliedSplitTunnelSignature = useRef('');
   const initialProtocolStrategy = useRef(settings.protocolStrategy);
   const connectionActionLock = useRef(false);
@@ -343,10 +348,7 @@ export default function App() {
 
 
   useEffect(() => {
-    void setNativeSessionAuthorized(
-      Boolean(isAuthorized && session),
-      isAuthorized && session ? authorizedAccessKeyRef.current : undefined
-    );
+    void setNativeSessionAuthorized(Boolean(isAuthorized && session));
   }, [isAuthorized, session]);
 
   useEffect(() => {
@@ -522,11 +524,20 @@ export default function App() {
 
     const bootstrap = async () => {
       setIsBootstrapping(true);
-      const [serversResult, historyResult, devicesResult, runtimeSnapshotResult] = await Promise.allSettled([
+
+      const localLastKnownServers = loadLastKnownServers();
+      if (localLastKnownServers.length) {
+        remnawaveClient.hydrateCachedServers(localLastKnownServers);
+        serversRef.current = localLastKnownServers;
+        setServers(localLastKnownServers);
+      }
+
+      const [serversResult, historyResult, devicesResult, runtimeSnapshotResult, lastKnownBackupResult] = await Promise.allSettled([
         remnawaveClient.loadServers(),
         remnawaveClient.loadHistory(),
         remnawaveClient.loadDevices(),
-        remnawaveClient.loadRuntimeSnapshot()
+        remnawaveClient.loadRuntimeSnapshot(),
+        loadLastKnownServersBackup()
       ]);
 
       if (cancelled) {
@@ -538,6 +549,22 @@ export default function App() {
         serversRef.current = result;
         setServers(result);
         const preferredServer = pickPreferredServer(result, initialProtocolStrategy.current);
+        if (preferredServer) {
+          setSelectedServerId((current: string) => {
+            const nextId = current || preferredServer.id;
+            selectedServerIdRef.current = nextId;
+            return nextId;
+          });
+        }
+      }
+
+      const currentServersNeedSecureRuntimeCache = !serversRef.current.length || !serversRef.current.some((server: VpnServer) => server.runtimeTemplate);
+      if (currentServersNeedSecureRuntimeCache && lastKnownBackupResult.status === 'fulfilled' && lastKnownBackupResult.value?.length) {
+        const backupServers = lastKnownBackupResult.value;
+        remnawaveClient.hydrateCachedServers(backupServers);
+        serversRef.current = backupServers;
+        setServers(backupServers);
+        const preferredServer = pickPreferredServer(backupServers, initialProtocolStrategy.current);
         if (preferredServer) {
           setSelectedServerId((current: string) => {
             const nextId = current || preferredServer.id;
@@ -639,6 +666,17 @@ export default function App() {
             return;
           }
 
+          const hadActiveRuntime = connectionStateRef.current === 'connected'
+            || connectionStateRef.current === 'connecting'
+            || Boolean(connectedServerIdRef.current)
+            || lastRuntimeTunnelActive.current;
+
+          if (!hadActiveRuntime) {
+            void writeNativeRoutingLog('Native runtime stop event получен в idle-состоянии и не показывается пользователю как ошибка.');
+            void refreshDiagnosticsAndRuntime();
+            return;
+          }
+
           lastRuntimeTunnelActive.current = false;
           lostRuntimePollCount.current = 0;
           setConnectedServerId('');
@@ -649,6 +687,14 @@ export default function App() {
           setSessionDuration(0);
           void refreshDiagnosticsAndRuntime();
           void refreshPrimaryExternalIp();
+
+          const now = Date.now();
+          if (now - lastNativeRuntimeStopToastAt.current < 30000) {
+            void writeNativeRoutingLog('Повторное уведомление о native runtime stop скрыто антиспам-защитой.');
+            return;
+          }
+          lastNativeRuntimeStopToastAt.current = now;
+
           pushToast(
             tr(language, 'Xray остановился. Клиент обновил состояние без автоматического переподключения.', 'Xray stopped. The client refreshed state without automatic reconnect.'),
             'error'
@@ -1863,6 +1909,7 @@ export default function App() {
       const result = await remnawaveClient.syncProfile(normalizedAccessKey, settingsRef.current.allowDemoFallback);
       serversRef.current = result.servers;
       setServers(result.servers);
+      saveLastKnownServers(result.servers);
       setFavoriteServerIds((current) => current.filter((id) => result.servers.some((server: VpnServer) => server.id === id)));
       setProfileSyncInfo(result.profile);
       const refreshedSession = remnawaveClient.getCachedSession();
@@ -1946,13 +1993,19 @@ export default function App() {
       setDevices(nextDevices);
       const keyPersisted = await saveStoredAccessKey(normalizedAccessKey);
       setIsAuthorized(true);
-      await setNativeSessionAuthorized(true, normalizedAccessKey);
+      const nativeSessionReady = await setNativeSessionAuthorized(true);
 
       if (!connectFavoriteAfterLaunch) {
         pushToast(tr(language, 'Ключ доступа принят.', 'Access key accepted.'), 'success');
         if (!keyPersisted) {
           pushToast(
             tr(language, 'Ключ принят, но не сохранён: защищённое хранилище Windows временно недоступно.', 'The key was accepted but not saved: Windows secure storage is temporarily unavailable.'),
+            'error'
+          );
+        }
+        if (!nativeSessionReady) {
+          pushToast(
+            tr(language, 'Native-сессия не подтверждена через защищённое хранилище Windows. Перезапустите приложение и войдите по ключу ещё раз.', 'Native session was not confirmed through Windows secure storage. Restart the app and sign in again.'),
             'error'
           );
         }
@@ -1964,6 +2017,7 @@ export default function App() {
       if (serverPool.length) {
         serversRef.current = serverPool;
         setServers(serverPool);
+        saveLastKnownServers(serverPool);
         setFavoriteServerIds((current) => current.filter((id) => serverPool.some((server: VpnServer) => server.id === id)));
         setProfileSyncInfo(remnawaveClient.getProfileSyncInfo());
 
@@ -1989,6 +2043,7 @@ export default function App() {
         : null;
       if (syncResult?.servers) {
         serverPool = syncResult.servers;
+        saveLastKnownServers(syncResult.servers);
         preferredServerForAutoConnect = pickPreferredServer(syncResult.servers, currentSettings.protocolStrategy);
       } else if (!currentSettings.profileSyncOnLogin && !connectFavoriteAfterLaunch && !serverPool.length) {
         setProfileSyncInfo((current: ProfileSyncInfo) => ({
@@ -2849,6 +2904,7 @@ export default function App() {
 
         clearPendingConnectionQueue();
         await clearStoredAccessKey();
+        await clearLastKnownServers();
         authorizedAccessKeyRef.current = '';
         await setNativeSessionAuthorized(false);
         setAccessKey('');

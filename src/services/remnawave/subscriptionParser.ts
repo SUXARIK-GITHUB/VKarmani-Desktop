@@ -341,6 +341,40 @@ function collectArraysAtPaths(source: unknown, paths: string[]): Array<{ path: s
   return collected;
 }
 
+function collectXrayConfigObjectsByOutbounds(
+  source: unknown,
+  path = 'root',
+  collected: Array<{ path: string; value: Record<string, unknown> }> = [],
+  depth = 0,
+  visited: { count: number } = { count: 0 }
+) {
+  if (!source || depth > MAX_JSON_WALK_DEPTH || visited.count > MAX_JSON_WALK_NODES || collected.length > 64) {
+    return collected;
+  }
+
+  visited.count += 1;
+
+  if (Array.isArray(source)) {
+    source.forEach((item, index) => collectXrayConfigObjectsByOutbounds(item, `${path}.${index}`, collected, depth + 1, visited));
+    return collected;
+  }
+
+  if (!isRecord(source)) {
+    return collected;
+  }
+
+  if (Array.isArray(source.outbounds)) {
+    collected.push({ path, value: source });
+  }
+
+  for (const [key, value] of Object.entries(source)) {
+    collectXrayConfigObjectsByOutbounds(value, `${path}.${key}`, collected, depth + 1, visited);
+    if (collected.length > 64) break;
+  }
+
+  return collected;
+}
+
 function isGenericServerLabel(label: string | undefined) {
   const normalized = (label ?? '').replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
   return !normalized
@@ -563,6 +597,112 @@ function stripCascadeSlotMarker(value: string) {
     .trim();
 }
 
+
+const TECHNICAL_CASCADE_BACKEND_LABELS = new Set([
+  // Internal Remnawave cascade/backend node labels. These are real connection
+  // building blocks, not user-facing server names, so they must not appear as
+  // separate countries when a public aggregate/server profile exists nearby.
+  'badger',
+  'mallard'
+]);
+
+const TECHNICAL_CASCADE_BACKEND_CONTEXT_TOKENS = new Set([
+  'vless',
+  'vmess',
+  'trojan',
+  'ss',
+  'shadowsocks',
+  'hysteria',
+  'hysteria2',
+  'hy2',
+  'raw',
+  'tcp',
+  'udp',
+  'grpc',
+  'ws',
+  'websocket',
+  'xhttp',
+  'splithttp',
+  'httpupgrade',
+  'http',
+  'tls',
+  'reality',
+  'xtls',
+  'server',
+  'node',
+  'srv'
+]);
+
+function normalizedCascadeTokens(label: string | undefined) {
+  return normalizeCascadeLabel(label)
+    .split(/[^a-z0-9]+/g)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function isKnownTechnicalCascadeBackendLabel(label: string | undefined) {
+  const normalized = normalizeCascadeLabel(label);
+  const compact = normalized.replace(/[^a-z0-9]+/g, '');
+  if (compact && TECHNICAL_CASCADE_BACKEND_LABELS.has(compact)) {
+    return true;
+  }
+
+  const tokens = normalizedCascadeTokens(label);
+  if (!tokens.length) {
+    return false;
+  }
+
+  const backendTokens = tokens.filter((token) => TECHNICAL_CASCADE_BACKEND_LABELS.has(token));
+  if (!backendTokens.length) {
+    return false;
+  }
+
+  // Remnawave may expose internal cascade members as composite labels such as
+  // "BADGER | VLESS | RAW" or "MALLARD / TCP". Those labels contain a pipe and
+  // previously looked like public cascade names, so they leaked into the UI.
+  // Treat them as technical when every other token is only protocol/transport
+  // context, or when the first visible token is one of the backend codenames.
+  const otherTokens = tokens.filter((token) => !TECHNICAL_CASCADE_BACKEND_LABELS.has(token));
+  return TECHNICAL_CASCADE_BACKEND_LABELS.has(tokens[0])
+    || otherTokens.every((token) => TECHNICAL_CASCADE_BACKEND_CONTEXT_TOKENS.has(token) || /^\d+$/.test(token));
+}
+
+function firstDnsLabel(value: string | undefined) {
+  const trimmed = (value ?? '').trim().toLowerCase();
+  if (!trimmed || /^(?:\d{1,3}\.){3}\d{1,3}$/.test(trimmed)) {
+    return '';
+  }
+  return trimmed.split(/[.:/]/)[0]?.replace(/[^a-z0-9-]+/g, ' ') ?? '';
+}
+
+function isKnownTechnicalCascadeBackendServer(server: VpnServer) {
+  const displayLabel = server.rawLabel || server.country;
+  if (isPublicCascadeAggregateLabel(displayLabel)) {
+    return false;
+  }
+
+  const outbound = server.runtimeTemplate?.outbound as Record<string, unknown> | undefined;
+  const runtimeEndpoint = extractRuntimeEndpoint(server.runtimeTemplate ?? null);
+  const candidates = [
+    server.rawLabel,
+    server.country,
+    server.city,
+    server.description,
+    server.host,
+    firstDnsLabel(server.host),
+    firstDnsLabel(runtimeEndpoint.host),
+    server.runtimeTemplate?.remarks,
+    typeof outbound?.tag === 'string' ? outbound.tag : undefined,
+    server.ipPool
+  ];
+
+  return candidates.some(isKnownTechnicalCascadeBackendLabel);
+}
+
+function isTechnicalOnlyCascadeBackendSet(servers: VpnServer[]) {
+  return Boolean(servers.length) && servers.every(isKnownTechnicalCascadeBackendServer);
+}
+
 function cascadeFamilyKey(server: VpnServer) {
   const label = server.rawLabel || server.country;
   const { head } = splitCascadeLabel(label);
@@ -583,18 +723,34 @@ function cascadeFamilyKey(server: VpnServer) {
 function isLikelyCascadeBackendMember(server: VpnServer) {
   const label = server.rawLabel || server.country;
   const { head, tail } = splitCascadeLabel(label);
-  if (!head || !tail) {
+
+  if (!tail) {
+    return isKnownTechnicalCascadeBackendLabel(label);
+  }
+
+  if (!head) {
     return false;
   }
 
   const hasSlotMarker = /\b(?:s|srv|server|node|n)\s*\d+\b/i.test(head)
-    || /\b\d+\s*(?:s|srv|server|node|n)\b/i.test(head);
+    || /\b\d+\s*(?:s|srv|server|node|n)\b/i.test(head)
+    || isKnownTechnicalCascadeBackendLabel(head);
   if (!hasSlotMarker) {
     return false;
   }
 
   const publicTail = /^(?:all|no ads?|adguard|без рекламы|premium|standard|basic|streaming|gaming|4g|5g)$/i.test(tail);
   return !publicTail;
+}
+
+function isPublicCascadeAggregateLabel(label: string | undefined) {
+  const normalized = normalizeCascadeLabel(label);
+  if (!normalized || isKnownTechnicalCascadeBackendLabel(label)) {
+    return false;
+  }
+
+  return normalized.includes('|')
+    || /vkarmani|smart|premium|standard|gaming|streaming/i.test(normalized);
 }
 
 function hasPublicCascadeAggregateSibling(server: VpnServer, servers: VpnServer[]) {
@@ -608,13 +764,42 @@ function hasPublicCascadeAggregateSibling(server: VpnServer, servers: VpnServer[
       return false;
     }
 
-    const label = normalizeCascadeLabel(candidate.rawLabel || candidate.country);
-    return Boolean(label && label.includes('|')) || /vkarmani|smart|premium|standard|gaming|streaming/i.test(label);
+    return isPublicCascadeAggregateLabel(candidate.rawLabel || candidate.country);
   });
 }
 
 function filterRemnawaveCascadeBackendMembers(servers: VpnServer[]) {
-  return servers.filter((server) => !isLikelyCascadeBackendMember(server) || !hasPublicCascadeAggregateSibling(server, servers));
+  const hasAnyPublicAggregate = servers.some((server) => !isLikelyCascadeBackendMember(server) && isPublicCascadeAggregateLabel(server.rawLabel || server.country));
+  const hasAnyUserFacingAlternative = servers.some((server) => !isKnownTechnicalCascadeBackendServer(server));
+
+  return servers.filter((server) => {
+    const isBackend = isLikelyCascadeBackendMember(server) || isKnownTechnicalCascadeBackendServer(server);
+    if (!isBackend) {
+      return true;
+    }
+
+    if (isKnownTechnicalCascadeBackendServer(server) && (hasAnyPublicAggregate || hasAnyUserFacingAlternative)) {
+      return false;
+    }
+
+    return !hasPublicCascadeAggregateSibling(server, servers);
+  });
+}
+
+function visibleServersForQuality(servers: VpnServer[]) {
+  const visibleServers = filterRemnawaveCascadeBackendMembers(servers);
+
+  // Remnawave may expose raw cascade members (for example BADGER/MALLARD)
+  // next to a single user-facing full Xray JSON profile such as
+  // "VKarmani Smart | MSK". These raw members are implementation details and
+  // must never win candidate scoring over the aggregate profile only because
+  // there are more of them. Treat a candidate made only from known backend
+  // codenames as non-displayable for UI/candidate scoring.
+  if (isTechnicalOnlyCascadeBackendSet(visibleServers)) {
+    return [];
+  }
+
+  return visibleServers;
 }
 
 function serverEndpointKey(server: VpnServer) {
@@ -741,7 +926,9 @@ function applyDisplayLabelOverlays(candidates: ServerCandidate[]): ServerCandida
       const key = serverEndpointKey(server);
       const labelOverlay = labelOverlays.get(key);
       const locationOverlay = locationOverlays.get(key);
-      const labeledServer = labelOverlay && isUsefulStructuredDisplayLabel(labelOverlay.label, server)
+      const labeledServer = labelOverlay
+        && !isKnownTechnicalCascadeBackendServer(server)
+        && isUsefulStructuredDisplayLabel(labelOverlay.label, server)
         ? relabelServer(server, labelOverlay.label)
         : server;
       return applyEndpointLocationOverlay(labeledServer, locationOverlay);
@@ -751,7 +938,8 @@ function applyDisplayLabelOverlays(candidates: ServerCandidate[]): ServerCandida
 
 function structuredServerQuality(servers: VpnServer[], path: string, priority = 0) {
   const normalizedPath = path.toLowerCase();
-  const visibleServers = filterRemnawaveCascadeBackendMembers(servers);
+  const visibleServers = visibleServersForQuality(servers);
+  const technicalOnlyPenalty = isTechnicalOnlyCascadeBackendSet(servers) ? 3200 : 0;
   const sourceBonus = normalizedPath.includes('rawhosts') || normalizedPath.includes('hosts') || normalizedPath.includes('remnawave-structured')
     ? 75
     : 0;
@@ -760,7 +948,12 @@ function structuredServerQuality(servers: VpnServer[], path: string, priority = 
   const runtimeReadyBonus = visibleServers.reduce((score, server) => score + (server.runtimeTemplate ? 10 : -30), 0);
   const genericOnlyPenalty = visibleServers.length > 0 && visibleServers.every((server) => isGenericServerLabel(server.rawLabel || server.country)) ? -90 : 0;
   const hiddenCascadePenalty = Math.max(0, servers.length - visibleServers.length) * 12;
-  return priority + visibleServers.length * 100 + sourceBonus + userFacingBonus + labelBonus + runtimeReadyBonus + genericOnlyPenalty - hiddenCascadePenalty;
+
+  // Количество готовых Xray JSON узлов важнее, чем тип контейнера JSON.
+  // После редизайна часть Remnawave endpoints начала отдавать обычный Xray config-object
+  // с несколькими proxy outbounds. Старый приоритет single config-object мог сжать такой
+  // профиль до первого outbound и в UI появлялся только 1 сервер вместо полного списка.
+  return priority + visibleServers.length * 1000 + sourceBonus + userFacingBonus + labelBonus + runtimeReadyBonus + genericOnlyPenalty - hiddenCascadePenalty - technicalOnlyPenalty;
 }
 
 function chooseBestStructuredServerSet(candidates: ServerCandidate[]) {
@@ -926,12 +1119,18 @@ function xrayOutboundToRuntime(outboundValue: unknown, label: string): XrayRunti
   };
 }
 
-function parseXrayOutboundArray(outbounds: unknown[], seed: string): VpnServer[] {
+function parseXrayOutboundArray(outbounds: unknown[], seed: string, parentLabel?: string): VpnServer[] {
   const servers: VpnServer[] = [];
+  const cleanParentLabel = trimLabel(parentLabel ?? '');
 
   for (const outbound of outbounds) {
     if (servers.length >= MAX_IMPORTED_SERVERS) break;
-    const label = pickString(outbound, ['remarks', 'tag', 'metadata.remark', 'metadata.tag']) || `Xray JSON ${servers.length + 1}`;
+
+    const outboundLabel = xrayOutboundDisplayLabel(outbound);
+    const labelIsGeneric = isGenericServerLabel(outboundLabel);
+    const label = labelIsGeneric && cleanParentLabel
+      ? (outbounds.length === 1 ? cleanParentLabel : `${cleanParentLabel} ${servers.length + 1}`)
+      : outboundLabel || `Xray JSON ${servers.length + 1}`;
     const runtime = xrayOutboundToRuntime(outbound, label);
     if (!runtime) continue;
     const server = buildServerFromRuntimeTemplate(runtime, label, `${seed}:outbound:${JSON.stringify(outbound)}`, servers.length);
@@ -958,6 +1157,56 @@ function pickXrayConnectionLabel(payload: unknown, fallback: string) {
   ]) || fallback;
 }
 
+function supportedXrayOutbounds(outbounds: unknown) {
+  if (!Array.isArray(outbounds)) {
+    return [] as Record<string, unknown>[];
+  }
+
+  return outbounds.filter((outbound): outbound is Record<string, unknown> => (
+    isRecord(outbound)
+    && ['vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria2'].includes(normalizeStructuredProtocol(pickString(outbound, ['protocol'])))
+  ));
+}
+
+function countSupportedXrayOutbounds(outbounds: unknown) {
+  return supportedXrayOutbounds(outbounds).length;
+}
+
+function xrayOutboundDisplayLabel(outbound: unknown) {
+  return pickString(outbound, ['remarks', 'remark', 'metadata.remark', 'metadata.remarks', 'metadata.name', 'metadata.label', 'tag']);
+}
+
+function isAggregateXrayCascadeConfig(payload: unknown) {
+  if (!isRecord(payload)) {
+    return false;
+  }
+
+  const rawOutbounds = getPathValue(payload, 'outbounds');
+  const allOutbounds = Array.isArray(rawOutbounds) ? rawOutbounds : [];
+  const outbounds = supportedXrayOutbounds(rawOutbounds);
+  if (outbounds.length < 2) {
+    return false;
+  }
+
+  const parentLabel = pickXrayConnectionLabel(payload, '');
+  if (!isPublicCascadeAggregateLabel(parentLabel)) {
+    return false;
+  }
+
+  const technicalOutbounds = outbounds.filter((outbound) => isKnownTechnicalCascadeBackendLabel(xrayOutboundDisplayLabel(outbound))).length;
+  const hasRoutingOrBalancer = Boolean(
+    getPathValue(payload, 'routing')
+      || getPathValue(payload, 'dns')
+      || getPathValue(payload, 'policy')
+      || allOutbounds.some((outbound) => ['selector', 'urltest', 'loadbalance'].includes(normalizeStructuredProtocol(pickString(outbound, ['protocol']))))
+  );
+
+  // Collapse only real aggregate/cascade profiles. A normal full JSON with
+  // separate user-facing outbounds such as "RU Moscow" + "NL Amsterdam"
+  // must remain split into separate servers.
+  return technicalOutbounds > 0 && (technicalOutbounds === outbounds.length || hasRoutingOrBalancer);
+}
+
 function parseXrayConfigObject(payload: unknown, seed: string, index: number): VpnServer | null {
   if (!isRecord(payload)) {
     return null;
@@ -975,8 +1224,14 @@ function parseXrayConfigObject(payload: unknown, seed: string, index: number): V
       continue;
     }
 
+    const primaryOutboundTag = pickString(outbound, ['tag']) || 'proxy';
+    const runtimeWithFullConfig: XrayRuntimeTemplate = {
+      ...runtime,
+      fullConfig: compactObject(payload) as Record<string, unknown>,
+      primaryOutboundTag
+    };
     const identity = `${seed}:config:${JSON.stringify(outbound)}`;
-    return buildServerFromRuntimeTemplate(runtime, label, identity, index);
+    return buildServerFromRuntimeTemplate(runtimeWithFullConfig, label, identity, index);
   }
 
   return null;
@@ -1006,6 +1261,14 @@ function parseXrayConfigArray(payload: unknown, seed: string): VpnServer[] {
     }
   }
 
+  const seenObjects = new Set(objects.map((item) => item.value));
+  for (const item of collectXrayConfigObjectsByOutbounds(payload, 'nested')) {
+    if (!seenObjects.has(item.value)) {
+      seenObjects.add(item.value);
+      objects.push(item);
+    }
+  }
+
   const servers: VpnServer[] = [];
   const seenIds = new Set<string>();
   const pushServer = (server: VpnServer | null) => {
@@ -1026,10 +1289,21 @@ function parseXrayConfigArray(payload: unknown, seed: string): VpnServer[] {
 
   for (const { path, value } of objects) {
     if (servers.length >= MAX_IMPORTED_SERVERS) break;
+
+    // Если один Xray JSON object содержит несколько user-facing proxy outbounds, это
+    // полный список серверов, а не один сервер. Но Remnawave cascade/full profile
+    // может иметь несколько внутренних raw outbounds BADGER/MALLARD внутри одного
+    // публичного профиля "VKarmani Smart | MSK". Такой профиль нужно оставить
+    // одной карточкой и запускать через fullConfig, иначе внутренние backend-ноды
+    // снова появляются в UI как отдельные серверы.
+    if (countSupportedXrayOutbounds(getPathValue(value, 'outbounds')) > 1 && !isAggregateXrayCascadeConfig(value)) {
+      continue;
+    }
+
     pushServer(parseXrayConfigObject(value, `${seed}:${path}`, servers.length));
   }
 
-  return servers;
+  return dedupeServersByRuntimeIdentity(servers);
 }
 
 function normalizeTransportName(value: string | null | undefined) {
@@ -1557,6 +1831,32 @@ function extractRuntimeEndpoint(runtimeTemplate: XrayRuntimeTemplate | null) {
   };
 }
 
+function parentPathForArrayPath(path: string) {
+  return path.endsWith('.outbounds') ? path.slice(0, -'.outbounds'.length) : '';
+}
+
+function pickParentXrayLabel(payload: unknown, path: string) {
+  const parentPath = parentPathForArrayPath(path);
+  const parentValue = parentPath ? getPathValue(payload, parentPath) : payload;
+  return pickXrayConnectionLabel(parentValue, '');
+}
+
+function dedupeServersByRuntimeIdentity(servers: VpnServer[]) {
+  const seen = new Set<string>();
+  const result: VpnServer[] = [];
+
+  for (const server of servers) {
+    const key = runtimeIdentityFallback(server);
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(server);
+  }
+
+  return result;
+}
+
 function parseXrayJsonServersFromPayload(payload: unknown, seed: string): VpnServer[] {
   if (!payload) {
     return [];
@@ -1574,21 +1874,24 @@ function parseXrayJsonServersFromPayload(payload: unknown, seed: string): VpnSer
   ]);
 
   const explicitCandidates = explicitOutbounds
-    .map(({ path, value }) => ({ path, servers: parseXrayOutboundArray(value, `${seed}:${path}`), priority: 700 }))
+    .map(({ path, value }) => ({
+      path,
+      servers: parseXrayOutboundArray(value, `${seed}:${path}`, pickParentXrayLabel(payload, path)),
+      priority: 900
+    }))
     .filter((candidate) => candidate.servers.length);
-  if (explicitCandidates.length) {
-    return chooseBestStructuredServerSet(explicitCandidates);
-  }
 
   const recursiveOutbounds = collectArraysByKey(payload, ['outbounds']);
-  for (const outbounds of recursiveOutbounds) {
-    const servers = parseXrayOutboundArray(outbounds, `${seed}:nested`);
-    if (servers.length) {
-      return servers;
-    }
-  }
+  const recursiveServers = dedupeServersByRuntimeIdentity(recursiveOutbounds.flatMap((outbounds, index) => (
+    parseXrayOutboundArray(outbounds, `${seed}:nested:${index}`)
+  )));
 
-  return [];
+  const candidates = [
+    ...explicitCandidates,
+    ...(recursiveServers.length ? [{ path: 'nested.outbounds-all', servers: recursiveServers, priority: 650 }] : [])
+  ];
+
+  return chooseBestStructuredServerSet(candidates);
 }
 
 function parseXrayJsonStringCandidatesFromPayload(payload: unknown, seed: string): VpnServer[] {
@@ -1654,8 +1957,10 @@ export function parseXrayJsonSubscriptionToServers(rawText: string): VpnServer[]
   try {
     const parsed = JSON.parse(trimmed);
     const servers = parseXrayJsonOnlyServersFromPayload(parsed, 'xray-json');
+    const visibleServers = filterRemnawaveCascadeBackendMembers(servers);
+    const displayableServers = isTechnicalOnlyCascadeBackendSet(visibleServers) ? [] : visibleServers;
     return withUniqueSubscriptionIds(
-      filterRemnawaveCascadeBackendMembers(servers).slice(0, MAX_IMPORTED_SERVERS)
+      displayableServers.slice(0, MAX_IMPORTED_SERVERS)
     );
   } catch {
     return [];

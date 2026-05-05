@@ -12,6 +12,12 @@ pub(crate) fn force_kill_process_tree(_pid: u32) {}
 
 pub(crate) fn terminate_child_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
     let pid = child.id();
+
+    // Для Xray важнее безопасно и быстро остановить дерево процесса, чем ждать
+    // мягкого завершения. При повреждённом TUN/route-loop обычный Child::kill на
+    // Windows иногда оставляет дочерние/зависшие процессы, поэтому сначала бьём
+    // всё дерево taskkill, а затем дополнительно зовём kill как portable fallback.
+    force_kill_process_tree(pid);
     let _ = child.kill();
     let started_at = Instant::now();
 
@@ -28,8 +34,6 @@ pub(crate) fn terminate_child_with_timeout(child: &mut Child, timeout: Duration)
         }
     }
 
-    // Защита от редкого зависания xray.exe при быстром переключении серверов:
-    // если обычный kill не завершил процесс, на Windows добиваем всё дерево процесса.
     force_kill_process_tree(pid);
     let forced_started_at = Instant::now();
     loop {
@@ -66,6 +70,70 @@ pub(crate) fn acquire_operation_lock<'a>(
             }
         }
     }
+}
+
+pub(crate) fn remember_starting_runtime(state: &tauri::State<AppState>, starting: StartingCore) {
+    if let Ok(mut guard) = state.starting_runtime.lock() {
+        *guard = Some(starting);
+    }
+}
+
+pub(crate) fn clear_starting_runtime(state: &tauri::State<AppState>, pid: u32) {
+    if let Ok(mut guard) = state.starting_runtime.lock() {
+        if guard.as_ref().map(|item| item.pid) == Some(pid) {
+            *guard = None;
+        }
+    }
+}
+
+pub(crate) fn stop_starting_runtime(app: &AppHandle, state: &tauri::State<AppState>, reason: &str) -> bool {
+    let starting_to_stop = state
+        .starting_runtime
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+
+    let Some(starting) = starting_to_stop else {
+        return false;
+    };
+
+    let _ = append_runtime_event(
+        app,
+        &format!(
+            "Аварийно останавливаем Xray, который ещё запускался ({reason}) | pid={} | startedAt={} | core={} | log={}",
+            starting.pid,
+            starting.started_at,
+            starting.core_path,
+            starting.log_path
+        ),
+    );
+    force_kill_process_tree(starting.pid);
+
+    if starting.network_mode == "tun" {
+        let _ = cleanup_tun_routes(
+            starting.tun_interface_name.as_deref().unwrap_or(TUN_INTERFACE_NAME),
+            starting.tun_server_ip.as_deref(),
+        );
+    }
+
+    let _ = fs::remove_file(Path::new(&starting.config_path));
+    true
+}
+
+pub(crate) fn stop_managed_or_starting_runtime(
+    app: &AppHandle,
+    state: &tauri::State<AppState>,
+    restore_proxy: bool,
+    reason: &str,
+) -> Result<(), String> {
+    let stopped_starting = stop_starting_runtime(app, state, reason);
+    stop_existing_runtime(app, state, restore_proxy)?;
+
+    if stopped_starting && restore_proxy {
+        let _ = restore_saved_proxy_state(app, state, reason);
+    }
+
+    Ok(())
 }
 
 pub(crate) fn stop_existing_runtime(app: &AppHandle, state: &tauri::State<AppState>, restore_proxy: bool) -> Result<(), String> {
@@ -127,7 +195,7 @@ pub(crate) fn escape_powershell_single_quoted(value: &str) -> String {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn stop_orphan_xray_processes(app: &AppHandle, core_path: &Path) {
+pub(crate) fn stop_orphan_xray_processes(app: &AppHandle, core_path: &Path) -> bool {
     let target = escape_powershell_single_quoted(&core_path.to_string_lossy());
     let runtime_dir = runtime_output_dir(app)
         .map(|path| escape_powershell_single_quoted(&path.to_string_lossy()))
@@ -140,7 +208,10 @@ $items = Get-CimInstance Win32_Process -Filter "name = 'xray.exe'" | Where-Objec
   ($_.ExecutablePath -and ($_.ExecutablePath -ieq $target)) -or
   ($runtimeDir -and $_.CommandLine -and $_.CommandLine.Contains($runtimeDir) -and $_.CommandLine.Contains('xray-config-'))
 }}
-$items | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output $_.ProcessId }}
+$items | ForEach-Object {{
+  Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+  Write-Output $_.ProcessId
+}}
 Start-Sleep -Milliseconds 150
 }}"#,
         target,
@@ -156,27 +227,64 @@ Start-Sleep -Milliseconds 150
             if !cleaned.is_empty() {
                 let _ = append_runtime_event(
                     app,
-                    &format!("Перед новым стартом остановлены старые процессы xray.exe: {cleaned}."),
+                    &format!("Остановлены только принадлежащие VKarmani старые процессы xray.exe: {cleaned}."),
                 );
+                true
+            } else {
+                false
             }
         }
         Err(error) => {
             let _ = append_runtime_event(
                 app,
-                &format!("Не удалось проверить/остановить старые процессы xray.exe: {error}"),
+                &format!("Не удалось проверить/остановить старые процессы VKarmani xray.exe: {error}"),
             );
+            false
         }
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn stop_orphan_xray_processes(_app: &AppHandle, _core_path: &Path) {}
+pub(crate) fn stop_orphan_xray_processes(_app: &AppHandle, _core_path: &Path) -> bool { false }
 
+pub(crate) fn stop_runtime_orphans_for_app(app: &AppHandle, state: &tauri::State<AppState>, reason: &str) -> bool {
+    let stopped_owned_orphans = resolve_core_path(app)
+        .map(|core_path| stop_orphan_xray_processes(app, &core_path))
+        .unwrap_or(false);
+
+    if !stopped_owned_orphans {
+        let busy_ports = runtime_busy_ports();
+        if !busy_ports.is_empty() {
+            let _ = append_runtime_event(
+                app,
+                &format!(
+                    "Порты VKarmani заняты, но принадлежащие VKarmani orphan-процессы не найдены ({reason}). Вероятно, эти порты использует другой VPN/proxy-сервис: {}. Чужие процессы не трогаем и UI не переводим в ошибку.",
+                    format_busy_runtime_ports(&busy_ports)
+                ),
+            );
+        }
+        return false;
+    }
+
+    let _ = cleanup_runtime_config_files(app);
+    let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, None);
+
+    if let Ok(mut guard) = state.connected.lock() {
+        *guard = false;
+    }
+    if let Ok(mut guard) = state.active_server_label.lock() {
+        *guard = None;
+    }
+
+    let _ = append_runtime_event(app, &format!("Выполнена защитная очистка Xray runtime ({reason})."));
+    true
+}
 
 pub(crate) fn cleanup_application(app: &AppHandle, reason: &str) {
     let state = app.state::<AppState>();
     let _ = append_runtime_event(app, &format!("Запущен cleanup приложения: {reason}."));
-    let _ = stop_existing_runtime(app, &state, true);
+    let _ = stop_managed_or_starting_runtime(app, &state, true, reason);
+    stop_runtime_orphans_for_app(app, &state, reason);
     let _ = restore_saved_proxy_state(app, &state, reason);
     let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, None);
     let _ = cleanup_runtime_config_files(app);
@@ -776,9 +884,39 @@ pub(crate) fn sync_runtime_liveness(app: &AppHandle, state: &tauri::State<AppSta
 }
 
 pub(crate) fn start_runtime_watchdog(app: AppHandle) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(2));
-        let state = app.state::<AppState>();
-        sync_runtime_liveness(&app, &state);
+    std::thread::spawn(move || {
+        let mut last_orphan_sweep = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            let state = app.state::<AppState>();
+            sync_runtime_liveness(&app, &state);
+
+            if last_orphan_sweep.elapsed() < Duration::from_secs(8) {
+                continue;
+            }
+            last_orphan_sweep = Instant::now();
+
+            let has_managed_runtime = state
+                .runtime
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false);
+            let has_starting_runtime = state
+                .starting_runtime
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false);
+
+            // Если приложение уже считает VPN остановленным, но локальные порты Xray
+            // всё ещё заняты, значит остался зависший orphan-процесс. Добиваем только
+            // процессы нашего core/config из runtime-папки, чужие VPN-клиенты не трогаем.
+            if !has_managed_runtime && !has_starting_runtime && !runtime_busy_ports().is_empty() {
+                if stop_runtime_orphans_for_app(&app, &state, "watchdog_orphan_ports") {
+                    let _ = restore_saved_proxy_state(&app, &state, "watchdog_orphan_ports");
+                    let _ = app.emit("vkarmani://native-disconnect", "stopped");
+                    refresh_tray_menu(&app);
+                }
+            }
+        }
     });
 }

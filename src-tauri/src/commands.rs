@@ -165,6 +165,15 @@ pub(crate) fn client_state_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("client-state-v1.json"))
 }
 
+pub(crate) fn sensitive_client_state_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("Не удалось определить каталог данных приложения: {error}"))?;
+    fs::create_dir_all(&dir).map_err(|error| format!("Не удалось создать каталог данных приложения: {error}"))?;
+    Ok(dir.join("sensitive-client-state-v1.dpapi"))
+}
+
 pub(crate) fn is_allowed_client_state_key(key: &str) -> bool {
     matches!(
         key,
@@ -174,6 +183,10 @@ pub(crate) fn is_allowed_client_state_key(key: &str) -> bool {
             | "selectedServerId"
             | "lastKnownServers"
     )
+}
+
+pub(crate) fn is_allowed_sensitive_client_state_key(key: &str) -> bool {
+    matches!(key, "lastKnownServers")
 }
 
 pub(crate) fn read_client_state_map(app: &AppHandle) -> Result<serde_json::Map<String, Value>, String> {
@@ -290,6 +303,151 @@ pub(crate) async fn clear_client_state_value(key: String, app: AppHandle) -> Res
     tauri::async_runtime::spawn_blocking(move || clear_client_state_value_blocking(key, app))
         .await
         .map_err(|error| format!("Очистка настроек клиента была прервана: {error}"))?
+}
+
+fn read_sensitive_client_state_map(app: &AppHandle) -> Result<serde_json::Map<String, Value>, String> {
+    let path = sensitive_client_state_path(app)?;
+    if !path.exists() {
+        return Ok(serde_json::Map::new());
+    }
+
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("Не удалось проверить защищённый кэш клиента: {error}"))?;
+    if metadata.len() > CLIENT_STATE_MAX_BYTES.saturating_mul(3) {
+        return Err("Файл защищённого кэша клиента слишком большой и не будет загружен.".to_string());
+    }
+
+    let encrypted = fs::read_to_string(&path)
+        .map_err(|error| format!("Не удалось прочитать защищённый кэш клиента: {error}"))?;
+    if encrypted.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+
+    let decrypted = decrypt_access_key(encrypted.trim()).map_err(|error| {
+        let backup_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|name| format!("{name}.corrupt-{}", unix_timestamp_seconds()))
+            .unwrap_or_else(|| format!("sensitive-client-state-v1.dpapi.corrupt-{}", unix_timestamp_seconds()));
+        let backup_path = path.with_file_name(backup_name);
+        let _ = fs::copy(&path, &backup_path);
+        let _ = append_interface_event(
+            app,
+            &format!(
+                "Защищённый кэш клиента повреждён и не будет загружен: {error}. Backup: {}",
+                backup_path.display()
+            ),
+        );
+        format!("Не удалось расшифровать защищённый кэш клиента: {error}")
+    })?;
+
+    if decrypted.len() as u64 > CLIENT_STATE_MAX_BYTES {
+        return Err("Расшифрованный защищённый кэш клиента слишком большой и не будет загружен.".to_string());
+    }
+
+    if decrypted.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+
+    let value: Value = serde_json::from_str(&decrypted).map_err(|error| {
+        let backup_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|name| format!("{name}.invalid-json-{}", unix_timestamp_seconds()))
+            .unwrap_or_else(|| format!("sensitive-client-state-v1.dpapi.invalid-json-{}", unix_timestamp_seconds()));
+        let backup_path = path.with_file_name(backup_name);
+        let _ = fs::copy(&path, &backup_path);
+        let _ = append_interface_event(
+            app,
+            &format!(
+                "Защищённый кэш клиента содержит некорректный JSON и не будет загружен: {error}. Backup: {}",
+                backup_path.display()
+            ),
+        );
+        format!("Защищённый кэш клиента содержит некорректный JSON: {error}")
+    })?;
+
+    Ok(value.as_object().cloned().unwrap_or_default())
+}
+
+fn save_sensitive_client_state_value_blocking(key: String, value: String, app: AppHandle) -> Result<(), String> {
+    let normalized_key = key.trim();
+    if !is_allowed_sensitive_client_state_key(normalized_key) {
+        return Err("Недопустимый ключ защищённого клиентского состояния.".into());
+    }
+
+    if value.len() as u64 > CLIENT_STATE_MAX_BYTES {
+        return Err("Защищённое клиентское состояние слишком большое и не будет сохранено.".to_string());
+    }
+
+    let parsed_value: Value = serde_json::from_str(&value)
+        .map_err(|error| format!("Не удалось сохранить защищённый кэш клиента: некорректный JSON: {error}"))?;
+
+    let mut map = read_sensitive_client_state_map(&app).unwrap_or_default();
+    map.insert(normalized_key.to_string(), parsed_value);
+    map.insert("updatedAt".to_string(), Value::String(unix_now_string()));
+
+    let payload = serde_json::to_string_pretty(&Value::Object(map))
+        .map_err(|error| format!("Не удалось подготовить защищённый кэш клиента к сохранению: {error}"))?;
+    if payload.len() as u64 > CLIENT_STATE_MAX_BYTES {
+        return Err("Защищённый кэш клиента слишком большой и не будет сохранён.".to_string());
+    }
+
+    let encrypted = encrypt_access_key(&payload)
+        .map_err(|error| format!("Не удалось зашифровать защищённый кэш клиента: {error}"))?;
+    let path = sensitive_client_state_path(&app)?;
+    atomic_write_text(&path, &encrypted, "Не удалось сохранить защищённый кэш клиента")
+}
+
+fn load_sensitive_client_state_value_blocking(key: String, app: AppHandle) -> Result<Option<String>, String> {
+    let normalized_key = key.trim();
+    if !is_allowed_sensitive_client_state_key(normalized_key) {
+        return Err("Недопустимый ключ защищённого клиентского состояния.".into());
+    }
+
+    let map = read_sensitive_client_state_map(&app)?;
+    Ok(map
+        .get(normalized_key)
+        .and_then(|value| serde_json::to_string(value).ok()))
+}
+
+fn clear_sensitive_client_state_value_blocking(key: String, app: AppHandle) -> Result<(), String> {
+    let normalized_key = key.trim();
+    if !is_allowed_sensitive_client_state_key(normalized_key) {
+        return Err("Недопустимый ключ защищённого клиентского состояния.".into());
+    }
+
+    let mut map = read_sensitive_client_state_map(&app).unwrap_or_default();
+    map.remove(normalized_key);
+    map.insert("updatedAt".to_string(), Value::String(unix_now_string()));
+
+    let payload = serde_json::to_string_pretty(&Value::Object(map))
+        .map_err(|error| format!("Не удалось подготовить защищённый кэш клиента к очистке: {error}"))?;
+    let encrypted = encrypt_access_key(&payload)
+        .map_err(|error| format!("Не удалось зашифровать защищённый кэш клиента после очистки: {error}"))?;
+    let path = sensitive_client_state_path(&app)?;
+    atomic_write_text(&path, &encrypted, "Не удалось очистить защищённый кэш клиента")
+}
+
+#[tauri::command]
+pub(crate) async fn save_sensitive_client_state_value(key: String, value: String, app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_sensitive_client_state_value_blocking(key, value, app))
+        .await
+        .map_err(|error| format!("Сохранение защищённого кэша клиента было прервано: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn load_sensitive_client_state_value(key: String, app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || load_sensitive_client_state_value_blocking(key, app))
+        .await
+        .map_err(|error| format!("Загрузка защищённого кэша клиента была прервана: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn clear_sensitive_client_state_value(key: String, app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || clear_sensitive_client_state_value_blocking(key, app))
+        .await
+        .map_err(|error| format!("Очистка защищённого кэша клиента была прервана: {error}"))?
 }
 #[cfg(target_os = "windows")]
 pub(crate) fn encrypt_access_key(value: &str) -> Result<String, String> {
@@ -522,14 +680,25 @@ pub(crate) fn set_session_authorized(
     app: AppHandle,
 ) -> Result<bool, String> {
     if authorized {
-        let normalized_access_key = normalize_access_key_for_native(
-            access_key
-                .as_deref()
-                .ok_or_else(|| "Для подтверждения native-сессии нужен ключ доступа.".to_string())?,
-        )?;
+        // Native-сессия больше не доверяет одному только renderer-состоянию.
+        // Перед включением нативных команд подключения берём ключ из DPAPI и,
+        // если renderer всё же передал ключ, требуем полного совпадения.
+        let stored_access_key = load_access_key_secure_blocking(app.clone())?
+            .ok_or_else(|| "Native-сессия не подтверждена: ключ не найден в защищённом хранилище Windows. Войдите по ключу ещё раз.".to_string())?;
+        let stored_access_key_hash = sha256_hex_bytes(stored_access_key.as_bytes());
+
+        if let Some(provided_access_key) = access_key.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            let normalized_provided_access_key = normalize_access_key_for_native(provided_access_key)?;
+            let provided_hash = sha256_hex_bytes(normalized_provided_access_key.as_bytes());
+            if provided_hash != stored_access_key_hash {
+                clear_native_session_authorization(&state)?;
+                return Err("Native-сессия не подтверждена: ключ renderer не совпадает с защищённым DPAPI-хранилищем.".to_string());
+            }
+        }
+
         let now = unix_timestamp_seconds();
         let auth = NativeSessionAuthorization {
-            access_key_hash: sha256_hex_bytes(normalized_access_key.as_bytes()),
+            access_key_hash: stored_access_key_hash,
             expires_at: now.saturating_add(NATIVE_SESSION_TTL_SECONDS),
         };
 
@@ -775,7 +944,7 @@ pub(crate) fn request_connect_blocking(
         return Err("TUN режим требует запуска VKarmani с правами администратора, иначе Windows не даст создать маршруты. Откройте настройки клиента и включите запуск от администратора или перезапустите приложение вручную от имени администратора.".into());
     }
 
-    stop_existing_runtime(&app, &state, !reconnect_requested)?;
+    stop_managed_or_starting_runtime(&app, &state, !reconnect_requested, "connect_preflight")?;
     stop_orphan_xray_processes(&app, &core_path);
     if let Err(first_release_error) = wait_for_runtime_ports_release(if reconnect_requested { Duration::from_secs(6) } else { Duration::from_secs(4) }) {
         let _ = append_runtime_event(
@@ -983,6 +1152,25 @@ pub(crate) fn request_connect_blocking(
     let mut child = command
         .spawn()
         .map_err(|error| format_xray_spawn_error(&error, &core_path))?;
+    let child_pid = child.id();
+    remember_starting_runtime(&state, StartingCore {
+        pid: child_pid,
+        core_path: core_path.to_string_lossy().to_string(),
+        config_path: config_path.to_string_lossy().to_string(),
+        log_path: log_path.to_string_lossy().to_string(),
+        network_mode: normalized_network_mode.clone(),
+        tun_interface_name: if normalized_network_mode == "tun" {
+            Some(TUN_INTERFACE_NAME.to_string())
+        } else {
+            None
+        },
+        tun_server_ip: if normalized_network_mode == "tun" {
+            outbound_ip.clone()
+        } else {
+            None
+        },
+        started_at: unix_now_string(),
+    });
 
     if let Err(error) = wait_for_xray_runtime_ready(
         &app,
@@ -996,6 +1184,7 @@ pub(crate) fn request_connect_blocking(
             &app,
             &format!("Xray runtime не стал готовым после запуска, выполняю аварийную очистку: {error}"),
         );
+        clear_starting_runtime(&state, child_pid);
         let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref());
         let _ = restore_saved_proxy_state(&app, &state, "connect_readiness_failed");
         let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
@@ -1004,7 +1193,9 @@ pub(crate) fn request_connect_blocking(
 
     if normalized_network_mode == "tun" {
         configure_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref()).map_err(|error| {
+            clear_starting_runtime(&state, child_pid);
             let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref());
+            let _ = restore_saved_proxy_state(&app, &state, "tun_routes_failed");
             let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
             format!("Не удалось подготовить Windows-маршруты для TUN режима: {error}")
         })?;
@@ -1013,6 +1204,7 @@ pub(crate) fn request_connect_blocking(
                 &app,
                 &format!("TUN IPv6 leak guard не применился, подключение остановлено для защиты от утечек IPv6: {error}"),
             );
+            clear_starting_runtime(&state, child_pid);
             let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref());
             let _ = restore_saved_proxy_state(&app, &state, "tun_ipv6_guard_failed");
             let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
@@ -1022,6 +1214,24 @@ pub(crate) fn request_connect_blocking(
         }
         let _ = append_runtime_event(&app, "TUN IPv6 leak guard применён: IPv6 split-default направлен в TUN, Xray дополнительно блокирует IPv6 на tun-in.");
         let _ = append_runtime_event(&app, "TUN маршруты применены для текущего сеанса.");
+    }
+
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|error| format!("Не удалось проверить Xray перед завершением подключения: {error}"))?
+    {
+        clear_starting_runtime(&state, child_pid);
+        let code = status.code();
+        if let Ok(mut exit_guard) = state.last_exit_code.lock() {
+            *exit_guard = code;
+        }
+        let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref());
+        let _ = restore_saved_proxy_state(&app, &state, "connect_final_check_failed");
+        let _ = fs::remove_file(&config_path);
+        return Err(format!(
+            "Xray остановился до завершения подключения. Exit code: {:?}. Подключение не было помечено активным.",
+            code
+        ));
     }
 
     if let Ok(mut guard) = state.connected.lock() {
@@ -1059,6 +1269,8 @@ pub(crate) fn request_connect_blocking(
         });
     }
 
+    clear_starting_runtime(&state, child_pid);
+
     let _ = app.emit("vkarmani://native-connect", server_id);
     let _ = app.emit("vkarmani://native-status", server_label);
     refresh_tray_menu(&app);
@@ -1076,9 +1288,29 @@ pub(crate) async fn request_disconnect(app: AppHandle) -> Result<RuntimeStatus, 
 
 pub(crate) fn request_disconnect_blocking(app: AppHandle) -> Result<RuntimeStatus, String> {
     let state = app.state::<AppState>();
-    let _operation_guard = acquire_operation_lock(&state, Duration::from_secs(8), "runtime-operation")?;
 
-    stop_existing_runtime(&app, &state, true)?;
+    match state.operation_lock.try_lock() {
+        Ok(operation_guard) => {
+            stop_managed_or_starting_runtime(&app, &state, true, "user_disconnect")?;
+            drop(operation_guard);
+        }
+        Err(_) => {
+            // Кнопка «Отключиться» должна быть аварийной: если в этот момент connect
+            // завис на старте Xray, ожидание operation_lock оставляло runaway-процесс.
+            // Поэтому при занятом lock сразу добиваем pending/runtime/orphan Xray.
+            let _ = append_runtime_event(&app, "Отключение запрошено во время другой runtime-операции: включён аварийный stop Xray.");
+            let _ = stop_managed_or_starting_runtime(&app, &state, true, "user_disconnect_busy");
+            stop_runtime_orphans_for_app(&app, &state, "user_disconnect_busy");
+            let _ = wait_for_runtime_ports_release(Duration::from_secs(3));
+        }
+    }
+
+    if let Some(core_path) = resolve_core_path(&app) {
+        stop_orphan_xray_processes(&app, &core_path);
+    }
+    let _ = wait_for_runtime_ports_release(Duration::from_secs(3));
+    let _ = restore_saved_proxy_state(&app, &state, "user_disconnect");
+    let _ = cleanup_runtime_config_files(&app);
 
     if let Ok(mut guard) = state.connected.lock() {
         *guard = false;
@@ -1091,7 +1323,6 @@ pub(crate) fn request_disconnect_blocking(app: AppHandle) -> Result<RuntimeStatu
     let _ = append_runtime_event(&app, "Xray runtime остановлен пользователем.");
     let _ = app.emit("vkarmani://native-disconnect", "idle");
     refresh_tray_menu(&app);
-    drop(_operation_guard);
     Ok(build_runtime_status(&app, state))
 }
 
@@ -1608,7 +1839,45 @@ pub(crate) fn active_tun_server_ip_for_ping(app: &AppHandle) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn add_temporary_direct_routes_for_ping(app: Option<&AppHandle>, addresses: &[std::net::SocketAddr]) -> Vec<String> {
+#[derive(Clone, Debug)]
+pub(crate) struct TemporaryDirectRoute {
+    ip: String,
+    gateway: String,
+    interface_index: u32,
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) struct TemporaryDirectRoutesGuard {
+    routes: Vec<TemporaryDirectRoute>,
+}
+
+#[cfg(target_os = "windows")]
+impl TemporaryDirectRoutesGuard {
+    pub(crate) fn new(app: Option<&AppHandle>, addresses: &[std::net::SocketAddr]) -> Self {
+        let routes = add_temporary_direct_routes_for_ping(app, addresses);
+        Self { routes }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for TemporaryDirectRoutesGuard {
+    fn drop(&mut self) {
+        cleanup_temporary_direct_routes_for_ping(&self.routes);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) struct TemporaryDirectRoutesGuard;
+
+#[cfg(not(target_os = "windows"))]
+impl TemporaryDirectRoutesGuard {
+    pub(crate) fn new(_app: Option<&AppHandle>, _addresses: &[std::net::SocketAddr]) -> Self {
+        Self
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn add_temporary_direct_routes_for_ping(app: Option<&AppHandle>, addresses: &[std::net::SocketAddr]) -> Vec<TemporaryDirectRoute> {
     let Some(app) = app else {
         return Vec::new();
     };
@@ -1622,42 +1891,47 @@ pub(crate) fn add_temporary_direct_routes_for_ping(app: Option<&AppHandle>, addr
         _ => return Vec::new(),
     };
 
-    let mut added_routes: Vec<String> = Vec::new();
+    let mut added_routes: Vec<TemporaryDirectRoute> = Vec::new();
     for address in addresses {
         let ip = match address.ip() {
             IpAddr::V4(ip) => ip.to_string(),
             IpAddr::V6(_) => continue,
         };
 
-        if ip == active_tun_server_ip || added_routes.iter().any(|item| item == &ip) {
+        if ip == active_tun_server_ip || added_routes.iter().any(|item| item.ip == ip) {
             continue;
         }
 
         // Во время активного TUN split-default отправляет все публичные IPv4 в Wintun.
         // Для проверки ping других VPN-нод временно добавляем /32 escape route через
-        // физический gateway. Иначе зелёным обычно остаётся только текущий сервер.
-        if route_add(&ip, "255.255.255.255", &default_route.next_hop, 2, None).is_ok() {
-            added_routes.push(ip);
+        // физический gateway + InterfaceIndex. RAII guard гарантированно удалит routes
+        // даже при раннем return или будущей ошибочной ветке.
+        if route_add(&ip, "255.255.255.255", &default_route.next_hop, 2, Some(default_route.interface_index)).is_ok() {
+            added_routes.push(TemporaryDirectRoute {
+                ip,
+                gateway: default_route.next_hop.clone(),
+                interface_index: default_route.interface_index,
+            });
         }
     }
 
     added_routes
 }
 
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn add_temporary_direct_routes_for_ping(_app: Option<&AppHandle>, _addresses: &[std::net::SocketAddr]) -> Vec<String> {
-    Vec::new()
-}
-
 #[cfg(target_os = "windows")]
-pub(crate) fn cleanup_temporary_direct_routes_for_ping(added_routes: &[String]) {
-    for ip in added_routes {
-        route_delete(ip, "255.255.255.255", None, None);
+pub(crate) fn cleanup_temporary_direct_routes_for_ping(added_routes: &[TemporaryDirectRoute]) {
+    for route in added_routes {
+        route_delete(
+            &route.ip,
+            "255.255.255.255",
+            Some(route.gateway.as_str()),
+            Some(route.interface_index),
+        );
+        // Fallback cleanup without gateway/interface removes stale routes left by
+        // older builds that did not track exact route metadata.
+        route_delete(&route.ip, "255.255.255.255", None, None);
     }
 }
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn cleanup_temporary_direct_routes_for_ping(_added_routes: &[String]) {}
 
 pub(crate) fn server_ping_blocking(host: String, port: u16, app: Option<AppHandle>) -> Result<ConnectivityProbe, String> {
     let checked_at = unix_now_string();
@@ -1667,14 +1941,13 @@ pub(crate) fn server_ping_blocking(host: String, port: u16, app: Option<AppHandl
     }
 
     let addresses = resolve_socket_addresses(&normalized_host, port)?;
-    let temporary_direct_routes = add_temporary_direct_routes_for_ping(app.as_ref(), &addresses);
+    let _temporary_direct_routes_guard = TemporaryDirectRoutesGuard::new(app.as_ref(), &addresses);
     let endpoint = format_endpoint_for_display(&normalized_host, port);
 
     // Для VPN-сервера важнее не ICMP, а доступность реального host:port.
     // Поэтому TCP-проверка идёт первой и с короткими timeout, чтобы UI не выглядел зависшим.
     let (success_count, latency_ms, packet_loss) = run_tcp_ping_samples(&addresses, 3, Duration::from_millis(850));
     if success_count > 0 {
-        cleanup_temporary_direct_routes_for_ping(&temporary_direct_routes);
         return Ok(ConnectivityProbe {
             success: true,
             checked_at,
@@ -1694,7 +1967,6 @@ pub(crate) fn server_ping_blocking(host: String, port: u16, app: Option<AppHandl
     // ICMP используем только как диагностику. Если ICMP отвечает, но TCP-порт закрыт,
     // сервер не считаем рабочим для подключения, чтобы не показывать ложный зелёный ping.
     if let Some((icmp_latency_ms, icmp_packet_loss)) = windows_icmp_ping(&normalized_host) {
-        cleanup_temporary_direct_routes_for_ping(&temporary_direct_routes);
         return Ok(ConnectivityProbe {
             success: false,
             checked_at,
@@ -1708,8 +1980,6 @@ pub(crate) fn server_ping_blocking(host: String, port: u16, app: Option<AppHandl
             ),
         });
     }
-
-    cleanup_temporary_direct_routes_for_ping(&temporary_direct_routes);
 
     Ok(ConnectivityProbe {
         success: false,
@@ -2093,18 +2363,75 @@ pub(crate) fn read_windows_registry_value(key: &str, value_name: &str) -> Option
 }
 
 #[cfg(target_os = "windows")]
+fn parse_windows_registry_dword(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    trimmed.parse::<u32>().ok()
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_windows_product_name(product_name: &str, edition_id: Option<&str>, build_number: Option<u32>) -> String {
+    let product = product_name.trim();
+    let edition = edition_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| match value.to_ascii_lowercase().as_str() {
+            "professional" => "Pro".to_string(),
+            "enterprise" => "Enterprise".to_string(),
+            "education" => "Education".to_string(),
+            "core" => "Home".to_string(),
+            other => other.to_string(),
+        });
+
+    // На Windows 11 реестр часто продолжает отдавать ProductName = "Windows 10 ..."
+    // ради совместимости. Определяем поколение по build >= 22000 и не показываем
+    // пользователю неверный Windows 10.
+    if build_number.unwrap_or_default() >= 22000 {
+        if product.to_ascii_lowercase().contains("windows 11") {
+            return product.to_string();
+        }
+
+        if let Some(edition) = edition {
+            return format!("Windows 11 {edition}");
+        }
+
+        return product.replacen("Windows 10", "Windows 11", 1);
+    }
+
+    if product.is_empty() {
+        edition
+            .map(|value| format!("Windows {value}"))
+            .unwrap_or_else(|| "Windows".to_string())
+    } else {
+        product.to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
 pub(crate) fn windows_device_info() -> (String, String, String, String, String, String) {
     let current_version_key = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion";
     let hwid = read_windows_registry_value(r"HKLM\SOFTWARE\Microsoft\Cryptography", "MachineGuid")
         .unwrap_or_else(|| "—".to_string());
-    let product_name = read_windows_registry_value(current_version_key, "ProductName")
+    let product_name_raw = read_windows_registry_value(current_version_key, "ProductName")
         .unwrap_or_else(|| "Windows".to_string());
+    let edition_id = read_windows_registry_value(current_version_key, "EditionID");
     let display_version = read_windows_registry_value(current_version_key, "DisplayVersion")
         .or_else(|| read_windows_registry_value(current_version_key, "ReleaseId"))
         .unwrap_or_else(|| "—".to_string());
-    let build = read_windows_registry_value(current_version_key, "CurrentBuildNumber")
+    let build_base = read_windows_registry_value(current_version_key, "CurrentBuildNumber")
         .or_else(|| read_windows_registry_value(current_version_key, "CurrentBuild"))
         .unwrap_or_else(|| "—".to_string());
+    let build_number = build_base.parse::<u32>().ok();
+    let ubr = read_windows_registry_value(current_version_key, "UBR")
+        .and_then(|value| parse_windows_registry_dword(&value));
+    let build = match (build_base.as_str(), ubr) {
+        ("—", _) => "—".to_string(),
+        (base, Some(ubr)) => format!("{base}.{ubr}"),
+        (base, None) => base.to_string(),
+    };
+    let product_name = normalize_windows_product_name(&product_name_raw, edition_id.as_deref(), build_number);
     let architecture = std::env::var("PROCESSOR_ARCHITECTURE")
         .or_else(|_| std::env::var("PROCESSOR_ARCHITEW6432"))
         .unwrap_or_else(|_| std::env::consts::ARCH.to_string());

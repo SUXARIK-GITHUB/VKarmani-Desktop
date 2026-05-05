@@ -38,6 +38,7 @@
 
 - 🔑 **Подключение по ключу VKarmani** — пользователь вставляет ключ подписки, а приложение само проверяет профиль и подтягивает серверы.
 - 🔐 **Сохранение ключа** — ключ может храниться в защищённом хранилище Windows, чтобы при следующем запуске не вводить его заново.
+- 🧷 **Защищённый кэш серверов** — рабочие runtime-конфиги серверов не сохраняются открытым текстом в обычном client-state/localStorage.
 - 🚪 **Быстрый выход из профиля** — сохранённый ключ можно удалить через интерфейс, если нужно выйти или сменить доступ.
 - 🌍 **Список серверов** — серверы подтягиваются из live-профиля Remnawave и отображаются в удобном списке.
 - ⭐ **Избранные серверы** — избранные узлы сохраняются и поднимаются выше в списке для быстрого выбора.
@@ -94,7 +95,7 @@ VKarmani Desktop поддерживает автообновления чере�
 | 🧠 Desktop backend | Rust, Tauri v2 | Native-команды, запуск Xray, системный proxy, TUN, маршруты, tray, updater |
 | 🌐 VPN core | Xray-core | Реальное VPN/proxy-подключение, inbound/outbound, проверка конфигов |
 | 🛡️ TUN | Wintun | Туннелирование выбранных приложений и служб через VPN |
-| 🔑 Хранение ключа | Windows DPAPI / secure storage | Защищённое сохранение ключа доступа на устройстве |
+| 🔑 Хранение ключа и runtime-кэша | Windows DPAPI / secure storage | Защищённое сохранение ключа доступа и полного server runtime cache на устройстве |
 | 📦 Обновления | Tauri Updater, GitHub Releases, latest.json | Проверка, загрузка и установка новых версий |
 | 🧩 Парсер подписки | Remnawave parser | Разбор VLESS, VMess, Trojan, Shadowsocks, Hysteria2 и server metadata |
 | 🧭 Маршрутизация | Routing exclusions, split-tunnel rules | Direct-исключения, приложения, службы, IPv4/TUN-правила |
@@ -255,12 +256,15 @@ VKarmani-Desktop/
 
 ## 🧪 Проверки и сборка
 
+Требования для разработки: **Node.js 22 LTS** и npm 10+.
+
 ```bash
 npm ci
 npm run build
 npm run test:parsers
 npm run verify:updater
 npm run verify:xray:manifest
+npm run smoke:windows
 npm run tauri:build
 ```
 

@@ -97,14 +97,12 @@ jobs:
       - name: Run Remnawave parser tests
         run: npm run test:parsers
 
-      - name: Refresh patched Rust transitive dependencies
-        shell: pwsh
-        run: |
-          cargo update --manifest-path src-tauri/Cargo.toml -p rustls-webpki --precise 0.103.13
-          cargo update --manifest-path src-tauri/Cargo.toml -p tar --precise 0.4.45
-
       - name: Run Rust unit tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Run Windows runtime smoke checks
+        shell: pwsh
+        run: .\scripts\windows-runtime-smoke.ps1 -RequireCleanDisconnect
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked

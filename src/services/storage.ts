@@ -1,4 +1,4 @@
-import type { AppSettings, SplitTunnelEntry } from '../types/vpn';
+import type { AppSettings, SplitTunnelEntry, VpnServer } from '../types/vpn';
 import { defaultRoutingExclusions, sanitizeRoutingExclusions } from '../utils/routingExclusions';
 
 const ACCESS_KEY_STORAGE = 'vkarmani.access-key';
@@ -8,10 +8,12 @@ const SETTINGS_STORAGE = 'vkarmani.settings';
 const SPLIT_TUNNEL_STORAGE = 'vkarmani.split-tunnel.entries';
 const FAVORITE_SERVERS_STORAGE = 'vkarmani.servers.favorites';
 const SELECTED_SERVER_STORAGE = 'vkarmani.servers.selected';
+const LAST_KNOWN_SERVERS_STORAGE = 'vkarmani.servers.last-known-xray-json';
 const NATIVE_SETTINGS_KEY = 'settings';
 const NATIVE_SPLIT_TUNNEL_KEY = 'splitTunnelEntries';
 const NATIVE_FAVORITES_KEY = 'favoriteServerIds';
 const NATIVE_SELECTED_SERVER_KEY = 'selectedServerId';
+const NATIVE_LAST_KNOWN_SERVERS_KEY = 'lastKnownServers';
 
 export const defaultSettings: AppSettings = {
   launchOnStartup: false,
@@ -92,6 +94,80 @@ function normalizeStoredSettings(value: unknown): AppSettings {
   return next;
 }
 
+
+function isStoredXrayRuntimeTemplate(value: unknown): value is VpnServer['runtimeTemplate'] {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const candidate = value as Partial<NonNullable<VpnServer['runtimeTemplate']>>;
+  return candidate.family === 'xray' && typeof candidate.outbound === 'object' && candidate.outbound !== null;
+}
+
+function isStoredVpnServer(value: unknown): value is VpnServer {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const candidate = value as Partial<VpnServer>;
+  const hasValidRuntimeTemplate = candidate.runtimeTemplate === undefined || isStoredXrayRuntimeTemplate(candidate.runtimeTemplate);
+  return typeof candidate.id === 'string'
+    && typeof candidate.country === 'string'
+    && typeof candidate.city === 'string'
+    && typeof candidate.flag === 'string'
+    && typeof candidate.load === 'number'
+    && hasValidRuntimeTemplate;
+}
+
+function normalizeStoredServers(value: unknown): VpnServer[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const servers: VpnServer[] = [];
+
+  for (const item of value) {
+    if (!isStoredVpnServer(item)) {
+      continue;
+    }
+
+    const id = item.id.trim();
+    if (!id || seen.has(id)) {
+      continue;
+    }
+
+    seen.add(id);
+    servers.push({
+      ...item,
+      id,
+      source: 'subscription',
+      latencyStatus: item.latencyStatus === 'ok' || item.latencyStatus === 'failed' ? item.latencyStatus : 'unchecked',
+      latency: typeof item.latency === 'number' ? item.latency : null
+    });
+
+    if (servers.length >= 300) {
+      break;
+    }
+  }
+
+  return servers;
+}
+
+function stripSensitiveServerRuntime(server: VpnServer): VpnServer {
+  const { runtimeTemplate: _runtimeTemplate, rawUri: _rawUri, ...safeServer } = server;
+  return {
+    ...safeServer,
+    latencyStatus: server.latencyStatus === 'ok' || server.latencyStatus === 'failed' ? server.latencyStatus : 'unchecked',
+    latency: typeof server.latency === 'number' ? server.latency : null
+  };
+}
+
+function stripSensitiveServerRuntimeList(value: VpnServer[]): VpnServer[] {
+  return value.map(stripSensitiveServerRuntime);
+}
+
+
 const tauriWindow = typeof window !== 'undefined'
   ? (window as Window & { __TAURI_INTERNALS__?: unknown; __TAURI__?: unknown })
   : undefined;
@@ -132,7 +208,10 @@ const STORAGE_COMMAND_TIMEOUTS_MS: Record<string, number> = {
   clear_client_state_value: 7000,
   save_access_key_secure: 12000,
   load_access_key_secure: 9000,
-  clear_access_key_secure: 9000
+  clear_access_key_secure: 9000,
+  save_sensitive_client_state_value: 12000,
+  load_sensitive_client_state_value: 9000,
+  clear_sensitive_client_state_value: 9000
 };
 
 function storageTimeoutMessage(command: string, timeoutMs: number) {
@@ -192,6 +271,52 @@ async function loadNativeClientStateValue<T>(key: string): Promise<T | null> {
     return JSON.parse(rawValue) as T;
   } catch {
     return null;
+  }
+}
+
+async function saveNativeSensitiveClientStateValue(key: string, value: unknown): Promise<boolean> {
+  if (!canUseTauriSecureStorage) {
+    return false;
+  }
+
+  try {
+    await invokeTauri('save_sensitive_client_state_value', {
+      key,
+      value: JSON.stringify(value)
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function loadNativeSensitiveClientStateValue<T>(key: string): Promise<T | null> {
+  if (!canUseTauriSecureStorage) {
+    return null;
+  }
+
+  try {
+    const rawValue = await invokeTauri<string | null>('load_sensitive_client_state_value', { key });
+    if (!rawValue) {
+      return null;
+    }
+
+    return JSON.parse(rawValue) as T;
+  } catch {
+    return null;
+  }
+}
+
+async function clearNativeSensitiveClientStateValue(key: string): Promise<boolean> {
+  if (!canUseTauriSecureStorage) {
+    return false;
+  }
+
+  try {
+    await invokeTauri('clear_sensitive_client_state_value', { key });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -530,4 +655,81 @@ export function saveSelectedServerId(value: string) {
 export async function loadSelectedServerIdBackup() {
   const value = await loadNativeClientStateValue<unknown>(NATIVE_SELECTED_SERVER_KEY);
   return typeof value === 'string' ? value.trim() : null;
+}
+
+
+export function loadLastKnownServers() {
+  if (typeof window === 'undefined') {
+    return [] as VpnServer[];
+  }
+
+  try {
+    const rawValue = window.localStorage.getItem(LAST_KNOWN_SERVERS_STORAGE);
+    const normalized = rawValue ? normalizeStoredServers(JSON.parse(rawValue) as unknown) : [] as VpnServer[];
+    const safeServers = stripSensitiveServerRuntimeList(normalized);
+
+    // Миграция старого plaintext-кэша: если в localStorage когда-либо попал
+    // runtimeTemplate/rawUri, сразу перезаписываем этот ключ безопасной версией.
+    if (normalized.some((server) => server.runtimeTemplate || server.rawUri)) {
+      void saveNativeSensitiveClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, normalized);
+      safeLocalStorageSet(LAST_KNOWN_SERVERS_STORAGE, JSON.stringify(safeServers));
+    }
+
+    return safeServers;
+  } catch {
+    return [] as VpnServer[];
+  }
+}
+
+export function saveLastKnownServers(value: VpnServer[]) {
+  const normalized = normalizeStoredServers(value);
+  if (!normalized.length) {
+    return;
+  }
+
+  const safeServers = stripSensitiveServerRuntimeList(normalized);
+
+  // Открытый localStorage/client-state хранит только UI-метаданные серверов.
+  // Полный runtimeTemplate/rawUri нужен для подключения и сохраняется только
+  // в защищённом native DPAPI-кэше через save_sensitive_client_state_value.
+  safeLocalStorageSet(LAST_KNOWN_SERVERS_STORAGE, JSON.stringify(safeServers));
+  void saveNativeClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, safeServers);
+  void saveNativeSensitiveClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, normalized);
+}
+
+export async function loadLastKnownServersBackup() {
+  const secureValue = await loadNativeSensitiveClientStateValue<unknown>(NATIVE_LAST_KNOWN_SERVERS_KEY);
+  const secureNormalized = normalizeStoredServers(secureValue);
+  if (secureNormalized.length) {
+    return secureNormalized;
+  }
+
+  const value = await loadNativeClientStateValue<unknown>(NATIVE_LAST_KNOWN_SERVERS_KEY);
+  const nativeNormalized = normalizeStoredServers(value);
+  if (!nativeNormalized.length) {
+    return null;
+  }
+
+  const nativeSafeServers = stripSensitiveServerRuntimeList(nativeNormalized);
+  if (nativeNormalized.some((server) => server.runtimeTemplate || server.rawUri)) {
+    // Миграция старого native plaintext client-state: полный кэш сразу переносим
+    // в DPAPI, а обычный client-state перезаписываем безопасной UI-версией.
+    void saveNativeSensitiveClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, nativeNormalized);
+    void saveNativeClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, nativeSafeServers);
+    return nativeNormalized;
+  }
+
+  return nativeSafeServers.length ? nativeSafeServers : null;
+}
+
+export async function clearLastKnownServers() {
+  safeLocalStorageRemove(LAST_KNOWN_SERVERS_STORAGE);
+  if (canUseTauriSecureStorage) {
+    try {
+      await invokeTauri('clear_client_state_value', { key: NATIVE_LAST_KNOWN_SERVERS_KEY });
+    } catch {
+      // Best effort cleanup only.
+    }
+    await clearNativeSensitiveClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY);
+  }
 }

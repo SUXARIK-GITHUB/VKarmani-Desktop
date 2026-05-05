@@ -1,5 +1,10 @@
 use super::*;
 
+pub(crate) fn is_allowed_vkarmani_remote_host(host: &str) -> bool {
+    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    normalized == "vkarmani.com" || normalized.ends_with(".vkarmani.com")
+}
+
 pub(crate) fn validate_remote_fetch_url(raw_url: &str) -> Result<reqwest::Url, String> {
     let parsed = reqwest::Url::parse(raw_url)
         .map_err(|_| "Некорректный URL для удалённого запроса.".to_string())?;
@@ -20,6 +25,10 @@ pub(crate) fn validate_remote_fetch_url(raw_url: &str) -> Result<reqwest::Url, S
 
     if is_forbidden_remote_host_label(&host) {
         return Err("Локальные hostnames запрещены для удалённого fetch.".into());
+    }
+
+    if !is_allowed_vkarmani_remote_host(&host) {
+        return Err("Удалённый fetch разрешён только для доменов VKarmani (*.vkarmani.com).".into());
     }
 
     if let Ok(ip) = host.parse::<IpAddr>() {

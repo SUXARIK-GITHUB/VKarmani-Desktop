@@ -11,9 +11,9 @@ describe('Remnawave Xray JSON profile parser', () => {
     const candidates = __remnawaveTest.buildXrayJsonUrlCandidates('https://sub.vkarmani.com/1NJDc37GHnsdRnvX', '1NJDc37GHnsdRnvX');
 
     expect(candidates).toEqual([
-      'https://sub.vkarmani.com/1NJDc37GHnsdRnvX/json',
       'https://sub.vkarmani.com/api/sub/1NJDc37GHnsdRnvX/json',
-      'https://sub.vkarmani.com/api/subscriptions/by-short-uuid/1NJDc37GHnsdRnvX/json'
+      'https://sub.vkarmani.com/api/subscriptions/by-short-uuid/1NJDc37GHnsdRnvX/json',
+      'https://sub.vkarmani.com/1NJDc37GHnsdRnvX/json'
     ]);
     expect(candidates.every((url) => url.endsWith('/json'))).toBe(true);
   });
@@ -66,6 +66,38 @@ describe('Remnawave Xray JSON profile parser', () => {
     expect(__remnawaveTest.parseXrayJsonSubscriptionToServers('not a json document')).toHaveLength(0);
   });
 
+  it('does not collapse a top-level Xray JSON profile with multiple proxy outbounds to one server', () => {
+    const payload = {
+      remarks: 'VKarmani Xray JSON full profile',
+      outbounds: [
+        {
+          tag: 'RU Moscow',
+          protocol: 'vless',
+          settings: {
+            vnext: [{ address: 'ru.example.com', port: 443, users: [{ id: uuid, encryption: 'none' }] }]
+          },
+          streamSettings: { network: 'tcp', security: 'tls', tlsSettings: { serverName: 'ru.example.com' } }
+        },
+        {
+          tag: 'NL Amsterdam',
+          protocol: 'vless',
+          settings: {
+            vnext: [{ address: 'nl.example.com', port: 443, users: [{ id: uuid, encryption: 'none' }] }]
+          },
+          streamSettings: { network: 'tcp', security: 'tls', tlsSettings: { serverName: 'nl.example.com' } }
+        },
+        { tag: 'direct', protocol: 'freedom' },
+        { tag: 'block', protocol: 'blackhole' }
+      ]
+    };
+
+    const servers = __remnawaveTest.parseXrayJsonSubscriptionToServers(JSON.stringify(payload));
+
+    expect(servers).toHaveLength(2);
+    expect(servers.map((server) => server.host)).toEqual(['ru.example.com', 'nl.example.com']);
+    expect(servers.map((server) => server.rawLabel)).toEqual(['RU Moscow', 'NL Amsterdam']);
+  });
+
   it('keeps top-level Xray JSON config remarks instead of showing generic proxy labels', () => {
     const payload = {
       remarks: 'Single Xray JSON Node',
@@ -87,6 +119,36 @@ describe('Remnawave Xray JSON profile parser', () => {
     expect(server?.rawLabel).toBe('Single Xray JSON Node');
     expect(server?.host).toBe('single-xray.example.com');
     expect(server?.runtimeTemplate?.protocol).toBe('vless');
+  });
+
+
+  it('keeps full Xray JSON config on single cascade profiles so native can preserve routing rules', () => {
+    const payload = {
+      remarks: 'Cascade With Rules',
+      dns: { servers: ['https+local://1.1.1.1/dns-query'] },
+      routing: {
+        rules: [
+          { domain: ['domain:example.org'], outboundTag: 'direct', type: 'field' }
+        ]
+      },
+      outbounds: [
+        {
+          tag: 'cascade-proxy',
+          protocol: 'vless',
+          settings: {
+            vnext: [{ address: 'cascade.example.com', port: 443, users: [{ id: uuid, encryption: 'none' }] }]
+          },
+          streamSettings: { network: 'tcp', security: 'tls', tlsSettings: { serverName: 'cascade.example.com' } }
+        },
+        { tag: 'direct', protocol: 'freedom' }
+      ]
+    };
+
+    const [server] = __remnawaveTest.parseXrayJsonSubscriptionToServers(JSON.stringify(payload));
+
+    expect(server?.runtimeTemplate?.primaryOutboundTag).toBe('cascade-proxy');
+    expect(server?.runtimeTemplate?.fullConfig?.routing).toEqual(payload.routing);
+    expect(server?.runtimeTemplate?.fullConfig?.dns).toEqual(payload.dns);
   });
 
   it('uses Remnawave structured display names inside Xray JSON payloads', () => {
@@ -145,6 +207,146 @@ describe('Remnawave Xray JSON profile parser', () => {
 
     expect(servers.map((server) => server.rawLabel)).toEqual(['Poland | No ADS', 'Sweden S1 | All']);
     expect(servers.some((server) => /mallard|badger/i.test(server.rawLabel ?? ''))).toBe(false);
+  });
+
+
+  it('hides raw backend codenames BADGER and MALLARD when user-facing cascade servers exist', () => {
+    const host = (name: string, label: string) => ({
+      protocol: 'vless',
+      host: `${name}.pl.example.com`,
+      port: 443,
+      uuid,
+      security: 'tls',
+      serverDescription: label
+    });
+    const payload = {
+      response: {
+        rawHosts: [
+          host('pl-public', 'Poland | No ADS'),
+          host('pl-badger', 'BADGER'),
+          host('pl-mallard', 'MALLARD'),
+          host('se-public', 'Sweden S1 | All')
+        ]
+      }
+    };
+
+    const servers = __remnawaveTest.parseXrayJsonSubscriptionToServers(JSON.stringify(payload));
+
+    expect(servers.map((server) => server.rawLabel)).toEqual(['Poland | No ADS', 'Sweden S1 | All']);
+    expect(servers.some((server) => /badger|mallard/i.test(server.rawLabel ?? ''))).toBe(false);
+  });
+
+
+  it('hides BADGER and MALLARD composite Xray JSON configs from the user-facing server list', () => {
+    const outbound = (tag: string, host: string) => ({
+      tag,
+      protocol: 'vless',
+      settings: {
+        vnext: [{ address: host, port: 443, users: [{ id: uuid, encryption: 'none' }] }]
+      },
+      streamSettings: { network: 'tcp', security: 'tls', tlsSettings: { serverName: host } }
+    });
+    const singleConfig = (remarks: string, host: string) => ({
+      remarks,
+      outbounds: [outbound('proxy', host), { tag: 'direct', protocol: 'freedom' }]
+    });
+    const payload = [
+      singleConfig('🇵🇱 VKarmani Smart | MSK', 'smart.pl.example.com'),
+      singleConfig('Germany | All', 'de.example.com'),
+      singleConfig('Netherland | All', 'nl.example.com'),
+      singleConfig('France | All', 'fr.example.com'),
+      singleConfig('Sweden | All', 'se.example.com'),
+      singleConfig('United States | All', 'us.example.com'),
+      singleConfig('United Kingdom | All', 'uk.example.com'),
+      singleConfig('BADGER | VLESS | RAW', 'badger.pl.example.com'),
+      singleConfig('MALLARD | VLESS | RAW', 'mallard.pl.example.com')
+    ];
+
+    const servers = __remnawaveTest.parseXrayJsonSubscriptionToServers(JSON.stringify(payload));
+
+    expect(servers).toHaveLength(7);
+    expect(servers.map((server) => server.rawLabel)).toEqual([
+      '🇵🇱 VKarmani Smart | MSK',
+      'Germany | All',
+      'Netherland | All',
+      'France | All',
+      'Sweden | All',
+      'United States | All',
+      'United Kingdom | All'
+    ]);
+    expect(servers.some((server) => /badger|mallard/i.test(`${server.rawLabel ?? ''} ${server.country} ${server.host ?? ''}`))).toBe(false);
+  });
+
+
+  it('prefers a user-facing Smart cascade full config over raw BADGER/MALLARD backend members', () => {
+    const backendHost = (name: string, label: string) => ({
+      protocol: 'vless',
+      host: `${name}.pl.example.com`,
+      port: 443,
+      uuid,
+      security: 'tls',
+      serverDescription: label
+    });
+    const outbound = (tag: string, host: string) => ({
+      tag,
+      protocol: 'vless',
+      settings: {
+        vnext: [{ address: host, port: 443, users: [{ id: uuid, encryption: 'none' }] }]
+      },
+      streamSettings: { network: 'tcp', security: 'tls', tlsSettings: { serverName: host } }
+    });
+    const payload = {
+      response: {
+        rawHosts: [
+          backendHost('badger', 'BADGER'),
+          backendHost('mallard', 'MALLARD')
+        ],
+        config: {
+          remarks: '🇵🇱 VKarmani Smart | MSK',
+          dns: { servers: ['1.1.1.1'] },
+          routing: {
+            domainStrategy: 'AsIs',
+            rules: [
+              { type: 'field', domain: ['domain:vk.com'], outboundTag: 'BADGER' },
+              { type: 'field', ip: ['geoip:private'], outboundTag: 'direct' }
+            ]
+          },
+          outbounds: [
+            outbound('BADGER', 'badger.pl.example.com'),
+            outbound('MALLARD', 'mallard.pl.example.com'),
+            { tag: 'direct', protocol: 'freedom' }
+          ]
+        }
+      }
+    };
+
+    const servers = __remnawaveTest.parseXrayJsonSubscriptionToServers(JSON.stringify(payload));
+
+    expect(servers.map((server) => server.rawLabel)).toEqual(['🇵🇱 VKarmani Smart | MSK']);
+    expect(servers.some((server) => /badger|mallard/i.test(server.rawLabel ?? ''))).toBe(false);
+    expect(servers[0]?.runtimeTemplate?.primaryOutboundTag).toBe('BADGER');
+    expect(servers[0]?.runtimeTemplate?.fullConfig?.routing).toEqual(payload.response.config.routing);
+    expect(servers[0]?.runtimeTemplate?.fullConfig?.dns).toEqual(payload.response.config.dns);
+  });
+
+
+  it('keeps previous full profile when Remnawave temporarily returns only one ready config', () => {
+    const makeServer = (id: string): VpnServer => ({
+      id,
+      country: id,
+      city: 'Node',
+      flag: '🌐',
+      load: 0,
+      protocol: 'Xray',
+      runtimeTemplate: {
+        family: 'xray',
+        protocol: 'vless',
+        outbound: { protocol: 'vless', settings: {} }
+      }
+    });
+
+    expect(__remnawaveTest.shouldKeepPreviousFullProfile([makeServer('a'), makeServer('b')], [makeServer('a')])).toBe(true);
+    expect(__remnawaveTest.shouldKeepPreviousFullProfile([makeServer('a'), makeServer('b')], [makeServer('a'), makeServer('c')])).toBe(false);
   });
 
   it('keeps server ids stable when Xray JSON config order changes', () => {

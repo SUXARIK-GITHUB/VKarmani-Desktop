@@ -53,6 +53,11 @@ export interface XrayRuntimeTemplate {
   transport?: 'raw' | 'ws' | 'grpc' | 'httpupgrade' | 'xhttp' | 'tcp' | 'udp';
   outbound: Record<string, unknown>;
   remarks?: string;
+  // For Remnawave cascade/full Xray JSON objects. The selected outbound is still
+  // used for identity/ping, but native runtime can preserve original routing,
+  // DNS and extra outbounds from the full config when this field exists.
+  fullConfig?: Record<string, unknown>;
+  primaryOutboundTag?: string;
 }
 
 export interface VpnServer {

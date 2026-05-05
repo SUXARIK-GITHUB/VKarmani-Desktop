@@ -284,10 +284,16 @@ if (!fs.existsSync(workflowPath)) {
   } else {
     ok('release workflow verifies xray.exe on Windows before build');
   }
-  if (!/Refresh patched Rust transitive dependencies/.test(workflow) || !/rustls-webpki\s+--precise\s+0\.103\.13/.test(workflow) || !/tar\s+--precise\s+0\.4\.45/.test(workflow)) {
-    fail('release workflow must refresh patched Rust transitive dependencies before cargo audit: rustls-webpki 0.103.13 and tar 0.4.45');
+  const cargoLockPath = path.join(root, 'src-tauri/Cargo.lock');
+  const cargoLock = fs.existsSync(cargoLockPath) ? fs.readFileSync(cargoLockPath, 'utf8') : '';
+  const rustlsWebpkiPinned = /name = "rustls-webpki"\nversion = "0\.103\.13"/.test(cargoLock);
+  const tarPinned = /name = "tar"\nversion = "0\.4\.45"/.test(cargoLock);
+  if (!rustlsWebpkiPinned || !tarPinned) {
+    fail('Cargo.lock must pin patched Rust transitive dependencies before cargo audit: rustls-webpki 0.103.13 and tar 0.4.45');
+  } else if (/cargo\s+update/.test(workflow)) {
+    fail('release workflow must not mutate Cargo.lock with cargo update; patched Rust dependencies must be committed in Cargo.lock');
   } else {
-    ok('release workflow refreshes patched Rust transitive dependencies before audit');
+    ok('Cargo.lock pins patched Rust transitive dependencies and release workflow does not mutate the lockfile');
   }
   if (/cargo\s+audit\s+--deny\s+warnings/.test(workflow)) {
     fail('release workflow must not use cargo audit --deny warnings because Tauri transitive GTK/WebKit warnings block Windows releases');

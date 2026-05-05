@@ -43,6 +43,7 @@ import { buildServerRuntimeFingerprint } from '../utils/serverIdentity';
 const delay = (value: number) => new Promise<void>((resolve) => window.setTimeout(resolve, value));
 const previewDelay = (value: number) => isTauriRuntime ? Promise.resolve() : delay(value);
 const REQUEST_TIMEOUT_MS = 6500;
+const MAX_SUBSCRIPTION_BYTES = 2 * 1024 * 1024;
 const VKARMANI_SUBSCRIPTION_PREFIX = 'https://sub.vkarmani.com/';
 
 function withRequestTimeout<T>(operation: Promise<T>, url: string): Promise<T> {
@@ -457,13 +458,13 @@ function buildXrayJsonUrlCandidates(rawUrl: string, shortUuid?: string) {
     const origin = url.origin;
     const encodedShortUuid = shortUuid ? encodeURIComponent(shortUuid) : '';
 
-    if (!base.endsWith('/json')) {
-      candidates.push(`${base}/json`);
-    }
-
     if (encodedShortUuid) {
       candidates.push(`${origin}/api/sub/${encodedShortUuid}/json`);
       candidates.push(`${origin}/api/subscriptions/by-short-uuid/${encodedShortUuid}/json`);
+    }
+
+    if (!base.endsWith('/json')) {
+      candidates.push(`${base}/json`);
     }
 
     if (base.endsWith('/json')) {
@@ -597,6 +598,57 @@ function xrayJsonProfileHasRemnawaveStructuredLabels(rawText: string) {
   return /resolvedProxyConfigs|rawHosts|clientOverrides|serverDescription|server_description/i.test(text);
 }
 
+
+function extractXrayJsonEndpointError(rawText: string) {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(rawText.slice(0, MAX_SUBSCRIPTION_BYTES));
+  } catch {
+    return null;
+  }
+
+  const message = maybeString(pickValue(payload, [
+    'response.message',
+    'response.error',
+    'response.errorMessage',
+    'response.reason',
+    'message',
+    'error',
+    'errorMessage',
+    'reason'
+  ]));
+  const status = maybeString(pickValue(payload, [
+    'response.status',
+    'response.user.status',
+    'response.subscription.status',
+    'status',
+    'user.status'
+  ]))?.toLowerCase();
+  const deviceLimitReached = maybeBoolean(pickValue(payload, [
+    'response.deviceLimitReached',
+    'response.hwidLimitReached',
+    'response.isDeviceLimitReached',
+    'response.user.deviceLimitReached',
+    'response.user.hwidLimitReached',
+    'deviceLimitReached',
+    'hwidLimitReached',
+    'isDeviceLimitReached'
+  ]));
+  const combined = `${status ?? ''} ${message ?? ''}`.toLowerCase();
+
+  if (deviceLimitReached === true || (/device|hwid|устройств|устройство|девайс/.test(combined) && /limit|лимит|огранич/.test(combined))) {
+    return `Remnawave не отдал Xray JSON профиль из-за лимита устройств/HWID.${message ? ` Сообщение панели: ${message}` : ''}`;
+  }
+
+  if (status && ['disabled', 'blocked', 'expired', 'limited', 'inactive'].some((item) => status.includes(item))) {
+    return `Remnawave вернул статус профиля: ${status}.${message ? ` Сообщение панели: ${message}` : ''}`;
+  }
+
+  return message && /error|ошиб|denied|forbidden|unauthorized|not found|limit|лимит|expired|ист[её]к/i.test(message)
+    ? `Remnawave вернул ошибку вместо Xray JSON профиля: ${message}`
+    : null;
+}
+
 function parsedXrayJsonProfileQuality(result: ParsedXrayJsonProfileResult & { profileName?: string }) {
   const genericPenalty = result.servers.reduce((score, server) => score + (isGenericImportedServerLabel(server.rawLabel || server.country) ? 60 : 0), 0);
   const namedBonus = result.servers.reduce((score, server) => score + (isGenericImportedServerLabel(server.rawLabel || server.country) ? 0 : 12), 0);
@@ -616,6 +668,10 @@ async function fetchXrayJsonSubscriptionCandidate(
   const servers = parseXrayJsonSubscriptionToServers(rawText);
 
   if (!servers.length) {
+    const endpointError = extractXrayJsonEndpointError(rawText);
+    if (endpointError) {
+      throw new Error(endpointError);
+    }
     throw new Error(`Endpoint ответил, но Xray JSON серверы в ответе не распознаны: ${url}`);
   }
 
@@ -635,7 +691,44 @@ function isPreferredUserFacingSubscription(result: ParsedXrayJsonProfileResult &
   return xrayJsonProfileHasRemnawaveStructuredLabels(result.rawText) || /^\s*proxies\s*:/im.test(result.rawText);
 }
 
-async function fetchParsableXrayJsonProfileCandidates(urls: string[]): Promise<ParsedXrayJsonProfileResult> {
+
+function readyServerCount(servers: VpnServer[]) {
+  return servers.filter((server) => Boolean(server.runtimeTemplate)).length;
+}
+
+function shouldKeepPreviousFullProfile(previousServers: VpnServer[], importedServers: VpnServer[]) {
+  const previousReady = readyServerCount(previousServers);
+  const importedReady = readyServerCount(importedServers);
+
+  return previousServers.length > 1
+    && importedServers.length <= 1
+    && previousReady > importedReady;
+}
+
+function preservedProfileMessage(remoteCount: number, restoredCount: number) {
+  return `Remnawave временно вернул неполный Xray JSON профиль (${remoteCount} конфиг). Сохранён последний полный список: ${restoredCount} конфигов.`;
+}
+
+interface XrayJsonFetchOptions {
+  expectedMinimumServers?: number;
+  retrySuspiciousSingle?: boolean;
+}
+
+function isSuspiciousSingleXrayJsonResult(
+  result: (ParsedXrayJsonProfileResult & { score: number; profileName?: string }) | null,
+  expectedMinimumServers = 0
+) {
+  if (!result || result.servers.length !== 1) {
+    return false;
+  }
+
+  return expectedMinimumServers > 1
+    || xrayJsonProfileHasRemnawaveStructuredLabels(result.rawText)
+    || /"rawHosts"\s*:\s*\[/i.test(result.rawText)
+    || /"outbounds"\s*:\s*\[/i.test(result.rawText);
+}
+
+async function collectBestXrayJsonProfileCandidate(urls: string[]) {
   let lastError = 'Не удалось получить Xray JSON subscription.';
   let sawUnrecognizedPayload = false;
   let best: (ParsedXrayJsonProfileResult & { score: number; profileName?: string }) | null = null;
@@ -648,7 +741,7 @@ async function fetchParsableXrayJsonProfileCandidates(urls: string[]): Promise<P
       }
 
       if (isPreferredUserFacingSubscription(item)) {
-        return { servers: item.servers, rawText: item.rawText, url: item.url };
+        return { best: item, lastError, sawUnrecognizedPayload, preferred: true };
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Ошибка сети.';
@@ -657,6 +750,38 @@ async function fetchParsableXrayJsonProfileCandidates(urls: string[]): Promise<P
         sawUnrecognizedPayload = true;
       }
     }
+  }
+
+  return { best, lastError, sawUnrecognizedPayload, preferred: false };
+}
+
+async function fetchParsableXrayJsonProfileCandidates(
+  urls: string[],
+  options: XrayJsonFetchOptions = {}
+): Promise<ParsedXrayJsonProfileResult> {
+  const attempts = options.retrySuspiciousSingle === false ? 1 : 2;
+  let lastError = 'Не удалось получить Xray JSON subscription.';
+  let sawUnrecognizedPayload = false;
+  let best: (ParsedXrayJsonProfileResult & { score: number; profileName?: string }) | null = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const result = await collectBestXrayJsonProfileCandidate(urls);
+    lastError = result.lastError;
+    sawUnrecognizedPayload = sawUnrecognizedPayload || result.sawUnrecognizedPayload;
+
+    if (result.best && (!best || result.best.score > best.score)) {
+      best = result.best;
+    }
+
+    if (result.preferred && result.best) {
+      return { servers: result.best.servers, rawText: result.best.rawText, url: result.best.url };
+    }
+
+    if (!isSuspiciousSingleXrayJsonResult(result.best, options.expectedMinimumServers) || attempt === attempts) {
+      break;
+    }
+
+    await delay(750);
   }
 
   if (best) {
@@ -857,6 +982,24 @@ export class RemnawaveClient {
     return this.cachedSession;
   }
 
+  hydrateCachedServers(servers: VpnServer[]) {
+    const readyServers = servers.filter((server) => Boolean(server.runtimeTemplate));
+    if (!readyServers.length) {
+      return;
+    }
+
+    this.cachedServers = readyServers;
+    this.profileSyncInfo = {
+      ...this.profileSyncInfo,
+      status: 'ready',
+      source: 'public-api',
+      sourceLabel: 'Последний рабочий Xray JSON профиль',
+      configCount: readyServers.length,
+      readyCount: readyServers.length,
+      message: `Загружен последний рабочий список серверов: ${readyServers.length}.`
+    };
+  }
+
   async authorizeByAccessKey(accessKey: string, allowDemoFallback = allowDemoFallbackByEnv): Promise<RemnawaveSession> {
     const key = resolveAccessKey(accessKey);
     const provisionalSession = makeProvisionalSession(accessKey, key);
@@ -878,23 +1021,31 @@ export class RemnawaveClient {
 
     // Для ключей VKarmani основной полезный результат — рабочий Xray JSON профиль со списком серверов.
     try {
-      const xrayJsonResult = await fetchParsableXrayJsonProfileCandidates(xrayJsonCandidates);
+      const xrayJsonResult = await fetchParsableXrayJsonProfileCandidates(xrayJsonCandidates, {
+        expectedMinimumServers: this.cachedServers.length
+      });
       const importedServers = xrayJsonResult.servers;
+      const previousServers = [...this.cachedServers];
+      const keepPreviousProfile = shouldKeepPreviousFullProfile(previousServers, importedServers);
+      const activeServers = keepPreviousProfile ? previousServers : importedServers;
+      const readyCount = readyServerCount(activeServers);
 
       this.cachedSession = provisionalSession;
       this.cachedDevices = [buildLocalDeviceRecord()];
-      this.cachedServers = importedServers;
+      this.cachedServers = activeServers;
       this.profileSyncInfo = {
         status: 'ready',
         source: xrayJsonResult.url.includes('/api/sub/') ? 'public-api' : 'panel-api',
         sourceLabel: xrayJsonResult.url.includes('/api/sub/') ? 'Публичная Xray JSON подписка' : 'Panel API',
-        configCount: importedServers.length,
-        readyCount: importedServers.filter((item) => item.runtimeTemplate).length,
+        configCount: activeServers.length,
+        readyCount,
         lastSyncAt: new Date().toLocaleString('ru-RU'),
         rawUrl: xrayJsonResult.url,
         updatedAt: new Date().toISOString(),
         accessKeyKind: key.kind,
-        message: `Ключ принят. Импортировано ${importedServers.length} серверов из Xray JSON подписки Remnawave.`
+        message: keepPreviousProfile
+          ? preservedProfileMessage(importedServers.length, previousServers.length)
+          : `Ключ принят. Импортировано ${importedServers.length} серверов из Xray JSON подписки Remnawave.`
       };
       return provisionalSession;
     } catch (error) {
@@ -942,23 +1093,30 @@ export class RemnawaveClient {
     }
 
     try {
-      const xrayJsonResult = await fetchParsableXrayJsonProfileCandidates(candidates);
+      const xrayJsonResult = await fetchParsableXrayJsonProfileCandidates(candidates, {
+        expectedMinimumServers: previousServers.length
+      });
       const importedServers = xrayJsonResult.servers;
+      const keepPreviousProfile = shouldKeepPreviousFullProfile(previousServers, importedServers);
+      const activeServers = keepPreviousProfile ? previousServers : importedServers;
 
-      this.cachedServers = importedServers;
-      const readyCount = importedServers.filter((item) => item.runtimeTemplate).length;
+      this.cachedServers = activeServers;
+      const readyCount = readyServerCount(activeServers);
       this.profileSyncInfo = {
         status: 'ready',
         source: xrayJsonResult.url.includes('/api/sub/') ? 'public-api' : 'panel-api',
         sourceLabel: xrayJsonResult.url.includes('/api/sub/') ? 'Публичная Xray JSON подписка' : 'Panel API',
-        configCount: importedServers.length,
+        configCount: activeServers.length,
+        readyCount,
         lastSyncAt: new Date().toLocaleString('ru-RU'),
         rawUrl: xrayJsonResult.url,
-        message: `Импортировано ${importedServers.length} Xray JSON конфигов из Remnawave. Готово к подключению: ${readyCount}.`,
+        message: keepPreviousProfile
+          ? preservedProfileMessage(importedServers.length, previousServers.length)
+          : `Импортировано ${importedServers.length} Xray JSON конфигов из Remnawave. Готово к подключению: ${readyCount}.`,
         accessKeyKind: key.kind
       };
 
-      await cacheNativeProfileSync(importedServers.length, this.profileSyncInfo.sourceLabel);
+      await cacheNativeProfileSync(activeServers.length, this.profileSyncInfo.sourceLabel);
       return {
         servers: this.cachedServers,
         profile: this.profileSyncInfo
@@ -1296,6 +1454,8 @@ export const __remnawaveTest = {
   buildXrayJsonUrlCandidates,
   buildXrayJsonProfileCandidates,
   parsedXrayJsonProfileQuality,
+  shouldKeepPreviousFullProfile,
+  fetchParsableXrayJsonProfileCandidates,
   parseXrayJsonSubscriptionToServers,
   XRAY_JSON_SUBSCRIPTION_PROFILE
 };

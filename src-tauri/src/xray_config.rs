@@ -36,14 +36,11 @@ pub(crate) fn tune_outbound_for_performance(outbound: &mut Value) {
 
     if let Some(sockopt_map) = sockopt.as_object_mut() {
         // Keep-alive helps detect dead TCP sessions faster and avoids hanging
-        // reconnects. TCP Fast Open is best-effort in Xray/Windows: unsupported
-        // systems ignore it without blocking startup.
+        // reconnects. Do not force TCP Fast Open: on some Windows/network-driver
+        // combinations it can make reconnects less predictable.
         sockopt_map
             .entry("tcpKeepAliveInterval".to_string())
             .or_insert_with(|| json!(30));
-        sockopt_map
-            .entry("tcpFastOpen".to_string())
-            .or_insert_with(|| json!(true));
     }
 
     // XHTTP/HTTPUpgrade/WS/GRPC already multiplex at their transport layer or
@@ -218,6 +215,182 @@ fn routing_exclusion_inbound_tags(network_mode: &str) -> Vec<&'static str> {
     } else {
         vec!["socks-in", "http-in"]
     }
+}
+
+
+fn value_string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+}
+
+fn outbound_tag(value: &Value) -> Option<String> {
+    value_string_field(value, "tag")
+}
+
+fn is_supported_proxy_protocol(protocol: &str) -> bool {
+    matches!(
+        protocol.to_ascii_lowercase().as_str(),
+        "vless" | "vmess" | "trojan" | "shadowsocks" | "hysteria" | "hysteria2"
+    )
+}
+
+fn apply_send_through_to_proxy_outbounds(outbounds: &mut [Value], send_through_ip: Option<&str>) {
+    let Some(ip) = send_through_ip else {
+        return;
+    };
+
+    for outbound in outbounds {
+        let protocol = outbound
+            .get("protocol")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !is_supported_proxy_protocol(protocol) {
+            continue;
+        }
+
+        if let Some(map) = outbound.as_object_mut() {
+            map.insert("sendThrough".to_string(), Value::String(ip.to_string()));
+        }
+    }
+}
+
+fn ensure_outbound_with_tag(outbounds: &mut Vec<Value>, tag: &str, outbound: Value) {
+    let exists = outbounds.iter().any(|item| outbound_tag(item).as_deref() == Some(tag));
+    if !exists {
+        outbounds.push(outbound);
+    }
+}
+
+fn normalized_primary_outbound_tag(template: &RuntimeTemplate, fallback: &Value) -> String {
+    template
+        .primary_outbound_tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| outbound_tag(fallback))
+        .unwrap_or_else(|| "proxy".to_string())
+}
+
+fn rewrite_proxy_outbound_tag_in_rules(rules: &mut [Value], primary_tag: &str) {
+    if primary_tag == "proxy" {
+        return;
+    }
+
+    for rule in rules {
+        if let Some(map) = rule.as_object_mut() {
+            if map.get("outboundTag").and_then(Value::as_str) == Some("proxy") {
+                map.insert("outboundTag".to_string(), Value::String(primary_tag.to_string()));
+            }
+        }
+    }
+}
+
+fn merge_full_config_routing(
+    existing_routing: Option<Value>,
+    mut safety_rules: Vec<Value>,
+    domain_strategy: &str,
+    primary_tag: &str,
+) -> Value {
+    rewrite_proxy_outbound_tag_in_rules(&mut safety_rules, primary_tag);
+
+    let mut routing = existing_routing
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+
+    if let Some(map) = routing.as_object_mut() {
+        map.entry("domainStrategy".to_string())
+            .or_insert_with(|| Value::String(domain_strategy.to_string()));
+
+        let existing_rules = map
+            .remove("rules")
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
+
+        let mut merged_rules = Vec::with_capacity(safety_rules.len() + existing_rules.len() + 1);
+        merged_rules.extend(safety_rules);
+        merged_rules.extend(existing_rules);
+
+        if merged_rules.iter().all(|rule| rule.get("outboundTag").and_then(Value::as_str) != Some(primary_tag)) {
+            merged_rules.push(json!({
+                "inboundTag": ["socks-in", "http-in", "tun-in"],
+                "outboundTag": primary_tag,
+                "type": "field",
+                "ruleTag": "vkarmani-full-config-fallback"
+            }));
+        }
+
+        map.insert("rules".to_string(), Value::Array(merged_rules));
+    }
+
+    routing
+}
+
+fn build_from_full_xray_config_template(
+    template: &RuntimeTemplate,
+    full_config: &Value,
+    inbounds: Vec<Value>,
+    routing_rules: Vec<Value>,
+    direct_outbound: Value,
+    block_outbound: Value,
+    log_object: Value,
+    domain_strategy: &str,
+    dns_query_strategy: &str,
+    send_through_ip: Option<&str>,
+) -> Option<Value> {
+    let mut config = full_config.clone();
+    let config_map = config.as_object_mut()?;
+
+    let mut fallback_outbound = template.outbound.clone();
+    tune_outbound_for_performance(&mut fallback_outbound);
+    let primary_tag = normalized_primary_outbound_tag(template, &fallback_outbound);
+
+    let mut outbounds = config_map
+        .remove("outbounds")
+        .and_then(|value| value.as_array().cloned())
+        .filter(|items| !items.is_empty())
+        .unwrap_or_else(|| vec![fallback_outbound]);
+
+    for outbound in &mut outbounds {
+        tune_outbound_for_performance(outbound);
+    }
+    apply_send_through_to_proxy_outbounds(&mut outbounds, send_through_ip);
+    ensure_outbound_with_tag(&mut outbounds, "direct", direct_outbound);
+    ensure_outbound_with_tag(&mut outbounds, "block", block_outbound);
+
+    let existing_routing = config_map.remove("routing");
+    let routing = merge_full_config_routing(existing_routing, routing_rules, domain_strategy, &primary_tag);
+
+    config_map.insert("log".to_string(), log_object);
+    config_map.insert("inbounds".to_string(), Value::Array(inbounds));
+    config_map.insert("routing".to_string(), routing);
+    config_map.insert("outbounds".to_string(), Value::Array(outbounds));
+    config_map.entry("dns".to_string()).or_insert_with(|| json!({
+        "queryStrategy": dns_query_strategy,
+        "servers": ["1.1.1.1", "8.8.8.8", "localhost"]
+    }));
+    config_map.insert("api".to_string(), json!({ "tag": "api", "services": ["StatsService"] }));
+    config_map.insert("stats".to_string(), json!({}));
+    config_map.insert("policy".to_string(), json!({
+        "levels": {
+            "0": {
+                "statsUserUplink": true,
+                "statsUserDownlink": true
+            }
+        },
+        "system": {
+            "statsInboundUplink": true,
+            "statsInboundDownlink": true,
+            "statsOutboundUplink": true,
+            "statsOutboundDownlink": true
+        }
+    }));
+
+    Some(config)
 }
 
 pub(crate) fn build_xray_config(
@@ -429,6 +602,29 @@ pub(crate) fn build_xray_config(
         "UseIPv4"
     };
 
+    if let Some(full_config) = template.full_config.as_ref().filter(|value| value.is_object()) {
+        let block_outbound = json!({
+            "tag": "block",
+            "protocol": "blackhole",
+            "settings": {}
+        });
+
+        if let Some(full_runtime_config) = build_from_full_xray_config_template(
+            template,
+            full_config,
+            inbounds.clone(),
+            routing_rules.clone(),
+            direct_outbound.clone(),
+            block_outbound,
+            log_object.clone(),
+            domain_strategy,
+            dns_query_strategy,
+            send_through_ip,
+        ) {
+            return (full_runtime_config, plan, routing_exclusion_plan);
+        }
+    }
+
     (
         json!({
             "log": log_object,
@@ -555,8 +751,30 @@ pub(crate) fn run_windows_net_command_str(program: &str, args: &[&str], timeout:
 
 #[cfg(target_os = "windows")]
 pub(crate) fn default_route_snapshot() -> Result<DefaultRouteSnapshot, String> {
-    // Fast path: `route.exe` starts much faster than PowerShell/Get-NetRoute.
-    // Expected active-route columns: destination, mask, gateway, interface, metric.
+    // Для /32 escape routes важно знать не только gateway, но и InterfaceIndex:
+    // на ПК с Hyper-V/WSL/VMware/старым VPN один gateway без `if` может уйти
+    // в другой адаптер. PowerShell даёт точный индекс; route.exe остаётся
+    // fallback-ом, если PowerShell недоступен или заблокирован политиками.
+    let ps_script = r#"
+$ErrorActionPreference = 'Stop'
+$route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
+  Where-Object { $_.State -eq 'Alive' -and $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
+  Sort-Object RouteMetric, InterfaceMetric |
+  Select-Object -First 1 InterfaceIndex, NextHop
+if (-not $route) { throw 'Default route not found' }
+$route | ConvertTo-Json -Compress
+"#;
+
+    if let Ok(raw) = run_powershell(ps_script) {
+        if let Ok(route) = serde_json::from_str::<DefaultRouteSnapshot>(&raw) {
+            if route.interface_index > 0 && !route.next_hop.trim().is_empty() && route.next_hop != "0.0.0.0" {
+                return Ok(route);
+            }
+        }
+    }
+
+    // Fallback: `route.exe` быстрее, но не даёт InterfaceIndex в стабильном виде.
+    // Возвращаем index=0, а вызывающие route_add передадут `if` только если он известен.
     let raw = run_windows_net_command_str(
         "route",
         &["print", "-4", "0.0.0.0"],
@@ -707,8 +925,8 @@ pub(crate) fn configure_tun_routes_fast(interface_name: &str, server_ip: Option<
         }
 
         route_delete(ip, "255.255.255.255", None, None);
-        if let Err(error) = route_add(ip, "255.255.255.255", &default_route.next_hop, 1, None) {
-            return Err(format!("Не удалось добавить /32 route до VPN-сервера через исходный gateway: {error}"));
+        if let Err(error) = route_add(ip, "255.255.255.255", &default_route.next_hop, 1, Some(default_route.interface_index)) {
+            return Err(format!("Не удалось добавить /32 route до VPN-сервера через исходный gateway/interface: {error}"));
         }
     }
 
