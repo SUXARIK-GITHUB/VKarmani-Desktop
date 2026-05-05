@@ -20,4 +20,4 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 tauri = { version = "2.10.3", features = ["tray-icon"] }
 tauri-plugin-updater = "2.10.0"
 tauri-plugin-single-instance = "2.0.0"
-windows-sys = { version = "0.59", features = ["Win32_Networking_WinInet", "Win32_Security_Cryptography", "Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinInet", "Win32_Security_Cryptography", "Win32_System_Memory"] }
