@@ -717,12 +717,25 @@ pub(crate) fn extract_outbound_address_and_port(template: &RuntimeTemplate) -> (
     (None, default_port)
 }
 
-pub(crate) fn resolve_ipv4_address(host: &str, port: u16) -> Option<String> {
-    resolve_socket_addresses(host, port)
-        .ok()
-        .and_then(|items| items.into_iter().find(|addr| addr.ip().is_ipv4()))
-        .map(|addr| addr.ip().to_string())
+pub(crate) fn resolve_ipv4_addresses(host: &str, port: u16) -> Vec<String> {
+    let mut addresses = Vec::new();
+
+    if let Ok(items) = resolve_socket_addresses(host, port) {
+        for addr in items {
+            if !addr.ip().is_ipv4() {
+                continue;
+            }
+
+            let ip = addr.ip().to_string();
+            if !addresses.iter().any(|item| item == &ip) {
+                addresses.push(ip);
+            }
+        }
+    }
+
+    addresses
 }
+
 
 pub(crate) fn detect_primary_ipv4_address() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -904,18 +917,17 @@ pub(crate) fn route_add(destination: &str, mask: &str, gateway: &str, metric: u3
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn configure_tun_routes_fast(interface_name: &str, server_ip: Option<&str>) -> Result<(), String> {
+pub(crate) fn configure_tun_routes_fast(interface_name: &str, server_ips: &[String]) -> Result<(), String> {
     // Snapshot the real default route before adding split-default TUN routes.
     // Taking it afterwards can capture the just-created TUN route on some Windows setups
     // and break the /32 escape route to the VPN server.
     let default_route_before_tun = default_route_snapshot().ok();
     let tun_index = wait_for_tun_interface(interface_name)?;
 
-    // Critical for soft server switching: protect the VPN server endpoint before
-    // split-default routes are added. Otherwise Windows can briefly route the new
-    // Xray outbound into the just-created TUN interface, which causes reconnect loops
-    // and high xray.exe CPU on some machines.
-    if let Some(ip) = server_ip.filter(|value| !value.trim().is_empty()) {
+    // Critical for soft server switching: protect every resolved VPN server endpoint
+    // before split-default routes are added. CDN/DNS can return several A records;
+    // protecting only the first one may still route Xray's outbound back into TUN.
+    if server_ips.iter().any(|value| !value.trim().is_empty()) {
         let default_route = default_route_before_tun.as_ref().ok_or_else(|| {
             "Не удалось снять default route до добавления TUN routes; fallback PowerShell будет использован для безопасной настройки server /32 route.".to_string()
         })?;
@@ -924,9 +936,11 @@ pub(crate) fn configure_tun_routes_fast(interface_name: &str, server_ip: Option<
             return Err("Default route не содержит gateway для server /32 route; fallback PowerShell будет использован.".to_string());
         }
 
-        route_delete(ip, "255.255.255.255", None, None);
-        if let Err(error) = route_add(ip, "255.255.255.255", &default_route.next_hop, 1, Some(default_route.interface_index)) {
-            return Err(format!("Не удалось добавить /32 route до VPN-сервера через исходный gateway/interface: {error}"));
+        for ip in server_ips.iter().map(String::as_str).filter(|value| !value.trim().is_empty()) {
+            route_delete(ip, "255.255.255.255", None, None);
+            if let Err(error) = route_add(ip, "255.255.255.255", &default_route.next_hop, 1, Some(default_route.interface_index)) {
+                return Err(format!("Не удалось добавить /32 route до VPN-сервера {ip} через исходный gateway/interface: {error}"));
+            }
         }
     }
 
@@ -936,12 +950,12 @@ pub(crate) fn configure_tun_routes_fast(interface_name: &str, server_ip: Option<
     // Split-default routing keeps the original default route alive, but sends public
     // IPv4 traffic through Wintun. `0.0.0.0` is the on-link gateway for the TUN interface.
     if let Err(error) = route_add("0.0.0.0", "128.0.0.0", "0.0.0.0", 6, Some(tun_index)) {
-        let _ = cleanup_tun_routes(interface_name, server_ip);
+        let _ = cleanup_tun_routes(interface_name, server_ips);
         return Err(error);
     }
 
     if let Err(error) = route_add("128.0.0.0", "128.0.0.0", "0.0.0.0", 6, Some(tun_index)) {
-        let _ = cleanup_tun_routes(interface_name, server_ip);
+        let _ = cleanup_tun_routes(interface_name, server_ips);
         return Err(error);
     }
 
@@ -949,11 +963,14 @@ pub(crate) fn configure_tun_routes_fast(interface_name: &str, server_ip: Option<
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn configure_tun_routes_powershell(interface_name: &str, server_ip: Option<&str>) -> Result<(), String> {
+pub(crate) fn configure_tun_routes_powershell(interface_name: &str, server_ips: &[String]) -> Result<(), String> {
     let script = r#"
 $ErrorActionPreference = 'Stop'
-$route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.State -eq 'Alive' } | Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1 InterfaceAlias, InterfaceIndex, NextHop
-if (-not $route) { throw 'Default route not found' }
+$route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
+  Where-Object { $_.State -eq 'Alive' -and $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
+  Sort-Object RouteMetric, InterfaceMetric |
+  Select-Object -First 1 InterfaceAlias, InterfaceIndex, NextHop
+if (-not $route) { throw 'Default route with gateway not found' }
 $route | ConvertTo-Json -Compress
 "#;
 
@@ -981,20 +998,20 @@ if ($adapter) {{ 'ready' }}
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    let server_route = if let Some(ip) = server_ip.filter(|value| !value.trim().is_empty()) {
-        if default_route.next_hop.trim().is_empty() || default_route.next_hop == "0.0.0.0" {
-            String::new()
-        } else {
+    let server_route = server_ips
+        .iter()
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|ip| {
             format!(
                 "Remove-NetRoute -DestinationPrefix '{ip}/32' -Confirm:$false -ErrorAction SilentlyContinue | Out-Null\nNew-NetRoute -DestinationPrefix '{ip}/32' -InterfaceIndex {} -NextHop '{}' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null",
                 default_route.interface_index,
                 ps_quote(&default_route.next_hop),
                 ip = ps_quote(ip)
             )
-        }
-    } else {
-        String::new()
-    };
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let script = format!(
         r#"
@@ -1015,11 +1032,11 @@ New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias $tun -NextHop '0.0
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn configure_tun_routes(interface_name: &str, server_ip: Option<&str>) -> Result<(), String> {
-    match configure_tun_routes_fast(interface_name, server_ip) {
+pub(crate) fn configure_tun_routes(interface_name: &str, server_ips: &[String]) -> Result<(), String> {
+    match configure_tun_routes_fast(interface_name, server_ips) {
         Ok(()) => Ok(()),
         Err(fast_error) => {
-            let fallback = configure_tun_routes_powershell(interface_name, server_ip);
+            let fallback = configure_tun_routes_powershell(interface_name, server_ips);
             if fallback.is_ok() {
                 Ok(())
             } else {
@@ -1034,7 +1051,7 @@ pub(crate) fn configure_tun_routes(interface_name: &str, server_ip: Option<&str>
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn configure_tun_routes(_interface_name: &str, _server_ip: Option<&str>) -> Result<(), String> {
+pub(crate) fn configure_tun_routes(_interface_name: &str, _server_ips: &[String]) -> Result<(), String> {
     Err("TUN маршруты сейчас реализованы только для Windows сборки VKarmani.".into())
 }
 
@@ -1084,7 +1101,7 @@ Remove-NetRoute -AddressFamily IPv6 -DestinationPrefix '8000::/1' -InterfaceAlia
 pub(crate) fn cleanup_tun_ipv6_routes(_interface_name: &str) {}
 
 #[cfg(target_os = "windows")]
-pub(crate) fn cleanup_tun_routes(interface_name: &str, server_ip: Option<&str>) -> Result<(), String> {
+pub(crate) fn cleanup_tun_routes(interface_name: &str, server_ips: &[String]) -> Result<(), String> {
     cleanup_tun_ipv6_routes(interface_name);
 
     if let Ok(tun_index) = find_tun_interface_index(interface_name) {
@@ -1092,19 +1109,23 @@ pub(crate) fn cleanup_tun_routes(interface_name: &str, server_ip: Option<&str>) 
         route_delete("128.0.0.0", "128.0.0.0", Some("0.0.0.0"), Some(tun_index));
     }
 
-    if let Some(ip) = server_ip.filter(|value| !value.trim().is_empty()) {
+    for ip in server_ips.iter().map(String::as_str).filter(|value| !value.trim().is_empty()) {
         route_delete(ip, "255.255.255.255", None, None);
     }
 
     // Best-effort fallback for older Windows builds / localized route output.
-    let server_cleanup = if let Some(ip) = server_ip.filter(|value| !value.trim().is_empty()) {
-        format!(
-            "Remove-NetRoute -DestinationPrefix '{}/32' -Confirm:$false -ErrorAction SilentlyContinue | Out-Null",
-            ps_quote(ip)
-        )
-    } else {
-        String::new()
-    };
+    let server_cleanup = server_ips
+        .iter()
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|ip| {
+            format!(
+                "Remove-NetRoute -DestinationPrefix '{}/32' -Confirm:$false -ErrorAction SilentlyContinue | Out-Null",
+                ps_quote(ip)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let script = format!(
         r#"
@@ -1123,6 +1144,6 @@ Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias $tun -Confirm:$
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn cleanup_tun_routes(_interface_name: &str, _server_ip: Option<&str>) -> Result<(), String> {
+pub(crate) fn cleanup_tun_routes(_interface_name: &str, _server_ips: &[String]) -> Result<(), String> {
     Ok(())
 }

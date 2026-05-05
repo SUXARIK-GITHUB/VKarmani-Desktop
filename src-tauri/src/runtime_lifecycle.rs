@@ -112,7 +112,7 @@ pub(crate) fn stop_starting_runtime(app: &AppHandle, state: &tauri::State<AppSta
     if starting.network_mode == "tun" {
         let _ = cleanup_tun_routes(
             starting.tun_interface_name.as_deref().unwrap_or(TUN_INTERFACE_NAME),
-            starting.tun_server_ip.as_deref(),
+            &starting.tun_server_ips,
         );
     }
 
@@ -160,7 +160,7 @@ pub(crate) fn stop_existing_runtime(app: &AppHandle, state: &tauri::State<AppSta
         if runtime.network_mode == "tun" {
             let _ = cleanup_tun_routes(
                 runtime.tun_interface_name.as_deref().unwrap_or(TUN_INTERFACE_NAME),
-                runtime.tun_server_ip.as_deref(),
+                &runtime.tun_server_ips,
             );
         }
 
@@ -267,7 +267,7 @@ pub(crate) fn stop_runtime_orphans_for_app(app: &AppHandle, state: &tauri::State
     }
 
     let _ = cleanup_runtime_config_files(app);
-    let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, None);
+    let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, &[]);
 
     if let Ok(mut guard) = state.connected.lock() {
         *guard = false;
@@ -286,7 +286,7 @@ pub(crate) fn cleanup_application(app: &AppHandle, reason: &str) {
     let _ = stop_managed_or_starting_runtime(app, &state, true, reason);
     stop_runtime_orphans_for_app(app, &state, reason);
     let _ = restore_saved_proxy_state(app, &state, reason);
-    let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, None);
+    let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, &[]);
     let _ = cleanup_runtime_config_files(app);
     refresh_tray_menu(app);
 }
@@ -854,7 +854,7 @@ pub(crate) fn sync_runtime_liveness(app: &AppHandle, state: &tauri::State<AppSta
         if runtime.network_mode == "tun" {
             let _ = cleanup_tun_routes(
                 runtime.tun_interface_name.as_deref().unwrap_or(TUN_INTERFACE_NAME),
-                runtime.tun_server_ip.as_deref(),
+                &runtime.tun_server_ips,
             );
         }
         let _ = fs::remove_file(Path::new(&runtime.config_path));

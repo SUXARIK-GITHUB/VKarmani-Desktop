@@ -7,7 +7,7 @@ pub(crate) struct StartingCore {
     pub(crate) log_path: String,
     pub(crate) network_mode: String,
     pub(crate) tun_interface_name: Option<String>,
-    pub(crate) tun_server_ip: Option<String>,
+    pub(crate) tun_server_ips: Vec<String>,
     pub(crate) started_at: String,
 }
 
@@ -21,7 +21,7 @@ pub(crate) struct ManagedCore {
     pub(crate) started_at: String,
     pub(crate) network_mode: String,
     pub(crate) tun_interface_name: Option<String>,
-    pub(crate) tun_server_ip: Option<String>,
+    pub(crate) tun_server_ips: Vec<String>,
 }
 
 #[derive(Default)]

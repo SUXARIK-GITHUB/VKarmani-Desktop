@@ -827,7 +827,11 @@ pub(crate) fn push_unique_process_match(matches: &mut Vec<String>, candidate: St
         return false;
     }
 
-    if matches.iter().any(|item| item.eq_ignore_ascii_case(&candidate)) {
+    // Xray process matching is case-sensitive. Do not deduplicate with
+    // eq_ignore_ascii_case here: Windows can report process names/paths with
+    // different casing than the file picker, and dropping lowercase variants
+    // makes selective TUN silently bypass selected apps.
+    if matches.iter().any(|item| item == &candidate) {
         return false;
     }
 
@@ -845,11 +849,16 @@ pub(crate) fn process_match_candidates(value: &str) -> Vec<String> {
 
     if has_path {
         // Keep the full path for Xray builds that support process path matching.
+        // Xray process matching is case-sensitive, while Windows process/path
+        // casing can vary between selection dialogs and runtime lookup.
         push_unique_process_match(&mut candidates, normalized.clone());
+        push_unique_process_match(&mut candidates, normalized.to_ascii_lowercase());
 
         // Some Windows process APIs return paths with backslashes. Add this variant
         // too so a manually selected C:\\...\\app.exe is not silently missed.
-        push_unique_process_match(&mut candidates, normalized.replace('/', "\\"));
+        let backslash_path = normalized.replace('/', "\\");
+        push_unique_process_match(&mut candidates, backslash_path.clone());
+        push_unique_process_match(&mut candidates, backslash_path.to_ascii_lowercase());
     }
 
     let file_name = normalized
@@ -860,10 +869,13 @@ pub(crate) fn process_match_candidates(value: &str) -> Vec<String> {
 
     if !file_name.is_empty() {
         // Xray process routing on Windows is more reliable by executable name than
-        // by full path. This fixes the case when a user chooses an .exe file but
-        // traffic is not tunneled because the runtime only sees the process name.
+        // by full path. Keep both original and lowercase spelling because Xray
+        // process rules are case-sensitive.
         push_unique_process_match(&mut candidates, file_name.to_string());
         push_unique_process_match(&mut candidates, strip_windows_exe_suffix(file_name));
+        let lower_file_name = file_name.to_ascii_lowercase();
+        push_unique_process_match(&mut candidates, lower_file_name.clone());
+        push_unique_process_match(&mut candidates, strip_windows_exe_suffix(&lower_file_name));
     }
 
     if !has_path {

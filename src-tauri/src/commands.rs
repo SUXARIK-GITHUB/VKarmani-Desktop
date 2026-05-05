@@ -873,6 +873,16 @@ pub(crate) fn validate_xray_config_with_core(core_path: &Path, config_path: &Pat
         .map_err(|error| format!("Xray-core не принял runtime-конфиг. Подключение остановлено до запуска процесса: {error}"))
 }
 
+
+fn remove_startup_runtime_config(app: &AppHandle, config_path: &Path, reason: &str) {
+    if fs::remove_file(config_path).is_ok() {
+        let _ = append_runtime_event(
+            app,
+            &format!("Временный Xray runtime config удалён после ошибки старта ({reason})."),
+        );
+    }
+}
+
 pub(crate) fn request_connect_blocking(
     server_id: String,
     server_label: String,
@@ -961,20 +971,28 @@ pub(crate) fn request_connect_blocking(
     }
     ensure_runtime_ports_available()?;
 
-    // Важно: определяем outbound_ip/sendThrough только после остановки старого runtime.
+    // Важно: определяем outbound IPv4/sendThrough только после остановки старого runtime.
     // Иначе при переключении из активного TUN Windows могла вернуть TUN/виртуальный
     // адрес как основной, новый Xray стартовал с неправильным sendThrough и мог
     // загнать собственный outbound в петлю с высоким CPU.
-    let outbound_ip = outbound_host
+    // DNS-имя VPN-сервера может иметь несколько A-записей; Xray при старте может
+    // выбрать не первый IP, поэтому для TUN защищаем /32 route для всех IPv4.
+    let outbound_ips = outbound_host
         .as_deref()
-        .and_then(|host| resolve_ipv4_address(host, outbound_port));
+        .map(|host| resolve_ipv4_addresses(host, outbound_port))
+        .unwrap_or_default();
+    let outbound_ip_display = if outbound_ips.is_empty() {
+        "—".to_string()
+    } else {
+        outbound_ips.join(",")
+    };
     let send_through_ip = if normalized_network_mode == "tun" {
         detect_primary_ipv4_address()
     } else {
         None
     };
 
-    if normalized_network_mode == "tun" && outbound_ip.is_none() {
+    if normalized_network_mode == "tun" && outbound_ips.is_empty() {
         return Err(format!(
             "TUN режим пока поддерживает только серверы с IPv4 endpoint. Для сервера {} не удалось получить IPv4 адрес. Выберите другой сервер или используйте Proxy режим.",
             outbound_host.as_deref().unwrap_or("—")
@@ -1015,6 +1033,7 @@ pub(crate) fn request_connect_blocking(
 
     validate_xray_config_with_core(&core_path, &config_path).map_err(|error| {
         let _ = append_runtime_event(&app, &error);
+        remove_startup_runtime_config(&app, &config_path, "config_validation_failed");
         error
     })?;
 
@@ -1057,7 +1076,7 @@ pub(crate) fn request_connect_blocking(
         let _ = append_runtime_event(
             &app,
             &format!(
-                "TUN diagnostics: core={} | config={} | runtimeLog={} | geoip.dat={} | geosite.dat={} | wintun.dll={} | outboundHost={} | outboundIp={} | sendThrough={}",
+                "TUN diagnostics: core={} | config={} | runtimeLog={} | geoip.dat={} | geosite.dat={} | wintun.dll={} | outboundHost={} | outboundIPv4={} | sendThrough={}",
                 core_path.display(),
                 config_path.display(),
                 log_path.display(),
@@ -1065,12 +1084,21 @@ pub(crate) fn request_connect_blocking(
                 geosite_status,
                 wintun_status,
                 outbound_host.as_deref().unwrap_or("—"),
-                outbound_ip.as_deref().unwrap_or("—"),
+                outbound_ip_display.as_str(),
                 send_through_ip.as_deref().unwrap_or("—")
+            ),
+        );
+        let _ = append_runtime_event(
+            &app,
+            &format!(
+                "TUN endpoint guard: подготовлены /32 route для {} IPv4 endpoint(s): {}.",
+                outbound_ips.len(),
+                outbound_ip_display.as_str()
             ),
         );
 
         if !wintun_exists {
+            remove_startup_runtime_config(&app, &config_path, "wintun_missing_or_invalid");
             return Err(format!(
                 "TUN режим не может стартовать: рядом с xray.exe отсутствует или повреждён wintun.dll ({wintun_status}). Положите официальный amd64 wintun.dll в {} и повторите подключение.",
                 core_dir
@@ -1123,18 +1151,28 @@ pub(crate) fn request_connect_blocking(
         let _ = append_runtime_event(&app, note);
     }
 
-    let stdout_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|error| format!("Не удалось открыть stdout log: {error}"))?;
-    let stderr_file = stdout_file
-        .try_clone()
-        .map_err(|error| format!("Не удалось дублировать stderr log: {error}"))?;
+    let stdout_file = match OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(file) => file,
+        Err(error) => {
+            remove_startup_runtime_config(&app, &config_path, "stdout_log_open_failed");
+            return Err(format!("Не удалось открыть stdout log: {error}"));
+        }
+    };
+    let stderr_file = match stdout_file.try_clone() {
+        Ok(file) => file,
+        Err(error) => {
+            remove_startup_runtime_config(&app, &config_path, "stderr_log_clone_failed");
+            return Err(format!("Не удалось дублировать stderr log: {error}"));
+        }
+    };
 
-    let core_working_dir = core_path.parent().ok_or_else(|| {
-        "Не удалось определить рабочую папку Xray-core для запуска runtime.".to_string()
-    })?;
+    let core_working_dir = match core_path.parent() {
+        Some(dir) => dir,
+        None => {
+            remove_startup_runtime_config(&app, &config_path, "core_working_dir_missing");
+            return Err("Не удалось определить рабочую папку Xray-core для запуска runtime.".to_string());
+        }
+    };
 
     let mut command = Command::new(&core_path);
     command
@@ -1149,9 +1187,13 @@ pub(crate) fn request_connect_blocking(
         .stderr(Stdio::from(stderr_file));
     hide_child_console(&mut command);
 
-    let mut child = command
-        .spawn()
-        .map_err(|error| format_xray_spawn_error(&error, &core_path))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            remove_startup_runtime_config(&app, &config_path, "xray_spawn_failed");
+            return Err(format_xray_spawn_error(&error, &core_path));
+        }
+    };
     let child_pid = child.id();
     remember_starting_runtime(&state, StartingCore {
         pid: child_pid,
@@ -1164,10 +1206,10 @@ pub(crate) fn request_connect_blocking(
         } else {
             None
         },
-        tun_server_ip: if normalized_network_mode == "tun" {
-            outbound_ip.clone()
+        tun_server_ips: if normalized_network_mode == "tun" {
+            outbound_ips.clone()
         } else {
-            None
+            Vec::new()
         },
         started_at: unix_now_string(),
     });
@@ -1185,18 +1227,20 @@ pub(crate) fn request_connect_blocking(
             &format!("Xray runtime не стал готовым после запуска, выполняю аварийную очистку: {error}"),
         );
         clear_starting_runtime(&state, child_pid);
-        let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref());
+        let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, &outbound_ips);
         let _ = restore_saved_proxy_state(&app, &state, "connect_readiness_failed");
         let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+        remove_startup_runtime_config(&app, &config_path, "runtime_readiness_failed");
         return Err(error);
     }
 
     if normalized_network_mode == "tun" {
-        configure_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref()).map_err(|error| {
+        configure_tun_routes(TUN_INTERFACE_NAME, &outbound_ips).map_err(|error| {
             clear_starting_runtime(&state, child_pid);
-            let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref());
+            let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, &outbound_ips);
             let _ = restore_saved_proxy_state(&app, &state, "tun_routes_failed");
             let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+            remove_startup_runtime_config(&app, &config_path, "tun_routes_failed");
             format!("Не удалось подготовить Windows-маршруты для TUN режима: {error}")
         })?;
         if let Err(error) = apply_tun_ipv6_route_guard(TUN_INTERFACE_NAME) {
@@ -1205,9 +1249,10 @@ pub(crate) fn request_connect_blocking(
                 &format!("TUN IPv6 leak guard не применился, подключение остановлено для защиты от утечек IPv6: {error}"),
             );
             clear_starting_runtime(&state, child_pid);
-            let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref());
+            let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, &outbound_ips);
             let _ = restore_saved_proxy_state(&app, &state, "tun_ipv6_guard_failed");
             let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+            remove_startup_runtime_config(&app, &config_path, "tun_ipv6_guard_failed");
             return Err(format!(
                 "Не удалось включить защиту TUN от IPv6-утечек: {error}. Подключение остановлено, чтобы не пропускать IPv6 мимо VPN."
             ));
@@ -1225,9 +1270,9 @@ pub(crate) fn request_connect_blocking(
         if let Ok(mut exit_guard) = state.last_exit_code.lock() {
             *exit_guard = code;
         }
-        let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, outbound_ip.as_deref());
+        let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, &outbound_ips);
         let _ = restore_saved_proxy_state(&app, &state, "connect_final_check_failed");
-        let _ = fs::remove_file(&config_path);
+        remove_startup_runtime_config(&app, &config_path, "xray_stopped_before_ready_final_check");
         return Err(format!(
             "Xray остановился до завершения подключения. Exit code: {:?}. Подключение не было помечено активным.",
             code
@@ -1261,10 +1306,10 @@ pub(crate) fn request_connect_blocking(
             } else {
                 None
             },
-            tun_server_ip: if normalized_network_mode == "tun" {
-                outbound_ip.clone()
+            tun_server_ips: if normalized_network_mode == "tun" {
+                outbound_ips.clone()
             } else {
-                None
+                Vec::new()
             },
         });
     }
@@ -1611,7 +1656,7 @@ pub(crate) fn repair_runtime_environment_blocking(app: AppHandle) -> Result<Runt
     }
 
     let _ = restore_saved_proxy_state(&app, &state, "manual_runtime_repair");
-    let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, None);
+    let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, &[]);
     let _ = cleanup_runtime_config_files(&app);
     let _ = append_runtime_event(&app, "Выполнено ручное восстановление runtime окружения: proxy/routes/runtime-config cleanup.");
     refresh_tray_menu(&app);
@@ -1820,22 +1865,27 @@ pub(crate) fn run_tcp_ping_samples(addresses: &[std::net::SocketAddr], attempts:
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn active_tun_server_ip_for_ping(app: &AppHandle) -> Option<String> {
+pub(crate) fn active_tun_server_ips_for_ping(app: &AppHandle) -> Vec<String> {
     let state = app.state::<AppState>();
     let connected = state.connected.lock().map(|value| *value).unwrap_or(false);
     if !connected {
-        return None;
+        return Vec::new();
     }
 
-    state.runtime.lock().ok().and_then(|runtime_guard| {
-        runtime_guard.as_ref().and_then(|runtime| {
-            if runtime.network_mode.eq_ignore_ascii_case("tun") {
-                runtime.tun_server_ip.clone()
-            } else {
-                None
-            }
+    state
+        .runtime
+        .lock()
+        .ok()
+        .and_then(|runtime_guard| {
+            runtime_guard.as_ref().and_then(|runtime| {
+                if runtime.network_mode.eq_ignore_ascii_case("tun") {
+                    Some(runtime.tun_server_ips.clone())
+                } else {
+                    None
+                }
+            })
         })
-    })
+        .unwrap_or_default()
 }
 
 #[cfg(target_os = "windows")]
@@ -1882,9 +1932,10 @@ pub(crate) fn add_temporary_direct_routes_for_ping(app: Option<&AppHandle>, addr
         return Vec::new();
     };
 
-    let Some(active_tun_server_ip) = active_tun_server_ip_for_ping(app) else {
+    let active_tun_server_ips = active_tun_server_ips_for_ping(app);
+    if active_tun_server_ips.is_empty() {
         return Vec::new();
-    };
+    }
 
     let default_route = match default_route_snapshot() {
         Ok(route) if !route.next_hop.trim().is_empty() && route.next_hop != "0.0.0.0" => route,
@@ -1898,7 +1949,7 @@ pub(crate) fn add_temporary_direct_routes_for_ping(app: Option<&AppHandle>, addr
             IpAddr::V6(_) => continue,
         };
 
-        if ip == active_tun_server_ip || added_routes.iter().any(|item| item.ip == ip) {
+        if active_tun_server_ips.iter().any(|active_ip| active_ip == &ip) || added_routes.iter().any(|item| item.ip == ip) {
             continue;
         }
 

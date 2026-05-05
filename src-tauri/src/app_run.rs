@@ -118,7 +118,7 @@ pub fn run() {
             let _ = interface_logs_dir(&app.handle());
             let _ = routing_logs_dir(&app.handle());
             let _ = ensure_log_tree(&app.handle());
-            let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, None);
+            let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, &[]);
             let _ = cleanup_runtime_config_files(&app.handle());
             let state = app.state::<AppState>();
             let _ = recover_orphaned_system_proxy(&app.handle(), &state, "startup_recovery");
