@@ -5,13 +5,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remote_url_validation_rejects_private_and_non_https_targets() {
-        assert!(validate_remote_fetch_url("http://1.1.1.1/sub").is_err());
+    fn remote_url_validation_rejects_private_non_https_and_non_vkarmani_targets() {
+        assert!(validate_remote_fetch_url("http://sub.vkarmani.com/sub").is_err());
         assert!(validate_remote_fetch_url("https://127.0.0.1/sub").is_err());
         assert!(validate_remote_fetch_url("https://10.0.0.1/sub").is_err());
         assert!(validate_remote_fetch_url("https://[::1]/sub").is_err());
         assert!(validate_remote_fetch_url("https://localhost/sub").is_err());
-        assert!(validate_remote_fetch_url("https://1.1.1.1/sub").is_ok());
+        assert!(validate_remote_fetch_url("https://1.1.1.1/sub").is_err());
+        assert!(validate_remote_fetch_url("https://example.com/sub").is_err());
+        assert!(is_allowed_vkarmani_remote_host("vkarmani.com"));
+        assert!(is_allowed_vkarmani_remote_host("sub.vkarmani.com"));
+        assert!(is_allowed_vkarmani_remote_host("sub.vkarmani.com."));
+        assert!(!is_allowed_vkarmani_remote_host("evil-vkarmani.com"));
+        assert!(!is_allowed_vkarmani_remote_host("vkarmani.com.evil.example"));
     }
 
     #[test]
