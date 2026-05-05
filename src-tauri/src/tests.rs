@@ -58,6 +58,8 @@ mod tests {
             family: "xray".into(),
             protocol: "vless".into(),
             remarks: None,
+            full_config: None,
+            primary_outbound_tag: None,
             outbound: json!({
                 "settings": {
                     "vnext": [{"address": "example.com", "port": 70000}]
@@ -132,6 +134,8 @@ mod tests {
             family: "xray".into(),
             protocol: "hysteria2".into(),
             remarks: Some("HY2 fixture".into()),
+            full_config: None,
+            primary_outbound_tag: None,
             outbound: json!({
                 "tag": "proxy",
                 "protocol": "hysteria",
