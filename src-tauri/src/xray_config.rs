@@ -265,6 +265,18 @@ fn ensure_outbound_with_tag(outbounds: &mut Vec<Value>, tag: &str, outbound: Val
     }
 }
 
+fn replace_or_insert_outbound_with_tag(outbounds: &mut Vec<Value>, tag: &str, outbound: Value) {
+    if let Some(existing) = outbounds
+        .iter_mut()
+        .find(|item| outbound_tag(item).as_deref() == Some(tag))
+    {
+        *existing = outbound;
+        return;
+    }
+
+    outbounds.push(outbound);
+}
+
 fn normalized_primary_outbound_tag(template: &RuntimeTemplate, fallback: &Value) -> String {
     template
         .primary_outbound_tag
@@ -359,7 +371,15 @@ fn build_from_full_xray_config_template(
         tune_outbound_for_performance(outbound);
     }
     apply_send_through_to_proxy_outbounds(&mut outbounds, send_through_ip);
-    ensure_outbound_with_tag(&mut outbounds, "direct", direct_outbound);
+    if send_through_ip.is_some() {
+        // В full Xray JSON Remnawave может уже быть outbound с tag=direct.
+        // В TUN-режиме такой direct обязан использовать свежий sendThrough
+        // физического IPv4, иначе unselected/public bypass может снова попасть
+        // в split-default TUN route и зациклить xray.exe.
+        replace_or_insert_outbound_with_tag(&mut outbounds, "direct", direct_outbound);
+    } else {
+        ensure_outbound_with_tag(&mut outbounds, "direct", direct_outbound);
+    }
     ensure_outbound_with_tag(&mut outbounds, "block", block_outbound);
 
     let existing_routing = config_map.remove("routing");
@@ -549,10 +569,15 @@ pub(crate) fn build_xray_config(
                 "outboundTag": "proxy",
                 "ruleTag": "tun-selected-processes"
             }));
+            // Жёсткая изоляция TUN: только выбранные процессы идут через VPN.
+            // Остальной публичный tun-in трафик отправляем в direct-bypass, но сам
+            // outbound direct ниже обязательно получает sendThrough физического IPv4.
+            // Это не даёт невыбранным приложениям уйти в VPN и одновременно защищает
+            // xray.exe от route-loop через split-default Wintun route.
             routing_rules.push(json!({
                 "inboundTag": ["tun-in"],
                 "outboundTag": "direct",
-                "ruleTag": "tun-bypass-unselected"
+                "ruleTag": "tun-unselected-public-direct-bypass"
             }));
         } else {
             routing_rules.push(json!({
