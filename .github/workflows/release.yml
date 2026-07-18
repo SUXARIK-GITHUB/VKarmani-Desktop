@@ -73,7 +73,7 @@ jobs:
         run: .\scripts\verify-hysteria2-bundled-xray.ps1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5.0.0
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: '22'
           cache: npm
