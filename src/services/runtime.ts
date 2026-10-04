@@ -1,4 +1,6 @@
 import packageJson from '../../package.json';
+import { getServerPingEndpoint } from '../utils/serverPing';
+export { getServerPingEndpoint } from '../utils/serverPing';
 import { redactSensitiveText } from '../utils/redaction';
 import type {
   ConnectivityProbe,
@@ -223,31 +225,6 @@ export function normalizeNativeError(error: unknown, fallback: string): Error {
   return new Error(message);
 }
 
-function readRuntimeEndpoint(server: VpnServer): { host: string; port: number } | null {
-  const hostFromServer = server.host?.trim();
-  const portFromServer = Number(server.port ?? 0);
-  if (hostFromServer && Number.isFinite(portFromServer) && portFromServer > 0 && portFromServer <= 65535) {
-    return { host: hostFromServer, port: Math.round(portFromServer) };
-  }
-
-  const settings = server.runtimeTemplate?.outbound?.settings as
-    | { vnext?: Array<{ address?: string; port?: number }>; servers?: Array<{ address?: string; port?: number }> }
-    | undefined;
-  const runtimeEndpoint = settings?.vnext?.[0] ?? settings?.servers?.[0];
-  const runtimeHost = runtimeEndpoint?.address?.trim();
-  const runtimePort = Number(runtimeEndpoint?.port ?? 443);
-
-  if (!runtimeHost || !Number.isFinite(runtimePort) || runtimePort <= 0 || runtimePort > 65535) {
-    return null;
-  }
-
-  return { host: runtimeHost, port: Math.round(runtimePort) };
-}
-
-export function getServerPingEndpoint(server: VpnServer): { host: string; port: number } | null {
-  if (server.runtimeTemplate?.profileKind === 'auto') return null;
-  return readRuntimeEndpoint(server);
-}
 
 function extractRuntimeTemplate(server: VpnServer): XrayRuntimeTemplate | null {
   return server.runtimeTemplate ?? null;

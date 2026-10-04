@@ -1,8 +1,10 @@
-import { FolderOpen, Plus, RefreshCw, Trash2, X } from 'lucide-react';
+import { FolderOpen, MonitorCog, Plus, RefreshCw, Trash2, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { tr, type UiLanguage } from '../i18n';
 import type { RoutingPolicy, RunningAppInfo, SplitTunnelEntry, TunnelMode, TunRoutingMode, WindowsServiceInfo } from '../types/vpn';
 import { listNativeWindowsServices } from '../services/runtime';
+import { PolicyChoice } from './PolicyChoice';
+import { policyEntryDisplay } from '../utils/policyDisplay';
 import { activePolicyEntries } from '../utils/appPolicies';
 import '../styles/policies.css';
 
@@ -67,7 +69,7 @@ export function SplitTunnelModal({
     if (!open) return;
     void refreshServices();
     const previous = document.activeElement as HTMLElement | null;
-    const focusable = () => Array.from(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),select:not(:disabled),[tabindex="0"]') ?? []);
+    const focusable = () => Array.from(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),select:not(:disabled),[tabindex="0"]') ?? []).filter(element => element.tabIndex >= 0);
     focusable()[0]?.focus();
     const key = (event: KeyboardEvent) => {
       if (event.key === 'Escape') { event.preventDefault(); closeRef.current(); }
@@ -80,7 +82,8 @@ export function SplitTunnelModal({
     return () => { serviceGeneration.current++; window.removeEventListener('keydown', key, true); previous?.focus(); };
   }, [open, refreshServices]);
   const query = appSearch.trim().toLowerCase();
-  const filteredEntries = entries.filter(entry => `${entry.kind} ${entry.value} ${entry.policy ?? 'VPN'}`.toLowerCase().includes(query));
+  const policyOptions = [{ value: 'VPN' as const, label: tr(language, 'Через VPN', 'Through VPN') }, { value: 'DIRECT' as const, label: tr(language, 'Напрямую', 'Direct') }];
+  const filteredEntries = entries.filter(entry => `${entry.kind} ${entry.value} ${policyOptions.find(option => option.value === (entry.policy ?? 'VPN'))?.label ?? ''}`.toLowerCase().includes(query));
   const filteredServices = services.filter(service => `${service.name} ${service.displayName} ${service.exePath}`.toLowerCase().includes(query));
   const activeCount = useMemo(() => activePolicyEntries(entries, tunRoutingMode).length, [entries, tunRoutingMode]);
   const filteredRunningApps = useMemo(() => {
@@ -132,12 +135,15 @@ export function SplitTunnelModal({
 
         <div className="vk-modal-scroll">
           <p className="split-tunnel-help">
-            {tunRoutingMode === 'selected' ? tr(language, 'Выбранные VPN-программы идут через VPN, DIRECT и остальные — напрямую.', 'Selected VPN applications use the VPN; DIRECT and unselected apps go directly.') : tr(language, 'Все приложения идут через VPN, кроме DIRECT. Сохранённые VPN-правила выбранных приложений сейчас не применяются.', 'All applications use the VPN except DIRECT. Saved selected-application VPN rules are inactive in this mode.')} {' '}{tr(language, 'Путь к exe относится только к этому файлу; имя exe — ко всем процессам с этим именем.', 'An exe path targets that file; an exe name targets every process with that name.')}
+            {tunRoutingMode === 'selected'
+              ? tr(language, 'Через VPN идут выбранные приложения и службы. Остальные подключаются напрямую.', 'Selected applications and services use the VPN. Others connect directly.')
+              : tr(language, 'Приложения используют VPN, кроме правил «Напрямую». Сохранённые правила «Через VPN» используются только в режиме выбранных приложений.', 'Applications use the VPN except Direct rules. Saved Through VPN rules apply only in selected-app mode.')} {' '}
+            {tr(language, 'Полный путь выбирает один файл, а имя .exe — все приложения с таким именем.', 'A full path targets one file; an .exe name targets all applications with that name.')}
           </p>
-          {tunnelMode === 'proxy' && <p className="split-tunnel-help policy-warning">{tr(language, 'Сейчас Proxy: эти process rules работают только в TUN. Программа, вручную использующая SOCKS/HTTP proxy, не получает строгую DIRECT-изоляцию.', 'Proxy mode: these process rules apply only in TUN. An app manually using SOCKS/HTTP proxy has no strict DIRECT isolation.')}</p>}
+          {tunnelMode === 'proxy' && <p className="split-tunnel-help policy-warning">{tr(language, 'Эти правила работают в режиме TUN. В режиме Proxy приложение с собственными настройками прокси может подключаться через него.', 'These rules apply in TUN mode. In Proxy mode, an application with its own proxy settings may still use that proxy.')}</p>}
           <div className="policy-toolbar">
             <label className="split-field"><span>{tr(language, 'Поиск правил, программ и служб', 'Search rules, applications and services')}</span><input value={appSearch} onChange={event => setAppSearch(event.target.value)} placeholder={tr(language, 'Имя или путь…', 'Name or path…')} /></label>
-            <label className="split-field"><span>{tr(language, 'Новое правило', 'New rule')}</span><select value={policy} onChange={event => setPolicy(event.target.value as RoutingPolicy)}><option value="VPN">VPN</option><option value="DIRECT">DIRECT</option></select></label>
+            <div className="split-field"><span>{tr(language, 'Новое правило', 'New rule')}</span><PolicyChoice label={tr(language, 'Новое правило', 'New rule')} value={policy} onChange={setPolicy} options={policyOptions} /></div>
           </div>
 
           <div className="split-tunnel-add-grid">
@@ -186,22 +192,23 @@ export function SplitTunnelModal({
               <strong>{tr(language, `Активные правила: ${activeCount}`, `Active rules: ${activeCount}`)}</strong>
             </div>
             <div className="split-entry-list">
-              {filteredEntries.map((entry) => (
-                <div className={`split-entry ${entry.enabled ? 'enabled' : ''}`} key={entry.id}>
-                  <button type="button" className="split-entry-toggle" onClick={() => onToggleEntry(entry.id)}>
+              {filteredEntries.map((entry) => {
+                const display = policyEntryDisplay(entry, language);
+                return <div className={`split-entry ${entry.enabled ? 'enabled' : ''}`} key={entry.id}>
+                  <button type="button" className="split-entry-toggle" disabled={Boolean(entry.invalidReason)} aria-pressed={entry.enabled} onClick={() => onToggleEntry(entry.id)} aria-label={`${display.name}: ${tr(language, 'включить или выключить', 'enable or disable')}`}>
                     <span>{entry.enabled ? tr(language, 'Вкл', 'On') : tr(language, 'Выкл', 'Off')}</span>
                   </button>
-                  <div>
-                    <strong>{entry.kind === 'app' ? tr(language, 'Приложение', 'Application') : tr(language, 'Служба', 'Service')}</strong>
-                    <small>{entry.value}</small>
-                    {entry.invalidReason && <small className="policy-warning">{tr(language, 'Правило из старых настроек отключено: проверьте тип и exe/имя службы. Исходная запись сохранена.', 'Legacy rule disabled: review target type and exe/service name. Original entry is preserved.')} ({entry.invalidReason})</small>}
-                    <select aria-label={tr(language, `Политика: ${entry.value}`, `Policy: ${entry.value}`)} value={entry.policy ?? 'VPN'} onChange={event => onChangePolicy(entry.id, event.target.value as RoutingPolicy)}><option value="VPN">VPN</option><option value="DIRECT">DIRECT</option></select>
+                  <div className="policy-entry-copy">
+                    <strong><MonitorCog size={16} aria-hidden="true" />{display.name}</strong>
+                    <small>{entry.kind === 'app' ? tr(language, 'Приложение', 'Application') : tr(language, 'Служба Windows', 'Windows service')}{display.detail ? ` · ${display.detail}` : ''}</small>
+                    {entry.invalidReason && <small className="policy-warning">{tr(language, 'Требует настройки. Удалите запись и добавьте приложение или службу заново.', 'Needs setup. Delete this entry and add the application or service again.')}</small>}
                   </div>
-                  <button type="button" className="split-entry-delete" onClick={() => onRemoveEntry(entry.id)} aria-label={tr(language, 'Удалить', 'Delete')}>
+                  <PolicyChoice label={tr(language, `Маршрут: ${display.name}`, `Route: ${display.name}`)} value={entry.policy ?? 'VPN'} options={policyOptions} disabled={Boolean(entry.invalidReason)} onChange={next => onChangePolicy(entry.id, next)} />
+                  <button type="button" className="split-entry-delete" onClick={() => onRemoveEntry(entry.id)} aria-label={tr(language, `Удалить: ${display.name}`, `Delete: ${display.name}`)}>
                     <Trash2 size={18} />
                   </button>
-                </div>
-              ))}
+                </div>;
+              })}
               {!entries.length ? <div className="split-empty">{tr(language, 'Пока нет выбранных приложений или служб.', 'No applications or services selected yet.')}</div> : null}
               {entries.length > 0 && !filteredEntries.length && <div className="split-empty">{tr(language, 'Правила не найдены.', 'No rules found.')}</div>}
             </div>
@@ -244,9 +251,9 @@ export function SplitTunnelModal({
           </section>
           <section className="split-section">
             <div className="split-section-title"><strong>{tr(language, 'Службы Windows', 'Windows services')}</strong><button type="button" className="vk-secondary-action compact" disabled={servicesBusy} onClick={() => void refreshServices()}><RefreshCw size={16} className={servicesBusy ? 'spin-icon' : ''} />{tr(language, 'Обновить', 'Refresh')}</button></div>
-            <p className="split-tunnel-help">{tr(language, 'Поддерживается только выделенный exe. Общий svchost/PID/exe не разделяется по имени службы; такое правило применяться не будет.', 'Only a dedicated exe is supported. A shared svchost/PID/exe cannot be isolated by service name; such a rule is not applied.')}</p>
+            <p className="split-tunnel-help">{tr(language, 'Можно выбрать службу с отдельным приложением. Службы в общем процессе, например svchost.exe, нельзя направить отдельно.', 'Choose a service with a dedicated application. Services sharing a process, such as svchost.exe, cannot be routed separately.')}</p>
             {servicesError && <p role="alert" className="split-empty">{tr(language, 'Список служб недоступен. Повторите загрузку.', 'Service list unavailable. Retry loading.')}</p>}
-            <div className="running-app-list">{filteredServices.slice(0,160).map(service => <button type="button" className="running-app-row" key={service.name} disabled={!service.supported} onClick={() => onAddEntry('service', service.name, policy)}><strong>{service.displayName} · {service.name}</strong><small>{service.supported ? service.exePath : tr(language, 'Общий host или неподдерживаемый target', 'Shared host or unsupported target')}</small></button>)}</div>
+            <div className="running-app-list">{filteredServices.slice(0,160).map(service => <button type="button" className="running-app-row" key={service.name} disabled={!service.supported} onClick={() => onAddEntry('service', service.name, policy)}><strong>{service.displayName} · {service.name}</strong><small>{service.supported ? service.exePath : tr(language, 'Общий процесс или недоступное приложение', 'Shared process or unavailable application')}</small></button>)}</div>
             {!services.length && !servicesError && <div className="split-empty">{servicesBusy ? tr(language, 'Загружаем службы…', 'Loading services…') : tr(language, 'Службы доступны в Windows-клиенте.', 'Services are available in the Windows client.')}</div>}
             {services.length > 0 && !filteredServices.length && <div className="split-empty">{tr(language, 'Службы не найдены.', 'No services found.')}</div>}
           </section>

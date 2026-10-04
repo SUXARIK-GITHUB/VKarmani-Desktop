@@ -1,4 +1,6 @@
 import { CircleAlert, Copy, Download, MonitorCog, RefreshCw, X } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { copyInformation } from '../utils/clipboard';
 import { tr, type UiLanguage } from '../i18n';
 import type { NativeAppInfo, UpdateInfo } from '../types/vpn';
 
@@ -10,6 +12,7 @@ interface AppInfoModalProps {
   onCheckUpdates: () => void;
   onInstallUpdate?: () => void;
   onClose: () => void;
+  onCopyFeedback: (success: boolean) => void;
 }
 
 function valueOrDash(value: string | undefined | null) {
@@ -26,7 +29,14 @@ function InfoRow({ label, value, mono = false }: { label: string; value: string 
   );
 }
 
-export function AppInfoModal({ open, language, info, updateInfo, onCheckUpdates, onInstallUpdate, onClose }: AppInfoModalProps) {
+export function AppInfoModal({ open, language, info, updateInfo, onCheckUpdates, onInstallUpdate, onClose, onCopyFeedback }: AppInfoModalProps) {
+  const [copying, setCopying] = useState(false);
+  const copyBusy = useRef(false);
+  const generation = useRef(0);
+  useEffect(() => {
+    generation.current++; copyBusy.current = false; setCopying(false);
+    return () => { generation.current++; };
+  }, [open]);
   if (!open) {
     return null;
   }
@@ -82,7 +92,11 @@ export function AppInfoModal({ open, language, info, updateInfo, onCheckUpdates,
             <button
               type="button"
               className="vk-copy-info-button"
-              onClick={() => {
+              disabled={copying}
+              onClick={async () => {
+                if (copyBusy.current) return;
+                copyBusy.current = true; setCopying(true);
+                const current = generation.current;
                 const payload = [
                   `VKarmani: ${valueOrDash(info?.appVersion)}`,
                   `Xray: ${valueOrDash(info?.xrayVersion)}`,
@@ -93,7 +107,10 @@ export function AppInfoModal({ open, language, info, updateInfo, onCheckUpdates,
                   `Arch: ${valueOrDash(info?.osArchitecture)}`,
                   `Core: ${valueOrDash(info?.corePath)}`
                 ].join('\n');
-                void navigator.clipboard?.writeText(payload);
+                const success = await copyInformation(payload, navigator.clipboard);
+                if (generation.current === current) {
+                  copyBusy.current = false; setCopying(false); onCopyFeedback(success);
+                }
               }}
             >
               <Copy size={18} />

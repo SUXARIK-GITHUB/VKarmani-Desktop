@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Bell, Download, Globe2, Languages, MonitorCog, Palette, Plus, RefreshCw, Route, Shield, SlidersHorizontal, Split, Star, Trash2, Wifi, Zap } from 'lucide-react';
 import { tr, type UiLanguage } from '../i18n';
+import { PolicyChoice } from './PolicyChoice';
+import { useSettingsNavigation } from '../hooks/useSettingsNavigation';
 import type { AppSettings, RoutingExclusionSettings } from '../types/vpn';
 import { countActiveRoutingExclusions, normalizeRoutingDomainInput, normalizeRoutingIpInput, sanitizeRoutingExclusions } from '../utils/routingExclusions';
 
@@ -16,31 +18,14 @@ interface SettingsTabProps {
 }
 
 type ToggleKey = keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode' | 'ipStack' | 'routingExclusions' | 'tunRoutingMode'>;
-type SectionId = 'general' | 'network' | 'routes' | 'tunnel' | 'split' | 'proxy' | 'startup' | 'notifications' | 'diagnostics';
+const SECTION_IDS = ['general', 'network', 'routes', 'tunnel', 'split', 'proxy', 'startup', 'notifications', 'diagnostics'] as const;
+type SectionId = typeof SECTION_IDS[number];
 
 interface ToggleItem {
   key: ToggleKey;
   title: string;
   description: string;
   icon: typeof Shield;
-}
-
-function scrollToSettingsSection(id: SectionId) {
-  const target = document.getElementById(`settings-${id}`);
-  if (!target) {
-    return;
-  }
-
-  const container = target.closest('.settings-screen-redesign') as HTMLElement | null;
-  if (container) {
-    container.scrollTo({
-      top: Math.max(0, target.offsetTop - container.offsetTop - 12),
-      behavior: 'smooth'
-    });
-    return;
-  }
-
-  target.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 function ToggleRow({ item, enabled, onClick, language }: { item: ToggleItem; enabled: boolean; onClick: () => void; language: UiLanguage }) {
@@ -93,8 +78,7 @@ function SettingsSection({ id, kicker, title, icon: Icon, children }: { id: Sect
 }
 
 export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeChange, onIpStackChange, onTunRoutingModeChange, onLanguageChange, onRoutingExclusionsChange }: SettingsTabProps) {
-  const [activeSection, setActiveSection] = useState<SectionId>('general');
-  const scrollSpyFrameRef = useRef<number | null>(null);
+  const { containerRef, navRef, activeSection, navigate: handleTabClick } = useSettingsNavigation(SECTION_IDS);
   const nextLanguage: UiLanguage = language === 'ru' ? 'en' : 'ru';
   const [routingDomainInput, setRoutingDomainInput] = useState('');
   const [routingIpInput, setRoutingIpInput] = useState('');
@@ -237,60 +221,9 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
     ]
   };
 
-  const handleTabClick = (id: SectionId) => {
-    setActiveSection(id);
-    window.requestAnimationFrame(() => scrollToSettingsSection(id));
-  };
-
-  useEffect(() => {
-    const container = document.querySelector('.settings-screen-redesign') as HTMLElement | null;
-    if (!container) {
-      return;
-    }
-
-    const sectionIds = tabs.map((tab) => tab.id);
-
-    const updateActiveSection = () => {
-      if (scrollSpyFrameRef.current !== null) {
-        window.cancelAnimationFrame(scrollSpyFrameRef.current);
-      }
-
-      scrollSpyFrameRef.current = window.requestAnimationFrame(() => {
-        const scrollMarker = container.scrollTop + 180;
-        let nextActive = sectionIds[0];
-
-        for (const id of sectionIds) {
-          const section = document.getElementById(`settings-${id}`);
-          if (!section) {
-            continue;
-          }
-
-          if (section.offsetTop <= scrollMarker) {
-            nextActive = id;
-          }
-        }
-
-        setActiveSection((current) => (current === nextActive ? current : nextActive));
-        scrollSpyFrameRef.current = null;
-      });
-    };
-
-    updateActiveSection();
-    container.addEventListener('scroll', updateActiveSection, { passive: true });
-    window.addEventListener('resize', updateActiveSection);
-
-    return () => {
-      if (scrollSpyFrameRef.current !== null) {
-        window.cancelAnimationFrame(scrollSpyFrameRef.current);
-        scrollSpyFrameRef.current = null;
-      }
-      container.removeEventListener('scroll', updateActiveSection);
-      window.removeEventListener('resize', updateActiveSection);
-    };
-  }, [language]);
 
   return (
-    <div className="settings-screen-redesign">
+    <div ref={containerRef} className="settings-screen-redesign">
       <section className="settings-hero-line">
         <div>
           <span className="section-kicker">VKarmani</span>
@@ -306,7 +239,7 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
         </div>
       </section>
 
-      <div className="settings-tab-strip" role="tablist" aria-label={tr(language, 'Разделы настроек', 'Settings sections')}>
+      <div ref={navRef} className="settings-tab-strip" role="tablist" aria-label={tr(language, 'Разделы настроек', 'Settings sections')}>
         {tabs.map((tab) => (
           <button
             key={tab.id}
@@ -345,7 +278,7 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
             ))}
             <SimpleToggleRow title={tr(language, 'Сортировать серверы по пингу', 'Sort servers by ping')} description={tr(language, 'Сортирует серверы от меньшей задержки к большей. Если выключено, сохраняется порядок из подписки.', 'Sorts servers from lower to higher latency. When off, subscription order is preserved.')} icon={Wifi} enabled={settings.sortServersByPing} onClick={() => onToggleSetting('sortServersByPing')} language={language} />
           </div>
-          <div className="settings-mode-card-inline">
+          <div className="settings-mode-card-inline settings-ip-stack-card">
             <div>
               <h4>{settings.ipStack === 'ipv6' ? 'IPv6' : 'IPv4'}</h4>
               <p>{settings.ipStack === 'ipv6'
@@ -407,7 +340,7 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
                   <strong>{activeRoutingExclusionCount}</strong>
                   <span>{tr(language, 'активных direct-правил будет применено при следующем подключении или переподключении', 'active direct rules will apply on next connect or reconnect')}</span>
                 </div>
-                <span className={`micro-pill ${activeRoutingExclusionCount ? 'active' : ''}`}>DIRECT</span>
+                <span className={`micro-pill ${activeRoutingExclusionCount ? 'active' : ''}`}>{tr(language, 'Напрямую', 'Direct')}</span>
               </div>
             </div>
 
@@ -488,7 +421,16 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
         </SettingsSection>
 
         <SettingsSection id="split" kicker={tr(language, 'Раздельное туннелирование', 'Split tunneling')} title={tr(language, 'Маршрутизация приложений', 'App routing')} icon={Split}>
-          <label className="split-field"><span>{tr(language, 'Трафик TUN', 'TUN traffic')}</span><select value={settings.tunRoutingMode} onChange={event => onTunRoutingModeChange(event.target.value as AppSettings['tunRoutingMode'])}><option value="all">{tr(language, 'Все приложения', 'All applications')}</option><option value="selected">{tr(language, 'Только выбранные VPN-приложения', 'Selected VPN applications only')}</option><option value="exclude">{tr(language, 'Все, кроме DIRECT', 'All except DIRECT')}</option></select></label>
+          <div className="settings-routing-control">
+            <PolicyChoice label={tr(language, 'Маршрутизация приложений', 'App routing')} value={settings.tunRoutingMode} onChange={onTunRoutingModeChange} options={[
+              { value: 'all', label: tr(language, 'Все приложения', 'All applications') },
+              { value: 'selected', label: tr(language, 'Только выбранные через VPN', 'Selected through VPN') },
+              { value: 'exclude', label: tr(language, 'Все, кроме исключённых', 'All except excluded') }
+            ]} />
+            <p>{settings.tunRoutingMode === 'selected'
+              ? tr(language, 'Через VPN идут только выбранные приложения. Остальные подключаются напрямую.', 'Only selected applications use the VPN. Others connect directly.')
+              : tr(language, 'Приложения используют VPN. Правила «Напрямую» задают исключения.', 'Applications use the VPN. Direct rules specify exceptions.')}</p>
+          </div>
           <div className="settings-note-card">
             <strong>{tr(language, 'Раздельное туннелирование управляется на главном экране TUN-режима', 'Split tunneling is managed from the main TUN-mode screen')}</strong>
             <span>{tr(language, 'Здесь можно быстро переключить режим туннеля. Списки приложений и служб применяются при переподключении.', 'Here you can quickly switch tunnel mode. App and service lists apply on reconnect.')}</span>

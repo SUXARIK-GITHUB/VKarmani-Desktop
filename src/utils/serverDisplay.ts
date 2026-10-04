@@ -1,6 +1,7 @@
 const FLAG_RE = /[\u{1F1E6}-\u{1F1FF}]{2}/u;
 
 const COUNTRY_NAME_TO_CODE: Record<string, string> = {
+  eu: 'EU',
   nl: 'NL',
   netherland: 'NL',
   netherlands: 'NL',

@@ -1,4 +1,5 @@
 import type { ConnectivityProbe, VpnServer } from '../types/vpn';
+import { getServerPingTargets } from './serverPing';
 
 // Four matches the existing helper budget and the native ping admission limit.
 // A connected VPN no longer forces a serial worker: ping never mutates routing.
@@ -10,13 +11,17 @@ export interface PingBatchResult { results: PingResult[]; durationMs: number; su
 
 export async function runPingBatch(targets: VpnServer[], probe: (server: VpnServer) => Promise<ConnectivityProbe>, signal: AbortSignal, progress: (completed: number) => void = () => {}): Promise<PingBatchResult> {
   const started = performance.now();
-  const results: PingResult[] = new Array(targets.length);
-  let cursor = 0, completed = 0;
+  // Flatten into the same shared queue: no per-Auto pool and no nested budget.
+  const groups = targets.map(getServerPingTargets);
+  const jobs = groups.flatMap((members, logical) => members.map(target => ({ target, logical })));
+  const outcomes: PingResult[][] = groups.map(() => []);
+  let cursor = 0, completed = groups.filter(group => !group.length).length;
+  if (completed) progress(completed);
   const worker = async () => {
     while (!signal.aborted && performance.now() - started < PING_BATCH_TIMEOUT_MS) {
       const index = cursor++;
-      if (index >= targets.length) return;
-      const target = targets[index];
+      if (index >= jobs.length) return;
+      const { target, logical } = jobs[index];
       const remaining = PING_BATCH_TIMEOUT_MS - (performance.now() - started);
       const outcome = await new Promise<PingResult>(resolve => {
         let settled = false;
@@ -26,16 +31,25 @@ export async function runPingBatch(targets: VpnServer[], probe: (server: VpnServ
         signal.addEventListener('abort', abort, { once: true });
         if (signal.aborted) { abort(); return; }
         Promise.resolve().then(() => probe(target)).then(value => {
-          const valid = value.success && typeof value.latencyMs === 'number' && Number.isFinite(value.latencyMs) && value.latencyMs > 0;
+          const valid = value?.success === true && typeof value.latencyMs === 'number' && Number.isFinite(value.latencyMs) && value.latencyMs > 0;
           finish({ id: target.id, status: valid ? 'ok' : 'unreachable', probe: value });
         }, error => finish({ id: target.id, status: /timeout|timed out|превысил|не завершилась/i.test(String(error)) ? 'timeout' : 'unreachable' }));
       });
-      results[index] = outcome;
-      progress(++completed);
+      outcomes[logical].push(outcome);
+      if (outcomes[logical].length === groups[logical].length) progress(++completed);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(PING_CONCURRENCY, targets.length) }, worker));
-  for (let i = 0; i < targets.length; i++) results[i] ??= { id: targets[i].id, status: signal.aborted ? 'cancelled' : 'timeout' };
+  await Promise.all(Array.from({ length: Math.min(PING_CONCURRENCY, jobs.length) }, worker));
+  const results: PingResult[] = targets.map((target, logical) => {
+    if (signal.aborted) return { id: target.id, status: 'cancelled' };
+    const values = outcomes[logical];
+    // Preserve ordinary-node failure diagnostics exactly; only Auto aggregates.
+    if (target.runtimeTemplate?.profileKind !== 'auto' && values[0]) return values[0];
+    const best = values.filter(result => result.status === 'ok').reduce<PingResult | undefined>((current, result) =>
+      !current || result.probe!.latencyMs! < current.probe!.latencyMs! ? result : current, undefined);
+    if (best) return { ...best, id: target.id };
+    return { id: target.id, status: values.length < groups[logical].length || values.some(result => result.status === 'timeout') ? 'timeout' : 'unreachable' };
+  });
   return { results, durationMs: performance.now() - started, success: results.filter(r => r.status === 'ok').length, timeout: results.filter(r => r.status === 'timeout').length, unreachable: results.filter(r => r.status === 'unreachable').length, cancelled: results.filter(r => r.status === 'cancelled').length };
 }
 export function applyPingBatch(current: VpnServer[], snapshot: VpnServer[], batch: PingBatchResult): VpnServer[] {

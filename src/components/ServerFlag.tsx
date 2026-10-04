@@ -21,6 +21,10 @@ function cross(fill: string, stroke = 0) {
 }
 
 const FLAGS: Record<string, ReactNode> = {
+  EU: <><rect width="36" height="24" fill="#003399" />{Array.from({ length: 12 }, (_, i) => {
+    const angle = i * Math.PI / 6 - Math.PI / 2;
+    return <path key={i} d="M0 -1.35 L.3 -.42 L1.28 -.42 L.49 .15 L.79 1.08 L0 .5 L-.79 1.08 L-.49 .15 L-1.28 -.42 L-.3 -.42 Z" fill="#FFCC00" transform={`translate(${18 + 7 * Math.cos(angle)} ${12 + 7 * Math.sin(angle)})`} />;
+  })}</>,
   NL: <>{stripe(0, 8, '#AE1C28')}{stripe(8, 8, '#FFFFFF')}{stripe(16, 8, '#21468B')}</>,
   SE: <><rect width="36" height="24" fill="#006AA7" /><rect x="10" y="0" width="5" height="24" fill="#FECC00" /><rect x="0" y="9" width="36" height="5" fill="#FECC00" /></>,
   CH: <><rect width="36" height="24" fill="#DA291C" /><rect x="15" y="5" width="6" height="14" fill="#FFFFFF" /><rect x="10" y="9" width="16" height="6" fill="#FFFFFF" /></>,

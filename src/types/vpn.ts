@@ -69,7 +69,7 @@ export interface XrayRuntimeTemplate {
   outbound: Record<string, unknown>;
   remarks?: string;
   // For Remnawave cascade/full Xray JSON objects. The selected outbound is still
-  // used for identity/ping, but native runtime can preserve original routing,
+  // used for node identity/ping; Auto ping measures its graph members. Native runtime preserves routing,
   // DNS and extra outbounds from the full config when this field exists.
   fullConfig?: Record<string, unknown>;
   primaryOutboundTag?: string;

@@ -149,12 +149,13 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: VKarmani Desktop ${{ github.ref_name }}
           releaseBody: |
-            Автоматическая сборка VKarmani Desktop.
-
-            Для автообновлений в assets должны быть:
-            - latest.json
-            - установщик Windows
-            - .sig подписи updater artifacts
+            - Улучшено управление маршрутизацией приложений.
+            - Правила приложений и служб: «Через VPN» и «Напрямую».
+            - Исправлена навигация по разделам настроек.
+            - Добавлено подтверждение копирования информации.
+            - Улучшено отображение сетевых настроек.
+            - Добавлен флаг EU для серверов Auto.
+            - Исправлено измерение пинга Auto.
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true

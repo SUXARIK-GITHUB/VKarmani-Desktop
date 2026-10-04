@@ -80,7 +80,7 @@ export function usePingManager({
   const getPingableServers = useCallback(() => {
     // Проверяем все серверы с endpoint. Менеджер пинга не выбирает сервер,
     // не переключает VPN и не блокирует reconnect — он только обновляет latency.
-    return serversRef.current.filter((server) => Boolean(getServerPingEndpoint(server)));
+    return serversRef.current.filter((server) => server.runtimeTemplate?.profileKind === 'auto' || Boolean(getServerPingEndpoint(server)));
   }, []);
 
   const cancelPing = useCallback(() => {

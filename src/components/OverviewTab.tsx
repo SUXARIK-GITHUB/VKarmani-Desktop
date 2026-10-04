@@ -174,7 +174,7 @@ export function OverviewTab({
             <strong>{selectedName}</strong>
             <span>{selectedMeta} · {selectedProtocol}</span>
           </div>
-          <div className="vk-hero-latency">
+          <div className="vk-hero-latency" title={selectedServer?.runtimeTemplate?.profileKind === 'auto' ? tr(language, 'Auto: минимальный измеренный пинг доступного участника; не текущий маршрут Xray.', 'Auto: lowest measured reachable member ping; not the current Xray route.') : undefined}>
             <Signal size={26} />
             <strong>{selectedLatency}</strong>
           </div>
@@ -222,7 +222,7 @@ export function OverviewTab({
                     <strong>{getServerPrimaryLabel(server)}</strong>
                     <small>{getProtocolLabel(server)}</small>
                   </span>
-                  <span className="vk-server-quality">
+                  <span className="vk-server-quality" title={server.runtimeTemplate?.profileKind === 'auto' ? tr(language, 'Auto: минимальный измеренный пинг доступного участника; не текущий маршрут Xray.', 'Auto: lowest measured reachable member ping; not the current Xray route.') : undefined}>
                     {active ? <span className="vk-check-badge"><Check size={13} /></span> : null}
                     <Signal size={20} />
                     <strong className={latencyTone(server, serverPingChecking)}>{formatLatency(server, language, serverPingChecking)}</strong>

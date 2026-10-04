@@ -156,7 +156,6 @@ export default function App() {
   const updateInfoRef = useSyncedRef(updateInfo);
   const authorizedAccessKeyRef = useRef('');
   const persistentRestoreStarted = useRef(false);
-  const migrationNoticeShown = useRef(false);
   const hasAutoCheckedUpdates = useRef(false);
 
   const hasTriedFavoriteAutoConnect = useRef(false);
@@ -895,13 +894,6 @@ export default function App() {
     [splitTunnelEntries, settings.tunRoutingMode]
   );
 
-  useEffect(() => {
-    if (!persistentStateReady || migrationNoticeShown.current) return;
-    migrationNoticeShown.current = true;
-    const count = splitTunnelEntries.filter(entry => entry.invalidReason).length;
-    if (count) pushToast(tr(language, `${count} правил TUN из старых настроек отключено. Исходные записи сохранены: проверьте список приложений.`, `${count} legacy TUN rules disabled. Original entries preserved: review the application list.`), 'info');
-  }, [persistentStateReady, splitTunnelEntries, language, pushToast]);
-
   const favoriteServerIdSet = useMemo(() => new Set(favoriteServerIds), [favoriteServerIds]);
   const deferredSearchValue = useDeferredValue(searchValue);
 
@@ -1413,7 +1405,7 @@ export default function App() {
     const selected = current.find(entry => entry.id === entryId);
     if (!selected) return;
     if (current.some(entry => entry.id !== entryId && entry.enabled && selected.enabled && (entry.policy ?? 'VPN') !== policy && rulesOverlap(entry, selected))) {
-      pushToast(tr(language, 'VPN и DIRECT пересекаются для этой программы.', 'VPN and DIRECT overlap for this application.'), 'info');
+      pushToast(tr(language, 'Правила «Через VPN» и «Напрямую» пересекаются для этой программы.', 'Through VPN and Direct rules overlap for this application.'), 'info');
       return;
     }
     const next = current.map(entry => entry.id === entryId ? { ...entry, policy } : entry);
@@ -1423,7 +1415,7 @@ export default function App() {
 
   function handleToggleSplitTunnelEntry(entryId: string) {
     const nextEntry = splitTunnelEntriesRef.current.find((entry: SplitTunnelEntry) => entry.id === entryId) ?? null;
-    if (nextEntry?.invalidReason) { pushToast(tr(language, 'Это правило отключено при миграции. Проверьте запись и добавьте корректный exe или имя службы.', 'This rule was disabled during migration. Review it and add a valid exe or service name.'), 'info'); return; }
+    if (nextEntry?.invalidReason) return;
     if (nextEntry) {
       void writeNativeInterfaceLog(
         nextEntry.enabled ? 'Правило TUN отключено.' : 'Правило TUN включено.',
@@ -3011,6 +3003,7 @@ export default function App() {
         updateInfo={updateInfo}
         onCheckUpdates={() => void handleCheckUpdates()}
         onInstallUpdate={updateInfo.available ? () => void handleInstallUpdate() : undefined}
+        onCopyFeedback={(success) => pushToast(success ? tr(language, 'Информация скопирована', 'Information copied') : tr(language, 'Не удалось скопировать информацию', 'Could not copy information'), success ? 'success' : 'error', { key: 'copy-info', force: true })}
         onClose={() => setIsAppInfoOpen(false)}
       />
       <SplitTunnelModal
