@@ -80,7 +80,9 @@ export function main() {
   const metadata = JSON.parse(run('cargo', ['metadata', ...argumentsBase, '--format-version', '1', '--filter-platform', target]).stdout);
   // cargo metadata includes weak optional dependencies on Cargo 1.94 (quinn).
   // Never use its packages/resolve list alone as the active compilation graph.
-  const tree = run('cargo', ['tree', ...argumentsBase, '--target', target, '--edges', 'normal,build,dev', '--prefix', 'none', '--format', '{p}']).stdout;
+  // rust-toolchain sets CARGO_TERM_COLOR=always on hosted runners. Machine
+  // output must explicitly disable ANSI styling; the strict parser stays intact.
+  const tree = run('cargo', ['tree', '--color', 'never', ...argumentsBase, '--target', target, '--edges', 'normal,build,dev', '--prefix', 'none', '--format', '{p}']).stdout;
   const report = { ...assessWindowsAudit(audit, metadata, tree), features, lockSha256: hash(fs.readFileSync(lock)), audit };
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   if (report.status !== 'PASS') process.exitCode = 1;
