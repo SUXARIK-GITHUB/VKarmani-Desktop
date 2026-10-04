@@ -53,3 +53,17 @@ if (fs.existsSync(cargoLockPath)) {
   fs.writeFileSync(cargoLockPath, cargoLock);
   console.log(`[version] src-tauri/Cargo.lock -> ${version}`);
 }
+
+const coreManifestPath = path.join(root, 'resources/core/windows/core-manifest.json');
+if (fs.existsSync(coreManifestPath)) {
+  const text = fs.readFileSync(coreManifestPath, 'utf8');
+  const manifest = JSON.parse(text.replace(/^\uFEFF/, ''));
+  if (typeof manifest.version !== 'string') throw new Error('Core manifest version is missing');
+  // Preserve resource identities, provenance and the existing manifest layout.
+  const updated = text.replace(/^(\s*"version"\s*:\s*)"[^"]+"/m, `$1"${version}"`);
+  if (JSON.parse(updated.replace(/^\uFEFF/, '')).version !== version) {
+    throw new Error('Core manifest version could not be synchronized');
+  }
+  fs.writeFileSync(coreManifestPath, updated);
+  console.log(`[version] resources/core/windows/core-manifest.json -> ${version}`);
+}

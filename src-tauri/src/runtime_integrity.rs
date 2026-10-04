@@ -159,6 +159,116 @@ mod windows {
             .map_err(|_| "PROVENANCE_SEEK")?;
         Ok(file)
     }
+    static STAGE_ARTIFACT_LOCK: Mutex<()> = Mutex::new(());
+    fn stage_verified_artifact(
+        source: &mut impl Read,
+        destination: &Path,
+        size: u64,
+        hash: &str,
+    ) -> Result<File, String> {
+        // Concurrent version/config/runtime checks share this protected package.
+        // Publish complete bytes and acquire the read-only integrity lease before
+        // another caller can inspect an in-progress copy. Retained leases still
+        // prohibit mutation/deletion; existing bytes are always verified.
+        let _stage = STAGE_ARTIFACT_LOCK
+            .lock()
+            .map_err(|_| "STAGE_ARTIFACT_LOCK_FAILED")?;
+        if !destination.exists() {
+            let mut target = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)
+                .map_err(|_| "STAGE_ARTIFACT_CREATE")?;
+            let write_result = std::io::copy(source, &mut target)
+                .map_err(|_| "STAGE_ARTIFACT_COPY")
+                .and_then(|_| target.sync_all().map_err(|_| "STAGE_ARTIFACT_FLUSH"));
+            drop(target);
+            if let Err(error) = write_result {
+                let _ = fs::remove_file(destination);
+                return Err(error.into());
+            }
+        }
+        verified_file(destination, Some(size), hash)
+    }
+    #[test]
+    fn concurrent_stage_waits_for_complete_verified_artifact() {
+        use std::sync::mpsc;
+        struct PausedSource {
+            data: std::io::Cursor<Vec<u8>>,
+            ready: Option<mpsc::Sender<()>>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Read for PausedSource {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(ready) = self.ready.take() {
+                    ready.send(()).unwrap();
+                    self.release.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+                self.data.read(buffer)
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("vkarmani-stage-race-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("artifact.dat");
+        let data = b"verified complete artifact".to_vec();
+        let hash = sha256_hex_bytes(&data);
+        let size = data.len() as u64;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_path = path.clone();
+        let first_hash = hash.clone();
+        let first_data = data.clone();
+        let first = std::thread::spawn(move || {
+            stage_verified_artifact(
+                &mut PausedSource {
+                    data: std::io::Cursor::new(first_data),
+                    ready: Some(ready_tx),
+                    release: release_rx,
+                },
+                &first_path,
+                size,
+                &first_hash,
+            )
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (result_tx, result_rx) = mpsc::channel();
+        let second_path = path.clone();
+        let second_hash = hash.clone();
+        let second = std::thread::spawn(move || {
+            let result = stage_verified_artifact(
+                &mut std::io::Cursor::new(data),
+                &second_path,
+                size,
+                &second_hash,
+            );
+            result_tx
+                .send(result.as_ref().map(|_| ()).map_err(Clone::clone))
+                .unwrap();
+            result
+        });
+        let early_result = result_rx.recv_timeout(Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        let first_pin = first.join().unwrap().unwrap();
+        let second_result = second.join().unwrap();
+        assert!(
+            matches!(early_result, Err(mpsc::RecvTimeoutError::Timeout)),
+            "reader observed unfinished publication: {early_result:?}"
+        );
+        let second_pin = second_result.unwrap();
+        assert!(OpenOptions::new().write(true).open(&path).is_err());
+        assert!(fs::remove_file(&path).is_err());
+        assert!(stage_verified_artifact(
+            &mut std::io::Cursor::new(b"replacement"),
+            &path,
+            size,
+            &"0".repeat(64),
+        )
+        .is_err());
+        drop((first_pin, second_pin));
+        assert_eq!(fs::read(&path).unwrap(), b"verified complete artifact");
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
     struct Descriptor(PSECURITY_DESCRIPTOR);
     impl Drop for Descriptor {
         fn drop(&mut self) {
@@ -322,22 +432,7 @@ mod windows {
         pinned.push(create_protected_directory(&package)?);
         for (name, size, hash, source) in &mut resources {
             let destination = package.join(*name);
-            if !destination.exists() {
-                let mut target = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&destination)
-                    .map_err(|_| "STAGE_ARTIFACT_CREATE")?;
-                let write_result = std::io::copy(source, &mut target)
-                    .map_err(|_| "STAGE_ARTIFACT_COPY")
-                    .and_then(|_| target.sync_all().map_err(|_| "STAGE_ARTIFACT_FLUSH"));
-                drop(target);
-                if let Err(error) = write_result {
-                    let _ = fs::remove_file(&destination);
-                    return Err(error.into());
-                }
-            }
-            let target = verified_file(&destination, Some(*size), hash)?;
+            let target = stage_verified_artifact(source, &destination, *size, hash)?;
             protected_acl(&target, false)?;
             pinned.push(target);
         }
