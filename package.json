@@ -1,7 +1,7 @@
 {
   "name": "vkarmani-desktop",
   "private": true,
-  "version": "0.13.68",
+  "version": "0.13.70",
   "type": "module",
   "scripts": {
     "dev": "node ./node_modules/vite/bin/vite.js --host 127.0.0.1",
@@ -11,12 +11,13 @@
     "tauri:build": "node ./node_modules/@tauri-apps/cli/tauri.js build",
     "tauri": "node ./node_modules/@tauri-apps/cli/tauri.js",
     "verify:updater": "node scripts/verify-updater-config.mjs",
-    "test:parsers": "node ./node_modules/vitest/vitest.mjs run tests/remnawave.test.ts --pool=threads --poolOptions.threads.singleThread=true",
+    "test:parsers": "node ./node_modules/vitest/vitest.mjs run tests/remnawave.test.ts --pool=threads --maxWorkers=1",
     "release:version": "node scripts/set-version.mjs",
     "prepare:xray:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-xray-windows.ps1 -Force",
     "verify:xray:manifest": "node scripts/verify-core-manifest.mjs",
     "verify:xray:hy2": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-hysteria2-bundled-xray.ps1",
-    "smoke:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-runtime-smoke.ps1 -RequireCleanDisconnect -CheckDnsSnapshot"
+    "smoke:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-runtime-smoke.ps1 -RequireCleanDisconnect -CheckDnsSnapshot",
+    "test": "node ./node_modules/vitest/vitest.mjs run tests --pool=threads --maxWorkers=1"
   },
   "dependencies": {
     "@tauri-apps/api": "2.10.1",
@@ -31,8 +32,8 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "4.3.4",
     "typescript": "5.9.3",
-    "vite": "^5.4.21",
-    "vitest": "2.1.9"
+    "vite": "6.4.3",
+    "vitest": "4.1.11"
   },
   "engines": {
     "node": ">=22 <23",

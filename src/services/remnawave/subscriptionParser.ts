@@ -1,4 +1,6 @@
 import type { VpnServer, XrayRuntimeTemplate } from '../../types/vpn';
+import { canonicalJson, sha256Text } from '../../utils/canonicalJson';
+import { readXrayConfigGraph, validateJsonBounds, XrayConfigError } from './xrayConfig';
 import { inferCountryCode, resolveServerFlag, looksLikeHost } from '../../utils/serverDisplay';
 
 const MAX_SUBSCRIPTION_BYTES = 2 * 1024 * 1024;
@@ -341,37 +343,22 @@ function collectArraysAtPaths(source: unknown, paths: string[]): Array<{ path: s
   return collected;
 }
 
-function collectXrayConfigObjectsByOutbounds(
-  source: unknown,
-  path = 'root',
-  collected: Array<{ path: string; value: Record<string, unknown> }> = [],
-  depth = 0,
-  visited: { count: number } = { count: 0 }
-) {
-  if (!source || depth > MAX_JSON_WALK_DEPTH || visited.count > MAX_JSON_WALK_NODES || collected.length > 64) {
-    return collected;
+function collectXrayConfigObjectsByOutbounds(source: unknown, path = 'root') {
+  const collected: Array<{ path: string; value: Record<string, unknown> }> = [];
+  const stack = [{ value: source, path }];
+  while (stack.length) {
+    const current = stack.pop()!;
+    if (Array.isArray(current.value)) {
+      for (let i = current.value.length - 1; i >= 0; i--) stack.push({ value: current.value[i], path: `${current.path}.${i}` });
+    } else if (isRecord(current.value)) {
+      if (Object.prototype.hasOwnProperty.call(current.value, 'outbounds')) {
+        collected.push({ path: current.path, value: current.value });
+        if (collected.length > MAX_IMPORTED_SERVERS) throw new XrayConfigError('LIMIT', 'configuration count');
+        continue; // Unknown fields inside a config are data, not extra profiles.
+      }
+      for (const [key, value] of Object.entries(current.value).reverse()) stack.push({ value, path: `${current.path}.${key}` });
+    }
   }
-
-  visited.count += 1;
-
-  if (Array.isArray(source)) {
-    source.forEach((item, index) => collectXrayConfigObjectsByOutbounds(item, `${path}.${index}`, collected, depth + 1, visited));
-    return collected;
-  }
-
-  if (!isRecord(source)) {
-    return collected;
-  }
-
-  if (Array.isArray(source.outbounds)) {
-    collected.push({ path, value: source });
-  }
-
-  for (const [key, value] of Object.entries(source)) {
-    collectXrayConfigObjectsByOutbounds(value, `${path}.${key}`, collected, depth + 1, visited);
-    if (collected.length > 64) break;
-  }
-
   return collected;
 }
 
@@ -1112,10 +1099,7 @@ function xrayOutboundToRuntime(outboundValue: unknown, label: string): XrayRunti
     protocol: protocol as XrayRuntimeTemplate['protocol'],
     remarks: label || pickString(outboundValue, ['tag']) || undefined,
     transport: transport as XrayRuntimeTemplate['transport'],
-    outbound: compactObject({
-      ...outboundValue,
-      tag: pickString(outboundValue, ['tag']) || 'proxy'
-    })
+    outbound: JSON.parse(JSON.stringify(outboundValue)) as Record<string, unknown>
   };
 }
 
@@ -1135,6 +1119,9 @@ function parseXrayOutboundArray(outbounds: unknown[], seed: string, parentLabel?
     if (!runtime) continue;
     const server = buildServerFromRuntimeTemplate(runtime, label, `${seed}:outbound:${JSON.stringify(outbound)}`, servers.length);
     if (server) {
+      server.legacyIds = [server.id];
+      server.id = `xray-json-${sha256Text(canonicalJson(outbound))}`;
+      server.rawUri = undefined;
       servers.push(server);
     }
   }
@@ -1176,65 +1163,42 @@ function xrayOutboundDisplayLabel(outbound: unknown) {
   return pickString(outbound, ['remarks', 'remark', 'metadata.remark', 'metadata.remarks', 'metadata.name', 'metadata.label', 'tag']);
 }
 
-function isAggregateXrayCascadeConfig(payload: unknown) {
-  if (!isRecord(payload)) {
-    return false;
-  }
-
-  const rawOutbounds = getPathValue(payload, 'outbounds');
-  const allOutbounds = Array.isArray(rawOutbounds) ? rawOutbounds : [];
-  const outbounds = supportedXrayOutbounds(rawOutbounds);
-  if (outbounds.length < 2) {
-    return false;
-  }
-
-  const parentLabel = pickXrayConnectionLabel(payload, '');
-  if (!isPublicCascadeAggregateLabel(parentLabel)) {
-    return false;
-  }
-
-  const technicalOutbounds = outbounds.filter((outbound) => isKnownTechnicalCascadeBackendLabel(xrayOutboundDisplayLabel(outbound))).length;
-  const hasRoutingOrBalancer = Boolean(
-    getPathValue(payload, 'routing')
-      || getPathValue(payload, 'dns')
-      || getPathValue(payload, 'policy')
-      || allOutbounds.some((outbound) => ['selector', 'urltest', 'loadbalance'].includes(normalizeStructuredProtocol(pickString(outbound, ['protocol']))))
-  );
-
-  // Collapse only real aggregate/cascade profiles. A normal full JSON with
-  // separate user-facing outbounds such as "RU Moscow" + "NL Amsterdam"
-  // must remain split into separate servers.
-  return technicalOutbounds > 0 && (technicalOutbounds === outbounds.length || hasRoutingOrBalancer);
-}
-
 function parseXrayConfigObject(payload: unknown, seed: string, index: number): VpnServer | null {
   if (!isRecord(payload)) {
     return null;
   }
 
   const outbounds = getPathValue(payload, 'outbounds');
-  if (!Array.isArray(outbounds)) {
-    return null;
-  }
-
-  const label = pickXrayConnectionLabel(payload, `Xray JSON ${index + 1}`);
-  for (const outbound of outbounds) {
+  if (outbounds === undefined) return null;
+  const graph = readXrayConfigGraph(payload);
+  const label = pickXrayConnectionLabel(payload, graph.primaryBalancerTag ? 'Auto' : `Xray JSON ${index + 1}`);
+  const representative = graph.primaryBalancerTag
+    ? graph.outbounds.filter((outbound) => graph.memberTags.includes(String(outbound.tag)))
+    : graph.outbounds;
+  for (const outbound of representative) {
     const runtime = xrayOutboundToRuntime(outbound, label);
-    if (!runtime) {
-      continue;
-    }
-
-    const primaryOutboundTag = pickString(outbound, ['tag']) || 'proxy';
+    if (!runtime) continue;
     const runtimeWithFullConfig: XrayRuntimeTemplate = {
       ...runtime,
-      fullConfig: compactObject(payload) as Record<string, unknown>,
-      primaryOutboundTag
+      fullConfig: graph.config,
+      primaryOutboundTag: pickString(outbound, ['tag']) || undefined,
+      profileKind: graph.primaryBalancerTag ? 'auto' : 'configuration',
+      primaryBalancerTag: graph.primaryBalancerTag,
+      memberTags: graph.memberTags
     };
-    const identity = `${seed}:config:${JSON.stringify(outbound)}`;
-    return buildServerFromRuntimeTemplate(runtimeWithFullConfig, label, identity, index);
+    const server = buildServerFromRuntimeTemplate(runtimeWithFullConfig, label, canonicalJson(graph.config), index);
+    if (!server) continue;
+    server.id = `xray-json-${graph.identity}`;
+    server.legacyIds = [stableXrayJsonId(`${seed}:config:${JSON.stringify(outbound)}`)];
+    server.rawUri = undefined; // Config credentials stay in the encrypted runtime template only.
+    if (graph.primaryBalancerTag) {
+      server.tags = ['Live', 'Xray JSON', 'Auto'];
+      server.transportLabel = 'Auto';
+      server.ipPool = undefined;
+    }
+    return server;
   }
-
-  return null;
+  throw new XrayConfigError('UNSUPPORTED', 'configuration has no supported endpoint');
 }
 
 function parseXrayConfigArray(payload: unknown, seed: string): VpnServer[] {
@@ -1290,13 +1254,17 @@ function parseXrayConfigArray(payload: unknown, seed: string): VpnServer[] {
   for (const { path, value } of objects) {
     if (servers.length >= MAX_IMPORTED_SERVERS) break;
 
-    // Если один Xray JSON object содержит несколько user-facing proxy outbounds, это
-    // полный список серверов, а не один сервер. Но Remnawave cascade/full profile
-    // может иметь несколько внутренних raw outbounds BADGER/MALLARD внутри одного
-    // публичного профиля "VKarmani Smart | MSK". Такой профиль нужно оставить
-    // одной карточкой и запускать через fullConfig, иначе внутренние backend-ноды
-    // снова появляются в UI как отдельные серверы.
-    if (countSupportedXrayOutbounds(getPathValue(value, 'outbounds')) > 1 && !isAggregateXrayCascadeConfig(value)) {
+    const outbounds = getPathValue(value, 'outbounds');
+    if (outbounds === undefined) continue;
+    const graph = readXrayConfigGraph(value as Record<string, unknown>);
+    if (countSupportedXrayOutbounds(outbounds) > 1 && !graph.connected) {
+      for (const server of parseXrayOutboundArray(graph.outbounds, `${seed}:${path === 'root' ? 'outbounds' : `${path}.outbounds`}`)) {
+        server.runtimeTemplate!.fullConfig = graph.config;
+        server.runtimeTemplate!.primaryOutboundTag = pickString(server.runtimeTemplate!.outbound, ['tag']) || undefined;
+        server.runtimeTemplate!.profileKind = 'node';
+        server.id = `xray-json-${sha256Text(`${graph.identity}:node:${canonicalJson(server.runtimeTemplate!.outbound)}`)}`;
+        pushServer(server);
+      }
       continue;
     }
 
@@ -1934,8 +1902,9 @@ function parseXrayJsonStringCandidatesFromPayload(payload: unknown, seed: string
 }
 
 function parseXrayJsonOnlyServersFromPayload(payload: unknown, seed: string): VpnServer[] {
+  const configs = parseXrayConfigArray(payload, seed);
+  if (configs.length) return configs;
   const candidates = [
-    { path: 'xray-json.standard-config-array', priority: 1200, servers: parseXrayConfigArray(payload, seed) },
     { path: 'xray-json.remnawave-structured', priority: 950, servers: parseResolvedProxyConfigServersFromPayload(payload, seed) },
     { path: 'xray-json.outbounds', priority: 700, servers: parseXrayJsonServersFromPayload(payload, seed) },
     { path: 'xray-json.embedded-json', priority: 500, servers: parseXrayJsonStringCandidatesFromPayload(payload, seed) }
@@ -1945,24 +1914,19 @@ function parseXrayJsonOnlyServersFromPayload(payload: unknown, seed: string): Vp
 }
 
 export function parseXrayJsonSubscriptionToServers(rawText: string): VpnServer[] {
-  const safeRawText = rawText.length > MAX_SUBSCRIPTION_BYTES
-    ? rawText.slice(0, MAX_SUBSCRIPTION_BYTES)
-    : rawText;
-  const trimmed = stripUtfBom(safeRawText);
-
-  if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) {
-    return [];
+  if (new TextEncoder().encode(rawText).length > MAX_SUBSCRIPTION_BYTES) {
+    throw new XrayConfigError('LIMIT', 'document bytes');
   }
-
-  try {
-    const parsed = JSON.parse(trimmed);
-    const servers = parseXrayJsonOnlyServersFromPayload(parsed, 'xray-json');
-    const visibleServers = filterRemnawaveCascadeBackendMembers(servers);
-    const displayableServers = isTechnicalOnlyCascadeBackendSet(visibleServers) ? [] : visibleServers;
-    return withUniqueSubscriptionIds(
-      displayableServers.slice(0, MAX_IMPORTED_SERVERS)
-    );
-  } catch {
-    return [];
-  }
+  const trimmed = stripUtfBom(rawText);
+  if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) return [];
+  let parsed: unknown;
+  try { parsed = JSON.parse(trimmed); }
+  catch { throw new XrayConfigError('INVALID_JSON', 'document'); }
+  validateJsonBounds(parsed);
+  const servers = parseXrayJsonOnlyServersFromPayload(parsed, 'xray-json');
+  // Legacy structured rawHosts have no reference graph. Full configs are never
+  // hidden by brand names: internal members are determined by their graph.
+  if (servers.some((server) => server.runtimeTemplate?.fullConfig)) return withUniqueSubscriptionIds(servers);
+  const visibleServers = filterRemnawaveCascadeBackendMembers(servers);
+  return withUniqueSubscriptionIds(isTechnicalOnlyCascadeBackendSet(visibleServers) ? [] : visibleServers);
 }

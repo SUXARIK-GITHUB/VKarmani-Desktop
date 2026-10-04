@@ -269,10 +269,10 @@ if (!fs.existsSync(workflowPath)) {
   } else {
     ok('release workflow validates PowerShell script syntax before fetch');
   }
-  if (!/fetch-xray-windows\.ps1/.test(workflow)) {
-    fail('release workflow must run scripts/fetch-xray-windows.ps1 before verify/build so CI bundles an official launch-tested Xray binary');
+  if (/run:\s*.*fetch-xray-windows\.ps1/.test(workflow)) {
+    fail('release workflow must not implicitly replace the reviewed core resource set while fetch integration is blocked');
   } else {
-    ok('release workflow fetches official Xray Windows x64 runtime before build');
+    ok('release workflow bundles reviewed resources without implicit fetching');
   }
   if (!/lfs:\s*true/.test(workflow)) {
     fail('release workflow checkout must set lfs: true so binary assets are real files if the repository uses Git LFS');
@@ -286,10 +286,10 @@ if (!fs.existsSync(workflowPath)) {
   }
   const cargoLockPath = path.join(root, 'src-tauri/Cargo.lock');
   const cargoLock = fs.existsSync(cargoLockPath) ? fs.readFileSync(cargoLockPath, 'utf8') : '';
-  const rustlsWebpkiPinned = /name = "rustls-webpki"\nversion = "0\.103\.13"/.test(cargoLock);
-  const tarPinned = /name = "tar"\nversion = "0\.4\.45"/.test(cargoLock);
+  const rustlsWebpkiPinned = /name = "rustls-webpki"\r?\nversion = "0\.103\.14"/.test(cargoLock);
+  const tarPinned = /name = "tar"\r?\nversion = "0\.4\.45"/.test(cargoLock);
   if (!rustlsWebpkiPinned || !tarPinned) {
-    fail('Cargo.lock must pin patched Rust transitive dependencies before cargo audit: rustls-webpki 0.103.13 and tar 0.4.45');
+    fail('Cargo.lock must retain accepted patched dependencies: rustls-webpki 0.103.14 and tar 0.4.45');
   } else if (/cargo\s+update/.test(workflow)) {
     fail('release workflow must not mutate Cargo.lock with cargo update; patched Rust dependencies must be committed in Cargo.lock');
   } else {
@@ -297,13 +297,13 @@ if (!fs.existsSync(workflowPath)) {
   }
   if (/cargo\s+audit\s+--deny\s+warnings/.test(workflow)) {
     fail('release workflow must not use cargo audit --deny warnings because Tauri transitive GTK/WebKit warnings block Windows releases');
-  } else if (!/cargo\s+audit(\s|$)/.test(workflow)) {
+  } else if (!/cargo\s+audit(\s|$)/.test(workflow) && !/run:\s*node scripts\/verify-cargo-audit-windows\.mjs/.test(workflow)) {
     fail('release workflow must run cargo audit');
   } else {
-    ok('release workflow runs cargo audit without denying transitive warnings');
+    ok('release workflow runs cargo audit directly or through the strict Windows graph gate; warnings remain visible');
   }
-  if (!/tauri-apps\/tauri-action@v0(\.\d+\.\d+)?/.test(workflow)) {
-    fail('release workflow must use available tauri-apps/tauri-action@v0 or @v0.x.x');
+  if (!/tauri-apps\/tauri-action@2d3036b306d86c3198f05a460dcd23cf55ef41b9/.test(workflow)) {
+    fail('release workflow must use the reviewed immutable tauri-action v0.5.23 revision');
   } else {
     ok('release workflow uses tauri-action v0');
   }
@@ -319,9 +319,9 @@ if (!fs.existsSync(workflowPath)) {
   }
 }
 
-if (!process.env.TAURI_SIGNING_PRIVATE_KEY && process.env.GITHUB_ACTIONS) {
+if (!process.env.TAURI_SIGNING_PRIVATE_KEY && process.env.REQUIRE_UPDATER_SIGNING_KEY === 'true') {
   fail('GitHub secret TAURI_SIGNING_PRIVATE_KEY is missing');
-} else if (process.env.GITHUB_ACTIONS) {
+} else if (process.env.REQUIRE_UPDATER_SIGNING_KEY === 'true') {
   ok('TAURI_SIGNING_PRIVATE_KEY is available in GitHub Actions');
 } else {
   console.log('[updater-check] INFO: local run: TAURI_SIGNING_PRIVATE_KEY is not required unless you build release artifacts locally.');

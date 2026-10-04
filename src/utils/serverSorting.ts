@@ -1,4 +1,5 @@
 import type { AppSettings, VpnServer } from '../types/vpn';
+import { migrateServerReferences } from './serverIdentity';
 
 export function isRealityPreferredServer(server: VpnServer) {
   const haystack = [server.protocol, server.transportLabel, ...(server.tags ?? []), server.rawLabel]
@@ -92,7 +93,7 @@ export function rankServersForDisplay(
   favoriteServerIds: string[] = []
 ) {
   const favoriteRank = new Map(
-    favoriteServerIds
+    migrateServerReferences(servers, favoriteServerIds)
       .map((id) => id.trim())
       .filter(Boolean)
       .map((id, index): [string, number] => [id, index])

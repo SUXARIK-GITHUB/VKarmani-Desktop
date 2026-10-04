@@ -1,5 +1,7 @@
+import { normalizeStoredRules } from '../utils/appPolicies';
 import type { AppSettings, SplitTunnelEntry, VpnServer } from '../types/vpn';
 import { defaultRoutingExclusions, sanitizeRoutingExclusions } from '../utils/routingExclusions';
+import { encodeProfileCache, decodeProfileCache } from './profileCache';
 
 const ACCESS_KEY_STORAGE = 'vkarmani.access-key';
 const ACCESS_KEY_FORM_STORAGE = 'vkarmani.form.access-key';
@@ -146,7 +148,7 @@ function normalizeStoredServers(value: unknown): VpnServer[] {
       latency: typeof item.latency === 'number' ? item.latency : null
     });
 
-    if (servers.length >= 300) {
+    if (servers.length >= 1000) {
       break;
     }
   }
@@ -544,22 +546,7 @@ export function loadSplitTunnelEntries() {
       return [] as SplitTunnelEntry[];
     }
 
-    return parsed
-      .filter((entry): entry is SplitTunnelEntry => Boolean(
-        entry
-        && typeof entry === 'object'
-        && 'id' in entry
-        && 'kind' in entry
-        && 'value' in entry
-        && 'enabled' in entry
-      ))
-      .map((entry: SplitTunnelEntry) => ({
-        id: String(entry.id),
-        kind: (entry.kind === 'service' ? 'service' : 'app') as SplitTunnelEntry['kind'],
-        value: String(entry.value ?? '').trim(),
-        enabled: Boolean(entry.enabled)
-      }))
-      .filter((entry) => Boolean(entry.value));
+    return normalizeStoredRules(parsed);
   } catch {
     return [] as SplitTunnelEntry[];
   }
@@ -577,22 +564,7 @@ export async function loadSplitTunnelEntriesBackup() {
     return null;
   }
 
-  return value
-    .filter((entry): entry is SplitTunnelEntry => Boolean(
-      entry
-      && typeof entry === 'object'
-      && 'id' in entry
-      && 'kind' in entry
-      && 'value' in entry
-      && 'enabled' in entry
-    ))
-    .map((entry: SplitTunnelEntry) => ({
-      id: String(entry.id),
-      kind: (entry.kind === 'service' ? 'service' : 'app') as SplitTunnelEntry['kind'],
-      value: String(entry.value ?? '').trim(),
-      enabled: Boolean(entry.enabled)
-    }))
-    .filter((entry) => Boolean(entry.value));
+  return normalizeStoredRules(value);
 }
 
 
@@ -658,6 +630,17 @@ export async function loadSelectedServerIdBackup() {
 }
 
 
+async function saveProtectedProfiles(servers: VpnServer[]) {
+  try {
+    return await saveNativeSensitiveClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, encodeProfileCache(servers));
+  } catch {
+    // Cache/serialization failure is not a subscription rejection. Preserve
+    // the last atomic DPAPI file; do not turn a usable in-memory profile invalid.
+    console.warn('[storage] Protected profile cache was not saved.');
+    return false;
+  }
+}
+
 export function loadLastKnownServers() {
   if (typeof window === 'undefined') {
     return [] as VpnServer[];
@@ -671,7 +654,7 @@ export function loadLastKnownServers() {
     // Миграция старого plaintext-кэша: если в localStorage когда-либо попал
     // runtimeTemplate/rawUri, сразу перезаписываем этот ключ безопасной версией.
     if (normalized.some((server) => server.runtimeTemplate || server.rawUri)) {
-      void saveNativeSensitiveClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, normalized);
+      void saveProtectedProfiles(normalized);
       safeLocalStorageSet(LAST_KNOWN_SERVERS_STORAGE, JSON.stringify(safeServers));
     }
 
@@ -694,12 +677,16 @@ export function saveLastKnownServers(value: VpnServer[]) {
   // в защищённом native DPAPI-кэше через save_sensitive_client_state_value.
   safeLocalStorageSet(LAST_KNOWN_SERVERS_STORAGE, JSON.stringify(safeServers));
   void saveNativeClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, safeServers);
-  void saveNativeSensitiveClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, normalized);
+  void saveProtectedProfiles(normalized);
 }
 
 export async function loadLastKnownServersBackup() {
   const secureValue = await loadNativeSensitiveClientStateValue<unknown>(NATIVE_LAST_KNOWN_SERVERS_KEY);
-  const secureNormalized = normalizeStoredServers(secureValue);
+  let secureNormalized: VpnServer[] = [];
+  if (secureValue) {
+    try { secureNormalized = normalizeStoredServers(decodeProfileCache(secureValue)); }
+    catch { return null; } // Corrupt secure cache never resurrects plaintext runtime.
+  }
   if (secureNormalized.length) {
     return secureNormalized;
   }
@@ -714,7 +701,7 @@ export async function loadLastKnownServersBackup() {
   if (nativeNormalized.some((server) => server.runtimeTemplate || server.rawUri)) {
     // Миграция старого native plaintext client-state: полный кэш сразу переносим
     // в DPAPI, а обычный client-state перезаписываем безопасной UI-версией.
-    void saveNativeSensitiveClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, nativeNormalized);
+    void saveProtectedProfiles(nativeNormalized);
     void saveNativeClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, nativeSafeServers);
     return nativeNormalized;
   }

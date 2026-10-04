@@ -21,7 +21,7 @@ export function runtimeConfirmsTargetServer(
     runtime?.tunnelActive
       && expectedId
       && getRuntimePreparedServerId(runtime) === expectedId
-      && (!expectedFingerprint || !actualFingerprint || actualFingerprint === expectedFingerprint)
+      && (!expectedFingerprint || actualFingerprint === expectedFingerprint)
   );
 }
 
@@ -36,11 +36,17 @@ export function assertNativeRuntimeServerMatches(
   const actualFingerprint = nativeFingerprint.trim();
   const expectedFingerprint = targetFingerprint.trim();
 
-  if (actual && actual !== expected) {
+  if (!actual || actual !== expected) {
     throw new Error(`Native runtime запустился не на выбранном сервере: ожидали ${expected}, получили ${actual}. Подключение остановлено для защиты от ложной галки.`);
   }
 
-  if (actualFingerprint && expectedFingerprint && actualFingerprint !== expectedFingerprint) {
+  if (expectedFingerprint && actualFingerprint !== expectedFingerprint) {
     throw new Error('Native runtime запустился с другим runtime-конфигом выбранного сервера. Подключение остановлено для защиты от случайного узла.');
   }
+}
+export function nativeConnectFailurePreservesRuntime(message: string): boolean {
+  return /(?:SUBSCRIPTION_(?:UNAVAILABLE|REJECTED)|SESSION_CHANGED|OPERATION_CANCELLED|REQUEST_IDENTITY|CONNECT_PREFLIGHT):/.test(message)
+    || message.includes('Подключение заняло больше')
+    || message.includes('UI разблокирован')
+    || message.includes('Runtime уже выполняет другое действие');
 }

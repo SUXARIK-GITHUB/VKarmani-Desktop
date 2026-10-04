@@ -20,3 +20,27 @@ pub(crate) fn hide_child_console(command: &mut Command) {
 
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn hide_child_console(_command: &mut Command) {}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn system_program(name: &str) -> Result<PathBuf, String> {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buffer = [0u16; 32768];
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return Err("SYSTEM_DIRECTORY_UNAVAILABLE".into());
+    }
+    if !matches!(name, "powershell" | "reg" | "ping" | "wmic" | "tasklist") {
+        return Err("SYSTEM_PROGRAM_UNSUPPORTED".into());
+    }
+    let root = PathBuf::from(String::from_utf16_lossy(&buffer[..length]));
+    Ok(match name {
+        "powershell" => root.join("WindowsPowerShell/v1.0/powershell.exe"),
+        "wmic" => root.join("wbem/wmic.exe"),
+        other => root.join(format!("{other}.exe")),
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn system_program(_name: &str) -> Result<PathBuf, String> {
+    Err("WINDOWS_SYSTEM_PROGRAM_REQUIRED".into())
+}

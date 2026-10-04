@@ -10,7 +10,7 @@ export function redactSensitiveText(value: string) {
     .replace(SUBSCRIPTION_URL_RE, 'https://sub.vkarmani.com/[redacted-key]')
     .replace(SECRET_QUERY_RE, '$1[redacted-secret]')
     .replace(UUID_RE, '[redacted-uuid]')
-    .replace(LONG_TOKEN_RE, (token) => `${token.slice(0, 6)}…${token.slice(-4)}`);
+    .replace(LONG_TOKEN_RE, '[redacted-token]');
 }
 
 export function redactUnknown(value: unknown) {

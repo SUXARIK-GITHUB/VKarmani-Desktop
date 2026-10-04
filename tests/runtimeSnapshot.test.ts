@@ -1,0 +1,2 @@
+import{it,expect}from'vitest';import{acceptRuntimeSnapshot}from'../src/utils/runtimeSnapshot';import type{RuntimeStatus}from'../src/types/vpn';
+it('late old snapshot cannot resurrect a disconnected native revision',()=>{const latest={nativeInstanceId:'instanceA',runtimeRevision:3,tunnelActive:false} as RuntimeStatus;expect(acceptRuntimeSnapshot(latest,{...latest,runtimeRevision:2,tunnelActive:true})).toBe(latest);expect(acceptRuntimeSnapshot(latest,{...latest,nativeInstanceId:'instanceB',runtimeRevision:0})).not.toBe(latest);});

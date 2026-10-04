@@ -6,6 +6,7 @@ import type {
   RuntimeStatus,
   TrafficSnapshot,
   RunningAppInfo,
+  WindowsServiceInfo,
   NativeAppInfo,
   SplitTunnelEntry,
   RoutingExclusionSettings,
@@ -15,6 +16,7 @@ import type {
   XrayRuntimeTemplate
 } from '../types/vpn';
 import { buildServerRuntimeFingerprint } from '../utils/serverIdentity';
+import { canonicalJson } from '../utils/canonicalJson';
 
 const tauriWindow = typeof window !== 'undefined'
   ? (window as Window & { __TAURI_INTERNALS__?: unknown; __TAURI__?: unknown })
@@ -67,8 +69,9 @@ function validateWebRemoteFetchUrl(rawUrl: string) {
 export const allowDemoFallbackByEnv = String(envFlag ?? '').trim().toLowerCase() === 'true';
 
 const NATIVE_COMMAND_TIMEOUTS_MS: Record<string, number> = {
-  request_connect: 60000,
+  request_connect: 85000,
   request_disconnect: 22000,
+  rollback_failed_connect: 22000,
   set_system_proxy: 18000,
   public_ip_snapshot: 12000,
   fetch_remote_text: 20000,
@@ -88,7 +91,9 @@ const NATIVE_COMMAND_TIMEOUTS_MS: Record<string, number> = {
   native_app_info: 12000,
   pick_executable_path: 120000,
   list_running_apps: 14000,
-  set_tray_update_state: 3500
+  list_windows_services: 14000,
+  set_tray_update_state: 3500,
+  set_session_authorized: 18000
 };
 
 function commandTimeoutMessage(command: string, timeoutMs: number) {
@@ -240,6 +245,7 @@ function readRuntimeEndpoint(server: VpnServer): { host: string; port: number } 
 }
 
 export function getServerPingEndpoint(server: VpnServer): { host: string; port: number } | null {
+  if (server.runtimeTemplate?.profileKind === 'auto') return null;
   return readRuntimeEndpoint(server);
 }
 
@@ -265,7 +271,7 @@ export async function getNativeRuntimeStatus(): Promise<RuntimeStatus> {
   try {
     return await invokeTauri<RuntimeStatus>('runtime_status');
   } catch (error) {
-    return mockRuntimeStatus(normalizeNativeError(error, 'Не удалось получить статус runtime.').message);
+    throw new Error(normalizeNativeError(error, 'Не удалось получить статус runtime.').message);
   }
 }
 
@@ -291,6 +297,7 @@ export async function requestNativeConnect(
     serverLabel: `${server.country}, ${server.city}`,
     serverFingerprint: buildServerRuntimeFingerprint(server),
     runtimeTemplate,
+    canonicalTemplateJson: canonicalJson(runtimeTemplate),
     networkMode,
     splitTunnelEntries,
     ipStack,
@@ -305,6 +312,10 @@ export async function listNativeRunningApps(): Promise<RunningAppInfo[]> {
   }
 
   return invokeTauri<RunningAppInfo[]>('list_running_apps');
+}
+export async function listNativeWindowsServices(): Promise<WindowsServiceInfo[]> {
+  if (!isTauriRuntime) return [];
+  return invokeTauri<WindowsServiceInfo[]>('list_windows_services');
 }
 
 
@@ -371,7 +382,7 @@ export async function getNativeProxyStatus(): Promise<ProxyStatus> {
   return invokeTauri<ProxyStatus>('proxy_status');
 }
 
-export async function setNativeSystemProxy(enabled: boolean): Promise<ProxyStatus> {
+export async function setNativeSystemProxy(enabled: boolean, expectedConfigPath?: string): Promise<ProxyStatus> {
   if (!isTauriRuntime) {
     return {
       enabled,
@@ -383,13 +394,17 @@ export async function setNativeSystemProxy(enabled: boolean): Promise<ProxyStatu
     };
   }
 
-  return invokeTauri<ProxyStatus>('set_system_proxy', { enabled });
+  return invokeTauri<ProxyStatus>('set_system_proxy', { enabled, expectedConfigPath });
+}
+
+export async function rollbackFailedNativeConnect(expectedConfigPath: string): Promise<RuntimeStatus> {
+  return invokeTauri<RuntimeStatus>('rollback_failed_connect', { expectedConfigPath });
 }
 
 
 
 export async function pingNativeServer(server: VpnServer): Promise<ConnectivityProbe> {
-  const endpoint = readRuntimeEndpoint(server);
+  const endpoint = getServerPingEndpoint(server);
 
   if (!endpoint) {
     throw new Error('У выбранного сервера нет host/port для проверки пинга. Обновите профиль серверов.');

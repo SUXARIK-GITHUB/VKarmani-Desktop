@@ -1,34 +1,16 @@
 import type { VpnServer } from '../types/vpn';
 
-function stableStringify(value: unknown): string {
-  if (value === null || value === undefined) {
-    return 'null';
-  }
+import { canonicalJson, sha256Text } from './canonicalJson';
 
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
-  }
-
-  if (typeof value === 'object') {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
-      .join(',')}}`;
-  }
-
-  return JSON.stringify(value);
+export function resolveServerReference(servers: VpnServer[], id: string): VpnServer | null {
+  const exact = servers.find((server) => server.id === id);
+  if (exact) return exact;
+  const candidates = servers.filter((server) => server.legacyIds?.includes(id));
+  return candidates.length === 1 ? candidates[0] : null;
 }
 
-function fnv1aHex(value: string) {
-  let hash = 0x811c9dc5;
-
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-
-  return (hash >>> 0).toString(16).padStart(8, '0');
+export function migrateServerReferences(servers: VpnServer[], ids: string[]): string[] {
+  return [...new Set(ids.map((id) => resolveServerReference(servers, id)?.id ?? id))];
 }
 
 export function buildServerRuntimeFingerprint(server: VpnServer | null | undefined) {
@@ -36,14 +18,7 @@ export function buildServerRuntimeFingerprint(server: VpnServer | null | undefin
     return '';
   }
 
-  return fnv1aHex(stableStringify({
-    rawUri: server.rawUri?.trim() ?? '',
-    host: server.host ?? '',
-    port: server.port ?? 0,
-    protocol: server.protocol,
-    transportLabel: server.transportLabel ?? '',
-    runtimeTemplate: server.runtimeTemplate ?? null
-  }));
+  return sha256Text(canonicalJson(server.runtimeTemplate ?? null));
 }
 
 export function isVpnServerLike(value: unknown): value is VpnServer {

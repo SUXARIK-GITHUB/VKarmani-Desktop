@@ -7,10 +7,11 @@ export type ProfileSyncState = 'idle' | 'syncing' | 'ready' | 'error';
 export type RuntimeBridge = 'web-preview' | 'tauri';
 export type RemnawaveSource = 'demo' | 'public-api' | 'panel-api';
 export type RuntimeLaunchMode = 'mock' | 'xray-sidecar';
-export type ProxyMethod = 'wininet-registry' | 'mock';
+export type ProxyMethod = 'wininet-registry' | 'wininet-api' | 'mock';
 export type TunnelMode = 'proxy' | 'tun';
 export type IpStack = 'ipv4' | 'ipv6';
 export type SplitTunnelEntryKind = 'app' | 'service';
+export type RoutingPolicy = 'VPN' | 'DIRECT';
 
 export interface RoutingExclusionSettings {
   enabled: boolean;
@@ -45,6 +46,17 @@ export interface SplitTunnelEntry {
   kind: SplitTunnelEntryKind;
   value: string;
   enabled: boolean;
+  policy?: RoutingPolicy;
+}
+
+export interface WindowsServiceInfo {
+  name: string;
+  displayName: string;
+  exePath: string;
+  processId: number;
+  state: string;
+  supported: boolean;
+  reason?: string;
 }
 
 export interface XrayRuntimeTemplate {
@@ -58,10 +70,14 @@ export interface XrayRuntimeTemplate {
   // DNS and extra outbounds from the full config when this field exists.
   fullConfig?: Record<string, unknown>;
   primaryOutboundTag?: string;
+  profileKind?: 'node' | 'configuration' | 'auto';
+  primaryBalancerTag?: string;
+  memberTags?: string[];
 }
 
 export interface VpnServer {
   id: string;
+  legacyIds?: string[];
   country: string;
   city: string;
   countryCode?: string;
@@ -152,6 +168,7 @@ export interface ProfileSyncInfo {
 }
 
 export interface RuntimeStatus {
+  nativeInstanceId?: string;
   bridge: RuntimeBridge;
   coreInstalled: boolean;
   tunnelActive: boolean;
@@ -174,6 +191,19 @@ export interface RuntimeStatus {
   proxyBypass?: string;
   networkMode?: TunnelMode;
   tunInterfaceName?: string;
+  xrayPid?: number;
+  runtimeConfigHash?: string;
+  operation?: { id: number; kind: string; stage: string; startedAt: number; deadlineAt: number; outcome?: string };
+  lastOperation?: RuntimeStatus['operation'];
+  runtimeRevision?: number;
+  routeOwnership?: string;
+  ownedRoutes?: { destination: string; prefix: number; nextHop: string; interfaceIndex: number; interfaceLuid: string; metric: number; protocol: number }[];
+  subscriptionState?: 'unconfirmed' | 'expired' | 'needs-refresh' | 'verified';
+  subscriptionRefreshAfter?: number;
+  reconnectAttempt?: number;
+  proxyOwnership?: string;
+  proxyAutoConfigUrl?: string;
+  proxyAutoDetect?: boolean;
 }
 
 export interface ProxyStatus {
@@ -183,6 +213,8 @@ export interface ProxyStatus {
   method: ProxyMethod;
   scope: 'current-user';
   checkedAt: string;
+  autoConfigUrl?: string;
+  autoDetect?: boolean;
 }
 
 export interface ConnectivityProbe {

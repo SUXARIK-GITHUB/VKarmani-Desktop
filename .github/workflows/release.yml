@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: vkarmani-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   dependency-review:
     name: Dependency review
@@ -23,10 +27,10 @@ jobs:
       pull-requests: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5.0.0
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
       - name: Review dependency changes
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
         with:
           fail-on-severity: high
 
@@ -36,18 +40,26 @@ jobs:
     runs-on: windows-2022
     permissions:
       contents: write
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5.0.0
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           lfs: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '22.23.3'
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
 
       - name: Validate PowerShell scripts
         shell: pwsh
         run: |
           $tokens = $null
-          foreach ($file in Get-ChildItem .\scripts -Filter *.ps1) {
+          foreach ($file in Get-ChildItem .\scripts -File | Where-Object Extension -in '.ps1', '.psm1') {
             $errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors.Count -gt 0) {
@@ -57,9 +69,10 @@ jobs:
             Write-Host "[ps-check] OK: $($file.Name)"
           }
 
-      - name: Download official Xray Windows x64 runtime
-        shell: pwsh
-        run: .\scripts\fetch-xray-windows.ps1 -Force
+      # Bundle the reviewed checked-in resource set. The original
+      # fetch-xray-windows.ps1 remains unchanged and is not run implicitly:
+      # CORE-FETCH-INTEGRATION = BLOCKED_BY_POLICY. Validation module is not
+      # a replacement download/publication pipeline.
 
       - name: Verify bundled Xray binary on Windows
         shell: pwsh
@@ -72,21 +85,18 @@ jobs:
         shell: pwsh
         run: .\scripts\verify-hysteria2-bundled-xray.ps1
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v5.0.0
-        with:
-          node-version: '22'
-          cache: npm
-          registry-url: 'https://registry.npmjs.org'
-
       - name: Force public npm registry
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           npm config set registry https://registry.npmjs.org/
           npm config set fund false
           npm config get registry
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: '1.94.0'
+          components: rustfmt, clippy
 
       - name: Install frontend dependencies
         run: npm ci
@@ -94,32 +104,43 @@ jobs:
       - name: Audit npm dependencies
         run: npm audit --audit-level=high
 
-      - name: Run Remnawave parser tests
-        run: npm run test:parsers
+      - name: Run all frontend tests and build
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm test
+          npm run build
 
       - name: Run Rust unit tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo tree --locked --manifest-path src-tauri/Cargo.toml
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo check --locked --manifest-path src-tauri/Cargo.toml
+          cargo test --locked --manifest-path src-tauri/Cargo.toml
+          cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Run Windows runtime smoke checks
         shell: pwsh
         run: .\scripts\windows-runtime-smoke.ps1 -RequireCleanDisconnect
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Audit Rust dependencies
-        run: cargo audit
-        working-directory: src-tauri
+        run: node scripts/verify-cargo-audit-windows.mjs
 
       - name: Verify updater config
+        if: startsWith(github.ref, 'refs/tags/v')
         run: npm run verify:updater
         env:
           GITHUB_ACTIONS: 'true'
+          REQUIRE_UPDATER_SIGNING_KEY: 'true'
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Build and publish Tauri release
-        uses: tauri-apps/tauri-action@v0.5.23
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: tauri-apps/tauri-action@2d3036b306d86c3198f05a460dcd23cf55ef41b9 # v0.5.23
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -138,3 +159,48 @@ jobs:
           prerelease: false
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
+
+  validate-windows:
+    name: Locked Windows validation without publishing
+    if: github.event_name == 'pull_request'
+    runs-on: windows-2022
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          lfs: true
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '22.23.3'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: '1.94.0'
+          components: rustfmt, clippy
+      - name: Frontend gates
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm ci
+          npm audit --audit-level=high
+          npm test
+          npm run build
+          npm run verify:updater
+      - name: Locked Rust gates
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo tree --locked --manifest-path src-tauri/Cargo.toml
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo check --locked --manifest-path src-tauri/Cargo.toml
+          cargo test --locked --manifest-path src-tauri/Cargo.toml
+          cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - name: Resource helper tests and read-only smoke
+        shell: pwsh
+        run: |
+          .\scripts\test-core-resource-tools.ps1
+          .\scripts\windows-runtime-smoke.ps1 -RequireCleanDisconnect
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Strict Windows Rust dependency audit
+        run: node scripts/verify-cargo-audit-windows.mjs

@@ -51,7 +51,6 @@ pub(crate) fn tune_outbound_for_performance(outbound: &mut Value) {
     }
 }
 
-
 const ROUTING_EXCLUSION_LIMIT: usize = 300;
 
 fn is_valid_domain_label(label: &str) -> bool {
@@ -127,7 +126,11 @@ fn normalize_route_ip(raw_value: &str) -> Option<String> {
         return Some(format!("{parsed_ip}/{parsed_prefix}"));
     }
 
-    value.trim().parse::<Ipv4Addr>().ok().map(|ip| ip.to_string())
+    value
+        .trim()
+        .parse::<Ipv4Addr>()
+        .ok()
+        .map(|ip| ip.to_string())
 }
 
 fn tld_domain_matcher(tld: &str) -> String {
@@ -171,7 +174,10 @@ pub(crate) fn build_routing_exclusion_rule_plan(
 
     for raw_domain in &exclusions.domains {
         if plan.domain_rules.len() >= ROUTING_EXCLUSION_LIMIT {
-            plan.skipped_notes.push("Routing exclusions: часть доменов пропущена из-за лимита direct-правил.".to_string());
+            plan.skipped_notes.push(
+                "Routing exclusions: часть доменов пропущена из-за лимита direct-правил."
+                    .to_string(),
+            );
             break;
         }
 
@@ -182,15 +188,18 @@ pub(crate) fn build_routing_exclusion_rule_plan(
                     plan.domain_rules.push(matcher);
                 }
             }
-            None => plan
-                .skipped_notes
-                .push(format!("Routing exclusions: домен пропущен как некорректный: {raw_domain}")),
+            None => plan.skipped_notes.push(format!(
+                "Routing exclusions: домен пропущен как некорректный: {raw_domain}"
+            )),
         }
     }
 
     for raw_ip in &exclusions.ips {
         if plan.ip_rules.len() >= ROUTING_EXCLUSION_LIMIT {
-            plan.skipped_notes.push("Routing exclusions: часть IPv4/CIDR пропущена из-за лимита direct-правил.".to_string());
+            plan.skipped_notes.push(
+                "Routing exclusions: часть IPv4/CIDR пропущена из-за лимита direct-правил."
+                    .to_string(),
+            );
             break;
         }
 
@@ -200,9 +209,9 @@ pub(crate) fn build_routing_exclusion_rule_plan(
                     plan.ip_rules.push(ip);
                 }
             }
-            None => plan
-                .skipped_notes
-                .push(format!("Routing exclusions: IPv4/CIDR пропущен как некорректный: {raw_ip}")),
+            None => plan.skipped_notes.push(format!(
+                "Routing exclusions: IPv4/CIDR пропущен как некорректный: {raw_ip}"
+            )),
         }
     }
 
@@ -210,13 +219,12 @@ pub(crate) fn build_routing_exclusion_rule_plan(
 }
 
 fn routing_exclusion_inbound_tags(network_mode: &str) -> Vec<&'static str> {
+    let mut tags = vec!["socks-in", "http-in"];
     if network_mode == "tun" {
-        vec!["tun-in"]
-    } else {
-        vec!["socks-in", "http-in"]
+        tags.push("tun-in");
     }
+    tags
 }
-
 
 fn value_string_field(value: &Value, key: &str) -> Option<String> {
     value
@@ -253,166 +261,319 @@ fn apply_send_through_to_proxy_outbounds(outbounds: &mut [Value], send_through_i
         }
 
         if let Some(map) = outbound.as_object_mut() {
-            map.insert("sendThrough".to_string(), Value::String(ip.to_string()));
+            set_client_owned_xray_field(map, "sendThrough", Value::String(ip.to_string()));
         }
     }
 }
 
-fn ensure_outbound_with_tag(outbounds: &mut Vec<Value>, tag: &str, outbound: Value) {
-    let exists = outbounds.iter().any(|item| outbound_tag(item).as_deref() == Some(tag));
-    if !exists {
-        outbounds.push(outbound);
+// Provider tags must never collide with client adapters or accidentally select
+// an injected loopback/direct outbound in a provider balancer.
+fn adapter_namespace(config: &Value) -> String {
+    let mut prefixes = Vec::new();
+    for section in ["outbounds", "inbounds"] {
+        if let Some(items) = config.get(section).and_then(Value::as_array) {
+            prefixes.extend(
+                items
+                    .iter()
+                    .filter_map(|item| item.get("tag").and_then(Value::as_str))
+                    .filter(|tag| !tag.is_empty()),
+            );
+        }
     }
-}
-
-fn replace_or_insert_outbound_with_tag(outbounds: &mut Vec<Value>, tag: &str, outbound: Value) {
-    if let Some(existing) = outbounds
-        .iter_mut()
-        .find(|item| outbound_tag(item).as_deref() == Some(tag))
+    if let Some(items) = config
+        .pointer("/routing/balancers")
+        .and_then(Value::as_array)
     {
-        *existing = outbound;
-        return;
-    }
-
-    outbounds.push(outbound);
-}
-
-fn normalized_primary_outbound_tag(template: &RuntimeTemplate, fallback: &Value) -> String {
-    template
-        .primary_outbound_tag
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| outbound_tag(fallback))
-        .unwrap_or_else(|| "proxy".to_string())
-}
-
-fn rewrite_proxy_outbound_tag_in_rules(rules: &mut [Value], primary_tag: &str) {
-    if primary_tag == "proxy" {
-        return;
-    }
-
-    for rule in rules {
-        if let Some(map) = rule.as_object_mut() {
-            if map.get("outboundTag").and_then(Value::as_str) == Some("proxy") {
-                map.insert("outboundTag".to_string(), Value::String(primary_tag.to_string()));
+        for item in items {
+            if let Some(selectors) = item.get("selector").and_then(Value::as_array) {
+                prefixes.extend(
+                    selectors
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|tag| !tag.is_empty()),
+                );
             }
         }
     }
+    for index in 0..=prefixes.len() {
+        let prefix = if index == 0 {
+            "__vkarmani.".into()
+        } else {
+            format!(
+                "{}vkarmani.",
+                char::from_u32(0xe000 + index as u32).unwrap_or('\u{f8ff}')
+            )
+        };
+        if !prefixes
+            .iter()
+            .any(|tag| prefix.starts_with(tag) || tag.starts_with(&prefix))
+        {
+            return prefix;
+        }
+    }
+    unreachable!("finite tag set cannot cover all allocated namespace prefixes")
 }
 
-fn merge_full_config_routing(
-    existing_routing: Option<Value>,
-    mut safety_rules: Vec<Value>,
-    domain_strategy: &str,
-    primary_tag: &str,
-) -> Value {
-    rewrite_proxy_outbound_tag_in_rules(&mut safety_rules, primary_tag);
-
-    let mut routing = existing_routing
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}));
-
-    if let Some(map) = routing.as_object_mut() {
-        map.entry("domainStrategy".to_string())
-            .or_insert_with(|| Value::String(domain_strategy.to_string()));
-
-        let existing_rules = map
-            .remove("rules")
-            .and_then(|value| value.as_array().cloned())
-            .unwrap_or_default();
-
-        let mut merged_rules = Vec::with_capacity(safety_rules.len() + existing_rules.len() + 1);
-        merged_rules.extend(safety_rules);
-        merged_rules.extend(existing_rules);
-
-        if merged_rules.iter().all(|rule| rule.get("outboundTag").and_then(Value::as_str) != Some(primary_tag)) {
-            merged_rules.push(json!({
-                "inboundTag": ["socks-in", "http-in", "tun-in"],
-                "outboundTag": primary_tag,
-                "type": "field",
-                "ruleTag": "vkarmani-full-config-fallback"
-            }));
-        }
-
-        map.insert("rules".to_string(), Value::Array(merged_rules));
+fn merge_stats_policy(config: &mut Value) {
+    if !config["policy"].is_object() {
+        config["policy"] = json!({});
     }
+    if !config["policy"]["levels"].is_object() {
+        config["policy"]["levels"] = json!({});
+    }
+    if !config["policy"]["levels"]["0"].is_object() {
+        config["policy"]["levels"]["0"] = json!({});
+    }
+    if !config["policy"]["system"].is_object() {
+        config["policy"]["system"] = json!({});
+    }
+    for (path, flags) in [
+        (
+            "/policy/levels/0",
+            &["statsUserUplink", "statsUserDownlink"][..],
+        ),
+        (
+            "/policy/system",
+            &[
+                "statsInboundUplink",
+                "statsInboundDownlink",
+                "statsOutboundUplink",
+                "statsOutboundDownlink",
+            ][..],
+        ),
+    ] {
+        let map = config
+            .pointer_mut(path)
+            .and_then(Value::as_object_mut)
+            .expect("policy object created");
+        for flag in flags {
+            map.entry((*flag).to_string()).or_insert(json!(true));
+        }
+    }
+    if config.get("stats").map_or(true, Value::is_null) {
+        config["stats"] = json!({});
+    }
+}
 
-    routing
+// Go encoding/json matches ASCII field names case-insensitively, including
+// Unicode simple-fold equivalents long-s and Kelvin sign. Rust JSON map lookup
+// is exact. Remove every equivalent spelling at client-owned boundaries before
+// serialization so a later alias cannot override the sanitized canonical key.
+fn xray_json_field_matches(name: &str, field: &str) -> bool {
+    name.chars()
+        .map(|character| match character {
+            '\u{017f}' => 's',
+            '\u{212a}' => 'k',
+            other => other.to_ascii_lowercase(),
+        })
+        .eq(field
+            .chars()
+            .map(|character| character.to_ascii_lowercase()))
+}
+
+fn set_client_owned_xray_field(map: &mut serde_json::Map<String, Value>, key: &str, value: Value) {
+    map.retain(|name, _| !xray_json_field_matches(name, key));
+    map.insert(key.into(), value);
+}
+
+struct FullConfigAdapterSettings<'a> {
+    log_object: Value,
+    domain_strategy: &'a str,
+    dns_query_strategy: &'a str,
+    send_through_ip: Option<&'a str>,
 }
 
 fn build_from_full_xray_config_template(
     template: &RuntimeTemplate,
     full_config: &Value,
-    inbounds: Vec<Value>,
-    routing_rules: Vec<Value>,
-    direct_outbound: Value,
-    block_outbound: Value,
-    log_object: Value,
-    domain_strategy: &str,
-    dns_query_strategy: &str,
-    send_through_ip: Option<&str>,
+    mut inbounds: Vec<Value>,
+    mut adapter_rules: Vec<Value>,
+    mut direct_outbound: Value,
+    mut block_outbound: Value,
+    settings: FullConfigAdapterSettings<'_>,
 ) -> Option<Value> {
+    let FullConfigAdapterSettings {
+        log_object,
+        domain_strategy,
+        dns_query_strategy,
+        send_through_ip,
+    } = settings;
     let mut config = full_config.clone();
-    let config_map = config.as_object_mut()?;
-
-    let mut fallback_outbound = template.outbound.clone();
-    tune_outbound_for_performance(&mut fallback_outbound);
-    let primary_tag = normalized_primary_outbound_tag(template, &fallback_outbound);
-
-    let mut outbounds = config_map
-        .remove("outbounds")
-        .and_then(|value| value.as_array().cloned())
-        .filter(|items| !items.is_empty())
-        .unwrap_or_else(|| vec![fallback_outbound]);
-
-    for outbound in &mut outbounds {
-        tune_outbound_for_performance(outbound);
-    }
-    apply_send_through_to_proxy_outbounds(&mut outbounds, send_through_ip);
-    if send_through_ip.is_some() {
-        // В full Xray JSON Remnawave может уже быть outbound с tag=direct.
-        // В TUN-режиме такой direct обязан использовать свежий sendThrough
-        // физического IPv4, иначе unselected/public bypass может снова попасть
-        // в split-default TUN route и зациклить xray.exe.
-        replace_or_insert_outbound_with_tag(&mut outbounds, "direct", direct_outbound);
-    } else {
-        ensure_outbound_with_tag(&mut outbounds, "direct", direct_outbound);
-    }
-    ensure_outbound_with_tag(&mut outbounds, "block", block_outbound);
-
-    let existing_routing = config_map.remove("routing");
-    let routing = merge_full_config_routing(existing_routing, routing_rules, domain_strategy, &primary_tag);
-
-    config_map.insert("log".to_string(), log_object);
-    config_map.insert("inbounds".to_string(), Value::Array(inbounds));
-    config_map.insert("routing".to_string(), routing);
-    config_map.insert("outbounds".to_string(), Value::Array(outbounds));
-    config_map.entry("dns".to_string()).or_insert_with(|| json!({
-        "queryStrategy": dns_query_strategy,
-        "servers": ["1.1.1.1", "8.8.8.8", "localhost"]
-    }));
-    config_map.insert("api".to_string(), json!({ "tag": "api", "services": ["StatsService"] }));
-    config_map.insert("stats".to_string(), json!({}));
-    config_map.insert("policy".to_string(), json!({
-        "levels": {
-            "0": {
-                "statsUserUplink": true,
-                "statsUserDownlink": true
-            }
-        },
-        "system": {
-            "statsInboundUplink": true,
-            "statsInboundDownlink": true,
-            "statsOutboundUplink": true,
-            "statsOutboundDownlink": true
+    config.as_object()?;
+    // Optional Xray sections may be JSON null; materialize only sections that
+    // the client adapter must augment, keeping the canonical input untouched.
+    for section in ["log", "api"] {
+        if config.get(section).is_some_and(Value::is_null) {
+            config[section] = json!({});
         }
-    }));
-
+    }
+    let namespace = adapter_namespace(&config);
+    let own = |tag: &str| format!("{namespace}{tag}");
+    let api_tag = config
+        .pointer("/api/tag")
+        .and_then(Value::as_str)
+        .filter(|tag| !tag.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| own("api"));
+    let mut outbounds = config.get("outbounds")?.as_array()?.clone();
+    // Imported transport/mux/policy settings are not performance-tuned away.
+    // TUN alone binds sockets to the observed physical address to prevent loops.
+    apply_send_through_to_proxy_outbounds(&mut outbounds, send_through_ip);
+    if let Some(ip) = send_through_ip {
+        for outbound in &mut outbounds {
+            if outbound.get("protocol").and_then(Value::as_str) == Some("freedom") {
+                set_client_owned_xray_field(outbound.as_object_mut()?, "sendThrough", json!(ip));
+            }
+        }
+    }
+    let default_tag = if template.profile_kind.as_deref() == Some("node") {
+        template.primary_outbound_tag.clone()
+    } else {
+        outbounds.first().and_then(outbound_tag)
+    }
+    .unwrap_or_else(|| own("default"));
+    if outbounds
+        .first()
+        .is_some_and(|item| outbound_tag(item).is_none())
+    {
+        outbounds[0]["tag"] = json!(default_tag);
+    }
+    direct_outbound["tag"] = json!(own("direct"));
+    block_outbound["tag"] = json!(own("block"));
+    let provider_tags: Vec<String> = outbounds.iter().filter_map(outbound_tag).collect();
+    // An empty selector means every ORIGINAL outbound, not the new adapters.
+    if let Some(balancers) = config
+        .pointer_mut("/routing/balancers")
+        .and_then(Value::as_array_mut)
+    {
+        for balancer in balancers {
+            if balancer
+                .get("selector")
+                .and_then(Value::as_array)
+                .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("")))
+            {
+                balancer["selector"] = json!(provider_tags);
+            }
+        }
+    }
+    for inbound in &mut inbounds {
+        if let Some(tag) = inbound
+            .get("tag")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+        {
+            inbound["tag"] = json!(own(&tag));
+        }
+    }
+    for rule in &mut adapter_rules {
+        if let Some(tags) = rule.get_mut("inboundTag").and_then(Value::as_array_mut) {
+            for tag in tags {
+                if let Some(original) = tag.as_str() {
+                    *tag = json!(own(original));
+                }
+            }
+        }
+        if let Some(tag) = rule
+            .get("outboundTag")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+        {
+            rule["outboundTag"] = json!(if tag == "api" {
+                api_tag.clone()
+            } else if tag == "proxy" {
+                own("dispatch-tun")
+            } else {
+                own(&tag)
+            });
+        }
+    }
+    let virtual_tags = [
+        own("profile-socks"),
+        own("profile-http"),
+        own("profile-tun"),
+    ];
+    for (source, target) in [
+        ("socks-in", "socks"),
+        ("http-in", "http"),
+        ("tun-in", "tun"),
+    ] {
+        outbounds.push(json!({"tag":own(&format!("dispatch-{target}")),"protocol":"loopback","settings":{"inboundTag":own(&format!("profile-{target}"))}}));
+        if source != "tun-in" {
+            adapter_rules.push(json!({"type":"field","inboundTag":[own(source)],"outboundTag":own(&format!("dispatch-{target}")),"ruleTag":own(&format!("enter-{target}"))}));
+        }
+    }
+    let provider_rules = config
+        .pointer("/routing/rules")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for mut rule in provider_rules {
+        let scope = if let Some(tags) = rule.get("inboundTag").and_then(Value::as_array) {
+            let mut mapped = Vec::new();
+            for tag in tags {
+                let declaration = full_config
+                    .get("inbounds")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.iter().find(|item| item.get("tag") == Some(tag)));
+                match declaration
+                    .and_then(|item| item.get("protocol"))
+                    .and_then(Value::as_str)
+                {
+                    Some("socks") => {
+                        mapped.extend([json!(own("profile-socks")), json!(own("profile-tun"))])
+                    }
+                    Some("http") => {
+                        mapped.extend([json!(own("profile-http")), json!(own("profile-tun"))])
+                    }
+                    _ => mapped.push(tag.clone()), // Preserve unknown selectors; never widen them.
+                }
+            }
+            mapped
+        } else {
+            virtual_tags.iter().map(|tag| json!(tag)).collect()
+        };
+        set_client_owned_xray_field(rule.as_object_mut()?, "inboundTag", json!(scope));
+        adapter_rules.push(rule);
+    }
+    adapter_rules.push(json!({"type":"field","inboundTag":virtual_tags,"outboundTag":default_tag,"ruleTag":own("provider-default")}));
+    outbounds.extend([direct_outbound, block_outbound]);
+    let map = config.as_object_mut()?;
+    set_client_owned_xray_field(map, "inbounds", json!(inbounds));
+    set_client_owned_xray_field(map, "outbounds", json!(outbounds));
+    let routing = map.entry("routing").or_insert(json!({})).as_object_mut()?;
+    routing
+        .entry("domainStrategy")
+        .or_insert(json!(domain_strategy));
+    set_client_owned_xray_field(routing, "rules", json!(adapter_rules));
+    // Client-owned listeners and log sinks are explicit runtime adapter boundaries.
+    let log = map.entry("log").or_insert(json!({})).as_object_mut()?;
+    for (key, value) in log_object.as_object()? {
+        set_client_owned_xray_field(log, key, value.clone());
+    }
+    set_client_owned_xray_field(log, "access", json!("none"));
+    map.entry("dns").or_insert(
+        json!({"queryStrategy":dns_query_strategy,"servers":["1.1.1.1","8.8.8.8","localhost"]}),
+    );
+    let api = map.entry("api").or_insert(json!({})).as_object_mut()?;
+    set_client_owned_xray_field(api, "tag", json!(api_tag));
+    api.retain(|name, _| !xray_json_field_matches(name, "listen"));
+    if api.iter().any(|(name, value)| {
+        xray_json_field_matches(name, "services")
+            && !value.is_null()
+            && !value
+                .as_array()
+                .is_some_and(|services| services.iter().all(Value::is_string))
+    }) {
+        return None;
+    }
+    // Provider API handlers are not capabilities of this client-owned listener.
+    // StatsService is the only consumer used by VKarmani.
+    set_client_owned_xray_field(api, "services", json!(["StatsService"]));
+    merge_stats_policy(&mut config);
     Some(config)
 }
 
+#[cfg(test)]
 pub(crate) fn build_xray_config(
     template: &RuntimeTemplate,
     network_mode: &str,
@@ -421,12 +582,37 @@ pub(crate) fn build_xray_config(
     split_tunnel_entries: &[SplitTunnelEntryPayload],
     routing_exclusions: Option<&RoutingExclusionSettingsPayload>,
     runtime_log_path: Option<&Path>,
-) -> (Value, SplitTunnelRulePlan, RoutingExclusionRulePlan) {
+) -> Result<(Value, SplitTunnelRulePlan, RoutingExclusionRulePlan), String> {
+    build_xray_config_with_plan(
+        template,
+        network_mode,
+        ip_stack,
+        send_through_ip,
+        if network_mode == "tun" {
+            Some(build_split_tunnel_rule_plan(split_tunnel_entries)?)
+        } else {
+            None
+        },
+        routing_exclusions,
+        runtime_log_path,
+    )
+}
+
+pub(crate) fn build_xray_config_with_plan(
+    template: &RuntimeTemplate,
+    network_mode: &str,
+    ip_stack: &str,
+    send_through_ip: Option<&str>,
+    prepared_policy: Option<SplitTunnelRulePlan>,
+    routing_exclusions: Option<&RoutingExclusionSettingsPayload>,
+    runtime_log_path: Option<&Path>,
+) -> Result<(Value, SplitTunnelRulePlan, RoutingExclusionRulePlan), String> {
     let plan = if network_mode == "tun" {
-        build_split_tunnel_rule_plan(split_tunnel_entries)
+        prepared_policy.ok_or("POLICY_PLAN_REQUIRED")?
     } else {
         SplitTunnelRulePlan {
             process_matches: Vec::new(),
+            direct_process_matches: Vec::new(),
             resolved_apps: 0,
             resolved_services: 0,
             skipped_notes: Vec::new(),
@@ -449,7 +635,7 @@ pub(crate) fn build_xray_config(
             // В TUN режиме исходный адрес должен соответствовать текущему физическому
             // адаптеру после остановки старого runtime. Не сохраняем sendThrough из
             // импортированного/старого шаблона, иначе можно получить loop при soft switch.
-            map.insert("sendThrough".to_string(), Value::String(ip.to_string()));
+            set_client_owned_xray_field(map, "sendThrough", Value::String(ip.to_string()));
         }
     }
 
@@ -554,13 +740,9 @@ pub(crate) fn build_xray_config(
             "ruleTag": "tun-local-domain-direct"
         }));
 
-
-        routing_rules.push(json!({
-            "inboundTag": ["tun-in"],
-            "ip": ["::/0"],
-            "outboundTag": "block",
-            "ruleTag": "tun-ipv6-leak-guard"
-        }));
+        if !plan.direct_process_matches.is_empty() {
+            routing_rules.push(json!({"inboundTag":["tun-in"],"process":plan.direct_process_matches,"outboundTag":"direct","ruleTag":"tun-explicit-direct-processes"}));
+        }
 
         if !plan.process_matches.is_empty() {
             routing_rules.push(json!({
@@ -569,23 +751,15 @@ pub(crate) fn build_xray_config(
                 "outboundTag": "proxy",
                 "ruleTag": "tun-selected-processes"
             }));
-            // Жёсткая изоляция TUN: только выбранные процессы идут через VPN.
-            // Остальной публичный tun-in трафик отправляем в direct-bypass, но сам
-            // outbound direct ниже обязательно получает sendThrough физического IPv4.
-            // Это не даёт невыбранным приложениям уйти в VPN и одновременно защищает
-            // xray.exe от route-loop через split-default Wintun route.
-            routing_rules.push(json!({
-                "inboundTag": ["tun-in"],
-                "outboundTag": "direct",
-                "ruleTag": "tun-unselected-public-direct-bypass"
-            }));
-        } else {
-            routing_rules.push(json!({
-                "inboundTag": ["tun-in"],
-                "outboundTag": "direct",
-                "ruleTag": "tun-empty-selection-direct"
-            }));
         }
+        if ip_stack == "ipv4" && !plan.process_matches.is_empty() {
+            let selected_index = routing_rules
+                .iter()
+                .position(|r| r["ruleTag"] == "tun-selected-processes")
+                .expect("selected rule");
+            routing_rules.insert(selected_index, json!({"inboundTag":["tun-in"],"process":plan.process_matches.clone(),"ip":["::/0"],"outboundTag":"block","ruleTag":"tun-selected-ipv6-guard"}));
+        }
+        routing_rules.push(json!({"inboundTag":["tun-in"],"outboundTag":"direct","ruleTag":"tun-unselected-direct"}));
     }
 
     let domain_strategy = if network_mode == "tun" {
@@ -609,15 +783,15 @@ pub(crate) fn build_xray_config(
         })
     };
 
-    let log_object = if let Some(path) = runtime_log_path {
+    let log_object = if runtime_log_path.is_some() {
         json!({
-            "loglevel": "warning",
-            "error": path.to_string_lossy().to_string(),
+            "loglevel": "error",
+            "error": "",
             "access": ""
         })
     } else {
         json!({
-            "loglevel": "warning"
+            "loglevel": "error"
         })
     };
 
@@ -627,7 +801,7 @@ pub(crate) fn build_xray_config(
         "UseIPv4"
     };
 
-    if let Some(full_config) = template.full_config.as_ref().filter(|value| value.is_object()) {
+    if let Some(full_config) = template.full_config.as_ref() {
         let block_outbound = json!({
             "tag": "block",
             "protocol": "blackhole",
@@ -641,16 +815,19 @@ pub(crate) fn build_xray_config(
             routing_rules.clone(),
             direct_outbound.clone(),
             block_outbound,
-            log_object.clone(),
-            domain_strategy,
-            dns_query_strategy,
-            send_through_ip,
+            FullConfigAdapterSettings {
+                log_object: log_object.clone(),
+                domain_strategy,
+                dns_query_strategy,
+                send_through_ip,
+            },
         ) {
-            return (full_runtime_config, plan, routing_exclusion_plan);
+            return Ok((full_runtime_config, plan, routing_exclusion_plan));
         }
+        return Err("Не удалось применить client adapter к полному Xray config; неполный fallback запрещён.".into());
     }
 
-    (
+    Ok((
         json!({
             "log": log_object,
             "dns": {
@@ -693,7 +870,7 @@ pub(crate) fn build_xray_config(
         }),
         plan,
         routing_exclusion_plan,
-    )
+    ))
 }
 
 pub(crate) fn value_as_valid_port(value: &Value) -> Option<u16> {
@@ -703,7 +880,9 @@ pub(crate) fn value_as_valid_port(value: &Value) -> Option<u16> {
         .map(|port| port as u16)
 }
 
-pub(crate) fn extract_outbound_address_and_port(template: &RuntimeTemplate) -> (Option<String>, u16) {
+pub(crate) fn extract_outbound_address_and_port(
+    template: &RuntimeTemplate,
+) -> (Option<String>, u16) {
     let default_port = 443_u16;
     let settings = template.outbound.get("settings");
 
@@ -761,414 +940,180 @@ pub(crate) fn resolve_ipv4_addresses(host: &str, port: u16) -> Vec<String> {
     addresses
 }
 
-
-pub(crate) fn detect_primary_ipv4_address() -> Option<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("1.1.1.1:53").ok()?;
-    let addr = socket.local_addr().ok()?;
-    if addr.ip().is_ipv4() {
-        Some(addr.ip().to_string())
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn run_windows_net_command(program: &str, args: &[String], timeout: Duration, context: &str) -> Result<String, String> {
-    let mut command = Command::new(program);
-    command.args(args);
-    run_command_with_timeout(command, timeout, context)
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn run_windows_net_command_str(program: &str, args: &[&str], timeout: Duration, context: &str) -> Result<String, String> {
-    let mut command = Command::new(program);
-    command.args(args);
-    run_command_with_timeout(command, timeout, context)
-}
-
 #[cfg(target_os = "windows")]
 pub(crate) fn default_route_snapshot() -> Result<DefaultRouteSnapshot, String> {
-    // Для /32 escape routes важно знать не только gateway, но и InterfaceIndex:
-    // на ПК с Hyper-V/WSL/VMware/старым VPN один gateway без `if` может уйти
-    // в другой адаптер. PowerShell даёт точный индекс; route.exe остаётся
-    // fallback-ом, если PowerShell недоступен или заблокирован политиками.
-    let ps_script = r#"
+    let raw = run_powershell(
+        r#"
 $ErrorActionPreference = 'Stop'
-$route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
-  Where-Object { $_.State -eq 'Alive' -and $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
-  Sort-Object RouteMetric, InterfaceMetric |
-  Select-Object -First 1 InterfaceIndex, NextHop
-if (-not $route) { throw 'Default route not found' }
-$route | ConvertTo-Json -Compress
-"#;
-
-    if let Ok(raw) = run_powershell(ps_script) {
-        if let Ok(route) = serde_json::from_str::<DefaultRouteSnapshot>(&raw) {
-            if route.interface_index > 0 && !route.next_hop.trim().is_empty() && route.next_hop != "0.0.0.0" {
-                return Ok(route);
-            }
-        }
-    }
-
-    // Fallback: `route.exe` быстрее, но не даёт InterfaceIndex в стабильном виде.
-    // Возвращаем index=0, а вызывающие route_add передадут `if` только если он известен.
-    let raw = run_windows_net_command_str(
-        "route",
-        &["print", "-4", "0.0.0.0"],
-        Duration::from_secs(3),
-        "route print default route",
+$route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore |
+  Where-Object { $_.State -eq 'Alive' -and $_.NextHop -ne '0.0.0.0' -and $_.InterfaceAlias -ne 'vkarmani-tun' } |
+  Sort-Object @{Expression={ $_.RouteMetric + $_.InterfaceMetric }} | Select-Object -First 1
+if (-not $route) { throw 'No original default route' }
+$adapter = Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $route.InterfaceIndex } | Select-Object -First 1
+if ($adapter.Status -ne 'Up') { throw 'Default adapter not Up' }
+$address = Get-NetIPAddress -InterfaceIndex $route.InterfaceIndex -AddressFamily IPv4 |
+  Where-Object { $_.AddressState -eq 'Preferred' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1
+if (-not $address) { throw 'No preferred source IPv4' }
+@{ InterfaceIndex=$route.InterfaceIndex; NextHop=$route.NextHop; InterfaceAlias=$route.InterfaceAlias; SourceIp=$address.IPAddress } | ConvertTo-Json -Compress
+"#,
     )?;
-
-    let mut best: Option<(String, u32)> = None;
-    for line in raw.lines() {
-        let parts = line.split_whitespace().collect::<Vec<_>>();
-        if parts.len() < 5 || parts[0] != "0.0.0.0" || parts[1] != "0.0.0.0" {
-            continue;
-        }
-
-        let gateway = parts[2].trim();
-        if gateway.eq_ignore_ascii_case("on-link") || gateway == "0.0.0.0" {
-            continue;
-        }
-
-        let metric = parts
-            .last()
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(u32::MAX);
-
-        match &best {
-            Some((_, current_metric)) if *current_metric <= metric => {}
-            _ => best = Some((gateway.to_string(), metric)),
-        }
+    let route: DefaultRouteSnapshot =
+        serde_json::from_str(&raw).map_err(|_| "Invalid default route snapshot".to_string())?;
+    if route.interface_index == 0
+        || route.interface_alias.is_empty()
+        || route.interface_alias == TUN_INTERFACE_NAME
+        || route.source_ip.parse::<Ipv4Addr>().is_err()
+        || route.next_hop.parse::<Ipv4Addr>().is_err()
+    {
+        return Err("TUN_BINDING_INVALID: original interface/source address not confirmed".into());
     }
+    Ok(route)
+}
 
-    best
-        .map(|(next_hop, _)| DefaultRouteSnapshot {
-            interface_index: 0,
-            next_hop,
-        })
-        .ok_or_else(|| "Default route not found".to_string())
+pub(crate) fn bind_tun_outbounds(config: &mut Value, interface: &str) -> Result<(), String> {
+    if interface.is_empty()
+        || interface == TUN_INTERFACE_NAME
+        || interface.len() > 256
+        || interface.contains('\0')
+    {
+        return Err("TUN_BINDING_INVALID: invalid outbound interface".into());
+    }
+    let inbounds = config["inbounds"]
+        .as_array_mut()
+        .ok_or("Missing TUN inbounds")?;
+    for inbound in inbounds.iter_mut().filter(|v| v["protocol"] == "tun") {
+        inbound["settings"]["autoOutboundsInterface"] = json!(interface);
+    }
+    for outbound in config["outbounds"]
+        .as_array_mut()
+        .ok_or("Missing TUN outbounds")?
+    {
+        if matches!(
+            outbound["protocol"].as_str(),
+            Some("blackhole" | "loopback")
+        ) {
+            continue;
+        }
+        let map = outbound.as_object_mut().ok_or("Missing outbound object")?;
+        let stream = map
+            .entry("streamSettings")
+            .or_insert(json!({}))
+            .as_object_mut()
+            .ok_or("Incompatible TUN stream settings")?;
+        let sockopt = stream
+            .entry("sockopt")
+            .or_insert(json!({}))
+            .as_object_mut()
+            .ok_or("Incompatible TUN socket settings")?;
+        if sockopt
+            .get("interface")
+            .is_some_and(|v| v.as_str() != Some(interface))
+        {
+            return Err(
+                "TUN_BINDING_CONFLICT: provider interface conflicts with client adapter".into(),
+            );
+        }
+        sockopt.insert("interface".into(), json!(interface));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
 pub(crate) fn find_tun_interface_index(interface_name: &str) -> Result<u32, String> {
-    let raw = run_windows_net_command_str(
-        "netsh",
-        &["interface", "ipv4", "show", "interfaces"],
-        Duration::from_secs(3),
-        "netsh interface list",
-    )?;
-
-    let wanted = interface_name.trim().to_ascii_lowercase();
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if !trimmed.to_ascii_lowercase().ends_with(&wanted) {
-            continue;
-        }
-
-        if let Some(index) = trimmed
-            .split_whitespace()
-            .next()
-            .and_then(|value| value.parse::<u32>().ok())
-        {
-            return Ok(index);
-        }
-    }
-
-    Err(format!("TUN интерфейс {interface_name} пока не найден."))
+    owned_interface_index(interface_name)
 }
 
 #[cfg(target_os = "windows")]
 pub(crate) fn wait_for_tun_interface(interface_name: &str) -> Result<u32, String> {
-    // Xray usually creates Wintun quickly. Poll with a lightweight netsh call instead
-    // of repeatedly starting PowerShell/Get-NetAdapter.
-    let mut last_error = String::new();
-    for _ in 0..24 {
-        match find_tun_interface_index(interface_name) {
-            Ok(index) => return Ok(index),
-            Err(error) => last_error = error,
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        if let Ok(index) = find_tun_interface_index(interface_name) {
+            return Ok(index);
         }
-
-        std::thread::sleep(Duration::from_millis(150));
-    }
-
-    Err(if last_error.is_empty() {
-        format!("TUN интерфейс {interface_name} не появился после запуска Xray.")
-    } else {
-        format!("{last_error} После запуска Xray интерфейс не появился вовремя.")
-    })
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn route_delete(destination: &str, mask: &str, gateway: Option<&str>, if_index: Option<u32>) {
-    let mut args = vec![
-        "delete".to_string(),
-        destination.to_string(),
-        "mask".to_string(),
-        mask.to_string(),
-    ];
-
-    if let Some(gateway) = gateway.filter(|value| !value.trim().is_empty()) {
-        args.push(gateway.to_string());
-    }
-
-    if let Some(index) = if_index.filter(|value| *value > 0) {
-        args.push("if".to_string());
-        args.push(index.to_string());
-    }
-
-    let _ = run_windows_net_command("route", &args, Duration::from_secs(2), "route delete");
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn route_add(destination: &str, mask: &str, gateway: &str, metric: u32, if_index: Option<u32>) -> Result<(), String> {
-    let mut args = vec![
-        "add".to_string(),
-        destination.to_string(),
-        "mask".to_string(),
-        mask.to_string(),
-        gateway.to_string(),
-        "metric".to_string(),
-        metric.to_string(),
-    ];
-
-    if let Some(index) = if_index.filter(|value| *value > 0) {
-        args.push("if".to_string());
-        args.push(index.to_string());
-    }
-
-    run_windows_net_command("route", &args, Duration::from_secs(3), "route add").map(|_| ())
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn configure_tun_routes_fast(interface_name: &str, server_ips: &[String]) -> Result<(), String> {
-    // Snapshot the real default route before adding split-default TUN routes.
-    // Taking it afterwards can capture the just-created TUN route on some Windows setups
-    // and break the /32 escape route to the VPN server.
-    let default_route_before_tun = default_route_snapshot().ok();
-    let tun_index = wait_for_tun_interface(interface_name)?;
-
-    // Critical for soft server switching: protect every resolved VPN server endpoint
-    // before split-default routes are added. CDN/DNS can return several A records;
-    // protecting only the first one may still route Xray's outbound back into TUN.
-    if server_ips.iter().any(|value| !value.trim().is_empty()) {
-        let default_route = default_route_before_tun.as_ref().ok_or_else(|| {
-            "Не удалось снять default route до добавления TUN routes; fallback PowerShell будет использован для безопасной настройки server /32 route.".to_string()
-        })?;
-
-        if default_route.next_hop.trim().is_empty() || default_route.next_hop == "0.0.0.0" {
-            return Err("Default route не содержит gateway для server /32 route; fallback PowerShell будет использован.".to_string());
+        if Instant::now() >= deadline {
+            return Err("TUN interface deadline exceeded".into());
         }
-
-        for ip in server_ips.iter().map(String::as_str).filter(|value| !value.trim().is_empty()) {
-            route_delete(ip, "255.255.255.255", None, None);
-            if let Err(error) = route_add(ip, "255.255.255.255", &default_route.next_hop, 1, Some(default_route.interface_index)) {
-                return Err(format!("Не удалось добавить /32 route до VPN-сервера {ip} через исходный gateway/interface: {error}"));
-            }
-        }
-    }
-
-    route_delete("0.0.0.0", "128.0.0.0", Some("0.0.0.0"), Some(tun_index));
-    route_delete("128.0.0.0", "128.0.0.0", Some("0.0.0.0"), Some(tun_index));
-
-    // Split-default routing keeps the original default route alive, but sends public
-    // IPv4 traffic through Wintun. `0.0.0.0` is the on-link gateway for the TUN interface.
-    if let Err(error) = route_add("0.0.0.0", "128.0.0.0", "0.0.0.0", 6, Some(tun_index)) {
-        let _ = cleanup_tun_routes(interface_name, server_ips);
-        return Err(error);
-    }
-
-    if let Err(error) = route_add("128.0.0.0", "128.0.0.0", "0.0.0.0", 6, Some(tun_index)) {
-        let _ = cleanup_tun_routes(interface_name, server_ips);
-        return Err(error);
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn configure_tun_routes_powershell(interface_name: &str, server_ips: &[String]) -> Result<(), String> {
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-$route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
-  Where-Object { $_.State -eq 'Alive' -and $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
-  Sort-Object RouteMetric, InterfaceMetric |
-  Select-Object -First 1 InterfaceAlias, InterfaceIndex, NextHop
-if (-not $route) { throw 'Default route with gateway not found' }
-$route | ConvertTo-Json -Compress
-"#;
-
-    let raw = run_powershell(script)?;
-    let default_route = serde_json::from_str::<DefaultRouteSnapshot>(&raw)
-        .map_err(|error| format!("Не удалось разобрать снимок default route: {error}"))?;
-
-    let wait_script = format!(
-        r#"
-$adapter = Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue
-if ($adapter) {{ 'ready' }}
-"#,
-        ps_quote(interface_name)
-    );
-
-    for _ in 0..20 {
-        if run_powershell(&wait_script)
-            .unwrap_or_default()
-            .trim()
-            .eq_ignore_ascii_case("ready")
-        {
-            break;
-        }
-
-        std::thread::sleep(Duration::from_millis(250));
-    }
-
-    let server_route = server_ips
-        .iter()
-        .map(String::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(|ip| {
-            format!(
-                "Remove-NetRoute -DestinationPrefix '{ip}/32' -Confirm:$false -ErrorAction SilentlyContinue | Out-Null\nNew-NetRoute -DestinationPrefix '{ip}/32' -InterfaceIndex {} -NextHop '{}' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null",
-                default_route.interface_index,
-                ps_quote(&default_route.next_hop),
-                ip = ps_quote(ip)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'Stop'
-$tun = '{}'
-Remove-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceAlias $tun -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias $tun -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-{}
-New-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceAlias $tun -NextHop '0.0.0.0' -RouteMetric 6 -PolicyStore ActiveStore | Out-Null
-New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias $tun -NextHop '0.0.0.0' -RouteMetric 6 -PolicyStore ActiveStore | Out-Null
-"#,
-        ps_quote(interface_name),
-        server_route
-    );
-
-    run_powershell(&script)?;
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn configure_tun_routes(interface_name: &str, server_ips: &[String]) -> Result<(), String> {
-    match configure_tun_routes_fast(interface_name, server_ips) {
-        Ok(()) => Ok(()),
-        Err(fast_error) => {
-            let fallback = configure_tun_routes_powershell(interface_name, server_ips);
-            if fallback.is_ok() {
-                Ok(())
-            } else {
-                fallback.map_err(|fallback_error| {
-                    format!(
-                        "Быстрая настройка TUN через route.exe/netsh не удалась: {fast_error}. Fallback PowerShell тоже не сработал: {fallback_error}"
-                    )
-                })
-            }
-        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn configure_tun_routes(_interface_name: &str, _server_ips: &[String]) -> Result<(), String> {
-    Err("TUN маршруты сейчас реализованы только для Windows сборки VKarmani.".into())
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn apply_tun_ipv6_route_guard(interface_name: &str) -> Result<(), String> {
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'Stop'
-$tun = '{}'
-$adapter = Get-NetAdapter -Name $tun -ErrorAction SilentlyContinue
-if (-not $adapter) {{ throw "TUN adapter not found for IPv6 leak guard" }}
-Remove-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/1' -InterfaceAlias $tun -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-Remove-NetRoute -AddressFamily IPv6 -DestinationPrefix '8000::/1' -InterfaceAlias $tun -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-try {{
-  New-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/1' -InterfaceAlias $tun -NextHop '::' -RouteMetric 6 -PolicyStore ActiveStore | Out-Null
-  New-NetRoute -AddressFamily IPv6 -DestinationPrefix '8000::/1' -InterfaceAlias $tun -NextHop '::' -RouteMetric 6 -PolicyStore ActiveStore | Out-Null
-}} catch {{
-  throw "IPv6 split-default route could not be applied: $($_.Exception.Message)"
-}}
-"#,
-        ps_quote(interface_name)
-    );
-
-    run_powershell(&script).map(|_| ())
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn apply_tun_ipv6_route_guard(_interface_name: &str) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn cleanup_tun_ipv6_routes(interface_name: &str) {
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'SilentlyContinue'
-$tun = '{}'
-Remove-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/1' -InterfaceAlias $tun -Confirm:$false | Out-Null
-Remove-NetRoute -AddressFamily IPv6 -DestinationPrefix '8000::/1' -InterfaceAlias $tun -Confirm:$false | Out-Null
-"#,
-        ps_quote(interface_name)
-    );
-    let _ = run_powershell(&script);
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn cleanup_tun_ipv6_routes(_interface_name: &str) {}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn cleanup_tun_routes(interface_name: &str, server_ips: &[String]) -> Result<(), String> {
-    cleanup_tun_ipv6_routes(interface_name);
-
-    if let Ok(tun_index) = find_tun_interface_index(interface_name) {
-        route_delete("0.0.0.0", "128.0.0.0", Some("0.0.0.0"), Some(tun_index));
-        route_delete("128.0.0.0", "128.0.0.0", Some("0.0.0.0"), Some(tun_index));
+#[cfg(test)]
+mod tun_policy_tests {
+    use super::*;
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn original_default_route_snapshot_is_read_only() {
+        let _fixture = HELPER_TEST_LOCK.lock().unwrap();
+        let snapshot = default_route_snapshot().expect("Read-only original route snapshot");
+        assert!(snapshot.interface_index > 0);
+        assert_ne!(snapshot.interface_alias, TUN_INTERFACE_NAME);
+        assert!(snapshot.source_ip.parse::<Ipv4Addr>().is_ok());
     }
-
-    for ip in server_ips.iter().map(String::as_str).filter(|value| !value.trim().is_empty()) {
-        route_delete(ip, "255.255.255.255", None, None);
+    #[test]
+    fn selected_vpn_unselected_direct_and_explicit_physical_binding() {
+        let template = RuntimeTemplate {
+            family: "xray".into(),
+            protocol: "vless".into(),
+            outbound: json!({"protocol":"vless","settings":{"vnext":[{"address":"vpn.example","port":443,"users":[{"id":"00000000-0000-4000-8000-000000000001"}]}]}}),
+            remarks: None,
+            full_config: None,
+            primary_outbound_tag: None,
+            profile_kind: None,
+        };
+        let entries = vec![SplitTunnelEntryPayload {
+            kind: "app".into(),
+            value: "example.exe".into(),
+            enabled: true,
+            policy: None,
+        }];
+        let (mut config, _, _) = build_xray_config(
+            &template,
+            "tun",
+            "ipv4",
+            Some("192.0.2.20"),
+            &entries,
+            None,
+            None,
+        )
+        .unwrap();
+        bind_tun_outbounds(&mut config, "Ethernet").unwrap();
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        let selected = rules
+            .iter()
+            .find(|r| r["ruleTag"] == "tun-selected-processes")
+            .unwrap();
+        assert_eq!(selected["outboundTag"], "proxy");
+        let direct = rules
+            .iter()
+            .find(|r| r["ruleTag"] == "tun-unselected-direct")
+            .unwrap();
+        assert_eq!(direct["outboundTag"], "direct");
+        assert!(direct.get("process").is_none());
+        let ipv6 = rules
+            .iter()
+            .find(|r| r["ruleTag"] == "tun-selected-ipv6-guard")
+            .unwrap();
+        assert_eq!(ipv6["process"], selected["process"]);
+        assert!(!rules.iter().any(|r| r["ruleTag"] == "tun-ipv6-leak-guard"
+            || r["ruleTag"] == "tun-unselected-public-block"));
+        assert_eq!(
+            config["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["protocol"] == "tun")
+                .unwrap()["settings"]["autoOutboundsInterface"],
+            "Ethernet"
+        );
+        assert!(config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["protocol"] != "blackhole")
+            .all(|o| o["streamSettings"]["sockopt"]["interface"] == "Ethernet"));
+        assert!(bind_tun_outbounds(&mut config, TUN_INTERFACE_NAME).is_err());
+        assert!(bind_tun_outbounds(&mut config, "Wi-Fi")
+            .unwrap_err()
+            .starts_with("TUN_BINDING_CONFLICT"));
     }
-
-    // Best-effort fallback for older Windows builds / localized route output.
-    let server_cleanup = server_ips
-        .iter()
-        .map(String::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(|ip| {
-            format!(
-                "Remove-NetRoute -DestinationPrefix '{}/32' -Confirm:$false -ErrorAction SilentlyContinue | Out-Null",
-                ps_quote(ip)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'SilentlyContinue'
-$tun = '{}'
-Remove-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceAlias $tun -Confirm:$false | Out-Null
-Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias $tun -Confirm:$false | Out-Null
-{}
-"#,
-        ps_quote(interface_name),
-        server_cleanup
-    );
-
-    let _ = run_powershell(&script);
-    Ok(())
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn cleanup_tun_routes(_interface_name: &str, _server_ips: &[String]) -> Result<(), String> {
-    Ok(())
 }

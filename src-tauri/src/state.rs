@@ -1,20 +1,17 @@
 use super::*;
 
+// Informational starting identity; PendingXray exclusively owns termination.
 pub(crate) struct StartingCore {
     pub(crate) pid: u32,
-    pub(crate) core_path: String,
-    pub(crate) config_path: String,
-    pub(crate) log_path: String,
-    pub(crate) network_mode: String,
-    pub(crate) tun_interface_name: Option<String>,
-    pub(crate) tun_server_ips: Vec<String>,
-    pub(crate) started_at: String,
+    pub(crate) config_hash: String,
 }
 
 pub(crate) struct ManagedCore {
-    pub(crate) child: Child,
+    pub(crate) child: OwnedXrayProcess,
     pub(crate) core_path: String,
     pub(crate) config_path: String,
+    pub(crate) config_hash: String,
+    pub(crate) request_hash: String,
     pub(crate) log_path: String,
     pub(crate) server_id: String,
     pub(crate) server_fingerprint: Option<String>,
@@ -22,6 +19,8 @@ pub(crate) struct ManagedCore {
     pub(crate) network_mode: String,
     pub(crate) tun_interface_name: Option<String>,
     pub(crate) tun_server_ips: Vec<String>,
+    pub(crate) self_restart_count: u8,
+    pub(crate) last_self_restart_at: Option<String>,
 }
 
 #[derive(Default)]
@@ -33,10 +32,15 @@ pub(crate) struct AppState {
     pub(crate) runtime: Mutex<Option<ManagedCore>>,
     pub(crate) starting_runtime: Mutex<Option<StartingCore>>,
     pub(crate) last_exit_code: Mutex<Option<i32>>,
-    pub(crate) previous_proxy: Mutex<Option<ProxyStatus>>,
-    pub(crate) operation_lock: Mutex<()>, 
+    pub(crate) operation_lock: Mutex<()>,
+    pub(crate) operation_machine: Mutex<OperationMachine>,
+    pub(crate) operation_generation: std::sync::atomic::AtomicU64,
+    pub(crate) stop_requested: std::sync::atomic::AtomicBool,
+    pub(crate) storage_lock: Mutex<()>,
     pub(crate) session_authorized: Mutex<bool>,
     pub(crate) session_authorization: Mutex<Option<NativeSessionAuthorization>>,
+    pub(crate) subscription_lock: Mutex<()>,
+    pub(crate) authorization_generation: std::sync::atomic::AtomicU64,
     pub(crate) tray_update_available: Mutex<bool>,
     pub(crate) tray_update_busy: Mutex<bool>,
 }
@@ -44,7 +48,9 @@ pub(crate) struct AppState {
 #[derive(Clone, Debug)]
 pub(crate) struct NativeSessionAuthorization {
     pub(crate) access_key_hash: String,
-    pub(crate) expires_at: u64,
+    pub(crate) verified_at: u64,
+    pub(crate) refresh_after: u64,
+    pub(crate) subscription_expires_at: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -57,6 +63,7 @@ pub(crate) struct BootstrapInfo {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RuntimeStatus {
+    pub(crate) native_instance_id: String,
     pub(crate) bridge: String,
     pub(crate) core_installed: bool,
     pub(crate) tunnel_active: bool,
@@ -79,6 +86,19 @@ pub(crate) struct RuntimeStatus {
     pub(crate) proxy_bypass: Option<String>,
     pub(crate) network_mode: Option<String>,
     pub(crate) tun_interface_name: Option<String>,
+    pub(crate) xray_pid: Option<u32>,
+    pub(crate) runtime_config_hash: Option<String>,
+    pub(crate) operation: Option<OperationStatus>,
+    pub(crate) last_operation: Option<OperationStatus>,
+    pub(crate) runtime_revision: u64,
+    pub(crate) subscription_state: String,
+    pub(crate) subscription_refresh_after: Option<u64>,
+    pub(crate) reconnect_attempt: u8,
+    pub(crate) proxy_ownership: String,
+    pub(crate) proxy_auto_config_url: Option<String>,
+    pub(crate) proxy_auto_detect: bool,
+    pub(crate) route_ownership: String,
+    pub(crate) owned_routes: Vec<OwnedRoute>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +110,10 @@ pub(crate) struct ProxyStatus {
     pub(crate) method: String,
     pub(crate) scope: String,
     pub(crate) checked_at: String,
+    #[serde(default)]
+    pub(crate) auto_config_url: Option<String>,
+    #[serde(default)]
+    pub(crate) auto_detect: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,24 +170,29 @@ pub(crate) struct RuntimeTemplate {
     pub(crate) remarks: Option<String>,
     pub(crate) full_config: Option<Value>,
     pub(crate) primary_outbound_tag: Option<String>,
+    pub(crate) profile_kind: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SplitTunnelEntryPayload {
     pub(crate) kind: String,
     pub(crate) value: String,
     pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) policy: Option<String>,
 }
 
+#[derive(Debug)]
 pub(crate) struct SplitTunnelRulePlan {
     pub(crate) process_matches: Vec<String>,
+    pub(crate) direct_process_matches: Vec<String>,
     pub(crate) resolved_apps: usize,
     pub(crate) resolved_services: usize,
     pub(crate) skipped_notes: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
 pub(crate) struct RoutingExclusionSettingsPayload {
@@ -181,16 +210,6 @@ pub(crate) struct RoutingExclusionRulePlan {
     pub(crate) skipped_notes: Vec<String>,
 }
 
-#[cfg(target_os = "windows")]
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ServiceLookupInfo {
-    pub(crate) name: String,
-    pub(crate) display_name: String,
-    pub(crate) exe_path: String,
-    pub(crate) is_shared_host: bool,
-}
-
 #[derive(Debug, Deserialize)]
 pub(crate) struct IpifyResponse {
     pub(crate) ip: String,
@@ -202,4 +221,6 @@ pub(crate) struct IpifyResponse {
 pub(crate) struct DefaultRouteSnapshot {
     pub(crate) interface_index: u32,
     pub(crate) next_hop: String,
+    pub(crate) interface_alias: String,
+    pub(crate) source_ip: String,
 }

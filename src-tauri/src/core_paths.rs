@@ -1,6 +1,9 @@
 use super::*;
 
-pub(crate) fn build_http_client(proxy_url: Option<&str>, timeout: Duration) -> Result<reqwest::blocking::Client, String> {
+pub(crate) fn build_http_client(
+    proxy_url: Option<&str>,
+    timeout: Duration,
+) -> Result<reqwest::blocking::Client, String> {
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -107,24 +110,40 @@ pub(crate) fn looks_like_launch_root(path: &Path) -> bool {
 
 #[allow(dead_code)]
 pub(crate) fn looks_like_tauri_subdir(path: &Path) -> bool {
-    matches!(path.file_name().and_then(|name| name.to_str()), Some("src-tauri") | Some("target") | Some("debug") | Some("release"))
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("src-tauri") | Some("target") | Some("debug") | Some("release")
+    )
 }
 
 #[allow(dead_code)]
 pub(crate) fn normalize_log_base_candidate(path: PathBuf) -> PathBuf {
     let mut candidate = path;
 
-    if matches!(candidate.file_name().and_then(|name| name.to_str()), Some("src-tauri")) {
+    if matches!(
+        candidate.file_name().and_then(|name| name.to_str()),
+        Some("src-tauri")
+    ) {
         if let Some(parent) = candidate.parent() {
             candidate = parent.to_path_buf();
         }
     }
 
-    if matches!(candidate.file_name().and_then(|name| name.to_str()), Some("debug") | Some("release")) {
-        if let Some(project_root) = candidate.parent().and_then(|path| path.parent()).and_then(|path| path.parent()) {
+    if matches!(
+        candidate.file_name().and_then(|name| name.to_str()),
+        Some("debug") | Some("release")
+    ) {
+        if let Some(project_root) = candidate
+            .parent()
+            .and_then(|path| path.parent())
+            .and_then(|path| path.parent())
+        {
             candidate = project_root.to_path_buf();
         }
-    } else if matches!(candidate.file_name().and_then(|name| name.to_str()), Some("target")) {
+    } else if matches!(
+        candidate.file_name().and_then(|name| name.to_str()),
+        Some("target")
+    ) {
         if let Some(project_root) = candidate.parent().and_then(|path| path.parent()) {
             candidate = project_root.to_path_buf();
         }
@@ -144,34 +163,32 @@ pub(crate) fn push_candidate_dir(candidates: &mut Vec<PathBuf>, value: Option<Pa
 }
 
 pub(crate) fn app_logs_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let base = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| format!("Не удалось определить каталог данных приложения для логов: {error}"))?;
+    let base = app.path().app_local_data_dir().map_err(|error| {
+        format!("Не удалось определить каталог данных приложения для логов: {error}")
+    })?;
     let logs_root = base.join("logs");
-    fs::create_dir_all(&logs_root)
+    ensure_safe_log_directory(&logs_root)
         .map_err(|error| format!("Не удалось создать logs каталог в app data: {error}"))?;
     Ok(logs_root)
 }
 
-
 pub(crate) fn daily_log_root(app: &AppHandle) -> Result<PathBuf, String> {
     let root = app_logs_base_dir(app)?.join(local_day_folder_name());
-    fs::create_dir_all(&root)
+    ensure_safe_log_directory(&root)
         .map_err(|error| format!("Не удалось создать каталог логов дня: {error}"))?;
     Ok(root)
 }
 
 pub(crate) fn interface_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let path = daily_log_root(app)?.join("Interface");
-    fs::create_dir_all(&path)
+    ensure_safe_log_directory(&path)
         .map_err(|error| format!("Не удалось создать Interface каталог: {error}"))?;
     Ok(path)
 }
 
 pub(crate) fn routing_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let path = daily_log_root(app)?.join("routing");
-    fs::create_dir_all(&path)
+    ensure_safe_log_directory(&path)
         .map_err(|error| format!("Не удалось создать routing каталог: {error}"))?;
     Ok(path)
 }
@@ -184,15 +201,8 @@ pub(crate) fn routing_event_log_path(app: &AppHandle) -> Result<PathBuf, String>
     Ok(routing_logs_dir(app)?.join("routing.log"))
 }
 
-
-pub(crate) fn ensure_log_file(path: &PathBuf) -> Result<(), String> {
-    if path.exists() {
-        return Ok(());
-    }
-
-    File::create(path)
-        .map(|_| ())
-        .map_err(|error| format!("Не удалось создать лог-файл {}: {error}", path.display()))
+pub(crate) fn ensure_log_file(path: &Path) -> Result<(), String> {
+    validate_or_create_log(path)
 }
 
 pub(crate) fn ensure_log_tree(app: &AppHandle) -> Result<(), String> {
@@ -207,28 +217,44 @@ pub(crate) fn ensure_log_tree(app: &AppHandle) -> Result<(), String> {
 }
 
 pub(crate) fn redact_sensitive(input: &str) -> String {
-    let mut result = input.to_string();
-    for scheme in ["vless://", "vmess://", "trojan://", "ss://", "hy2://", "hysteria2://"] {
-        while let Some(start) = result.to_ascii_lowercase().find(scheme) {
-            let end = result[start..]
+    // Scan each token once instead of repeatedly copying/scanning the full body.
+    // Remote subscriptions are bounded to 2 MiB, but may contain many links.
+    let mut result = String::with_capacity(input.len());
+    for token in input.split_inclusive(char::is_whitespace) {
+        let lower = token.to_ascii_lowercase();
+        let first = [
+            "vless://",
+            "vmess://",
+            "trojan://",
+            "ss://",
+            "hy2://",
+            "hysteria2://",
+            "https://",
+            "http://",
+            "wss://",
+        ]
+        .iter()
+        .filter_map(|scheme| lower.find(scheme).map(|start| (start, *scheme)))
+        .min_by_key(|(start, _)| *start);
+        if let Some((start, scheme)) = first {
+            let end = token[start..]
                 .find(char::is_whitespace)
                 .map(|offset| start + offset)
-                .unwrap_or(result.len());
-            result.replace_range(start..end, "[redacted-vpn-link]");
-        }
-    }
-
-    for sub_host in ["https://sub.vkarmani.com/"] {
-        while let Some(start) = result.to_ascii_lowercase().find(sub_host) {
-            let end = result[start..]
-                .find(char::is_whitespace)
-                .map(|offset| start + offset)
-                .unwrap_or(result.len());
-            result.replace_range(start..end, "[redacted-key]");
+                .unwrap_or(token.len());
+            result.push_str(&token[..start]);
+            result.push_str(if ["https://", "http://", "wss://"].contains(&scheme) {
+                "[redacted-key]"
+            } else {
+                "[redacted-vpn-link]"
+            });
+            result.push_str(&token[end..]);
+        } else {
+            result.push_str(token);
         }
     }
 
     let mut output = String::with_capacity(result.len());
+    let mut mask_remainder = false;
     for token in result.split_whitespace() {
         let trimmed = token.trim_matches(|c: char| {
             !c.is_ascii_alphanumeric()
@@ -241,7 +267,7 @@ pub(crate) fn redact_sensitive(input: &str) -> String {
                 && c != '?'
                 && c != '&'
         });
-        let lower = trimmed.to_ascii_lowercase();
+        let lower = trimmed.to_ascii_lowercase().replace(['"', '\''], "");
         let contains_secret_marker = [
             "access_key=",
             "access-key=",
@@ -255,29 +281,52 @@ pub(crate) fn redact_sensitive(input: &str) -> String {
             "sub=",
             "subscription=",
             "token=",
+            "userid:",
+            "user_id:",
+            "accesskey:",
+            "password:",
+            "token:",
+            "secret:",
+            "authorization:",
+            "cookie:",
+            "set-cookie:",
         ]
         .iter()
         .any(|marker| lower.contains(marker));
         let looks_like_uuid = trimmed.len() == 36
             && trimmed.chars().filter(|c| *c == '-').count() == 4
             && trimmed.chars().filter(|c| c.is_ascii_hexdigit()).count() == 32;
-        let should_mask = contains_secret_marker
+        let header = lower == "bearer"
+            || lower == "basic"
+            || lower.starts_with("authorization:")
+            || lower.starts_with("cookie:")
+            || lower.starts_with("set-cookie:");
+        let should_mask = mask_remainder
+            || header
+            || contains_secret_marker
             || looks_like_uuid
             || (trimmed.len() >= 28
-                && trimmed.chars().filter(|c| c.is_ascii_alphanumeric()).count() >= 20
-                && (trimmed.contains('-') || trimmed.contains('_') || trimmed.contains('=') || trimmed.contains("http")));
+                && trimmed
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .count()
+                    >= 20
+                && (trimmed.contains('-')
+                    || trimmed.contains('_')
+                    || trimmed.contains('=')
+                    || trimmed.contains("http")));
 
-        let rendered = if contains_secret_marker {
+        let rendered = if mask_remainder || header || contains_secret_marker || looks_like_uuid {
             token.replace(trimmed, "[redacted-secret]")
         } else if should_mask {
-            let prefix: String = trimmed.chars().take(6).collect();
-            let suffix_rev: String = trimmed.chars().rev().take(4).collect();
-            let suffix: String = suffix_rev.chars().rev().collect();
-            token.replace(trimmed, &format!("{prefix}…{suffix}"))
+            token.replace(trimmed, "[redacted-token]")
         } else {
             token.to_string()
         };
 
+        if header || contains_secret_marker {
+            mask_remainder = true;
+        }
         if !output.is_empty() {
             output.push(' ');
         }
@@ -287,15 +336,16 @@ pub(crate) fn redact_sensitive(input: &str) -> String {
     output
 }
 
-pub(crate) fn append_log_line(path: &PathBuf, scope: &str, line: &str) -> Result<(), String> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| format!("Не удалось открыть лог-файл {}: {error}", path.display()))?;
-
-    writeln!(file, "[{}] [{}] {}", log_timestamp_string(), scope, redact_sensitive(line))
-        .map_err(|error| format!("Не удалось записать лог {}: {error}", path.display()))
+pub(crate) fn append_log_line(path: &Path, scope: &str, line: &str) -> Result<(), String> {
+    append_bounded_log(
+        path,
+        &format!(
+            "[{}] [{}] {}",
+            log_timestamp_string(),
+            scope,
+            redact_sensitive(&line.chars().take(4096).collect::<String>())
+        ),
+    )
 }
 
 pub(crate) fn append_interface_event(app: &AppHandle, line: &str) -> Result<(), String> {
@@ -315,84 +365,52 @@ pub(crate) fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 
 pub(crate) fn sha256_hex_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 pub(crate) fn sha256_file_hex(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path)
-        .map_err(|error| format!("не удалось открыть файл для sha256 {}: {error}", path.display()))?;
+    let mut file = File::open(path).map_err(|error| {
+        format!(
+            "не удалось открыть файл для sha256 {}: {error}",
+            path.display()
+        )
+    })?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
 
     loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("не удалось прочитать файл для sha256 {}: {error}", path.display()))?;
+        let read = file.read(&mut buffer).map_err(|error| {
+            format!(
+                "не удалось прочитать файл для sha256 {}: {error}",
+                path.display()
+            )
+        })?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
     }
 
-    Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>())
-}
-
-pub(crate) fn manifest_expected_sha256(manifest_path: &Path, file_name: &str) -> Result<String, String> {
-    let raw = fs::read_to_string(manifest_path)
-        .map_err(|error| format!("не удалось прочитать core-manifest.json: {error}"))?;
-    // Windows PowerShell 5 writes UTF-8 with BOM when using Set-Content -Encoding UTF8.
-    // serde_json expects JSON to start directly with `{`/`[`, so strip BOM defensively.
-    let raw = raw.trim_start_matches('\u{feff}');
-    let manifest: Value = serde_json::from_str(raw)
-        .map_err(|error| format!("не удалось разобрать core-manifest.json: {error}"))?;
-
-    let files = manifest
-        .get("files")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "core-manifest.json не содержит массив files".to_string())?;
-
-    for item in files {
-        let Some(name) = item.get("file").and_then(Value::as_str) else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case(file_name) {
-            return item
-                .get("sha256")
-                .and_then(Value::as_str)
-                .map(|value| value.to_ascii_lowercase())
-                .filter(|value| value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
-                .ok_or_else(|| format!("core-manifest.json содержит некорректный sha256 для {file_name}"));
-        }
-    }
-
-    Err(format!("core-manifest.json не содержит запись для {file_name}"))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>())
 }
 
 pub(crate) fn verify_core_manifest_artifact(path: &Path, file_name: &str) -> Result<(), String> {
-    let manifest_path = path
-        .parent()
-        .ok_or_else(|| format!("не удалось определить папку для {file_name}"))?
-        .join("core-manifest.json");
-
-    if !manifest_path.exists() {
-        #[cfg(debug_assertions)]
-        {
-            return Ok(());
-        }
-
-        #[cfg(not(debug_assertions))]
-        {
-            return Err(format!(
-                "рядом с {file_name} нет core-manifest.json; release-сборка не запускает непроверенный Xray-core"
-            ));
-        }
+    // The neighboring manifest is metadata, not a mutable execution authority.
+    let (expected_size, expected) = compiled_artifact_identity(file_name)?;
+    if fs::metadata(path).map_err(|_| "CORE_METADATA")?.len() != expected_size {
+        return Err("CORE_SIZE_MISMATCH".into());
     }
-
-    let expected = manifest_expected_sha256(&manifest_path, file_name)?;
     let actual = sha256_file_hex(path)?.to_ascii_lowercase();
     if actual != expected {
         return Err(format!(
-            "sha256 {file_name} не совпадает с core-manifest.json: ожидалось {expected}, получено {actual}"
+            "sha256 {file_name} не совпадает с compiled manifest pin: ожидалось {expected}, получено {actual}"
         ));
     }
 
@@ -405,20 +423,24 @@ pub(crate) fn validate_core_sidecar_path(path: &Path, label: &str) -> Result<(),
 }
 
 pub(crate) fn validate_pe_binary(path: &Path, label: &str) -> Result<(), String> {
-    let mut file = File::open(path)
-        .map_err(|error| format!("не удалось открыть {label}: {error}"))?;
+    let mut file =
+        File::open(path).map_err(|error| format!("не удалось открыть {label}: {error}"))?;
     let mut header = [0u8; 4096];
     let read = file
         .read(&mut header)
         .map_err(|error| format!("не удалось прочитать PE-заголовок {label}: {error}"))?;
 
     if read < 256 {
-        return Err(format!("повреждённый PE-файл: слишком короткий заголовок, прочитано {read} байт"));
+        return Err(format!(
+            "повреждённый PE-файл: слишком короткий заголовок, прочитано {read} байт"
+        ));
     }
 
     if &header[0..2] != b"MZ" {
-        if &header[0..4] == [0, 0, 0, 0] && &header[4..6] == b"MZ" {
-            return Err("повреждённый PE-файл: перед сигнатурой MZ есть 4 лишних нулевых байта".to_string());
+        if header[0..4] == [0, 0, 0, 0] && &header[4..6] == b"MZ" {
+            return Err(
+                "повреждённый PE-файл: перед сигнатурой MZ есть 4 лишних нулевых байта".to_string(),
+            );
         }
         if header.starts_with(b"version https://git-lfs") {
             return Err("вместо настоящего xray.exe упакован Git LFS pointer; включите checkout lfs:true в GitHub Actions и пересоберите релиз".to_string());
@@ -429,18 +451,26 @@ pub(crate) fn validate_pe_binary(path: &Path, label: &str) -> Result<(), String>
         ));
     }
 
-    let pe_offset = u32::from_le_bytes([header[0x3c], header[0x3d], header[0x3e], header[0x3f]]) as usize;
+    let pe_offset =
+        u32::from_le_bytes([header[0x3c], header[0x3d], header[0x3e], header[0x3f]]) as usize;
     if !(64..=8192).contains(&pe_offset) {
-        return Err(format!("повреждённый PE-файл: некорректный offset PE-заголовка {pe_offset}"));
+        return Err(format!(
+            "повреждённый PE-файл: некорректный offset PE-заголовка {pe_offset}"
+        ));
     }
     if pe_offset + 26 > read {
-        return Err(format!("повреждённый PE-файл: PE-заголовок обрывается на offset {pe_offset}"));
+        return Err(format!(
+            "повреждённый PE-файл: PE-заголовок обрывается на offset {pe_offset}"
+        ));
     }
 
     if &header[pe_offset..pe_offset + 4] != b"PE\0\0" {
         return Err(format!(
             "повреждённый PE-файл: ожидалась сигнатура PE, получено {:02X} {:02X} {:02X} {:02X}",
-            header[pe_offset], header[pe_offset + 1], header[pe_offset + 2], header[pe_offset + 3]
+            header[pe_offset],
+            header[pe_offset + 1],
+            header[pe_offset + 2],
+            header[pe_offset + 3]
         ));
     }
 
@@ -451,7 +481,8 @@ pub(crate) fn validate_pe_binary(path: &Path, label: &str) -> Result<(), String>
         ));
     }
 
-    let optional_header_magic = u16::from_le_bytes([header[pe_offset + 24], header[pe_offset + 25]]);
+    let optional_header_magic =
+        u16::from_le_bytes([header[pe_offset + 24], header[pe_offset + 25]]);
     if optional_header_magic != PE32_PLUS_MAGIC {
         return Err(format!(
             "неподходящий PE-файл: {label} должен быть PE32+ x64, optional_header=0x{optional_header_magic:04X}"
@@ -479,9 +510,9 @@ pub(crate) fn format_xray_spawn_error(error: &std::io::Error, core_path: &Path) 
 #[cfg(target_os = "windows")]
 pub(crate) fn ensure_core_launchable(path: &Path) -> Result<(), String> {
     validate_core_path(path)?;
-    let core_working_dir = path.parent().ok_or_else(|| {
-        "Не удалось определить рабочую папку Xray-core для проверки запуска.".to_string()
-    })?;
+    let prepared = prepare_core_launch(path, None)?;
+    let path = prepared.core.as_path();
+    let core_working_dir = path.parent().ok_or("CORE_DIRECTORY_MISSING")?;
 
     let mut command = Command::new(path);
     command
@@ -492,17 +523,7 @@ pub(crate) fn ensure_core_launchable(path: &Path) -> Result<(), String> {
         .stderr(Stdio::null());
     hide_child_console(&mut command);
 
-    let status = command
-        .status()
-        .map_err(|error| format_xray_spawn_error(&error, path))?;
-
-    if !status.success() {
-        return Err(format!(
-            "Xray-core найден, но проверка xray.exe version завершилась с кодом {:?}. Путь: {}",
-            status.code(),
-            path.display()
-        ));
-    }
+    run_command_with_timeout(command, Duration::from_secs(5), "Xray version preflight")?;
 
     Ok(())
 }
@@ -513,8 +534,8 @@ pub(crate) fn ensure_core_launchable(path: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn validate_core_path(path: &Path) -> Result<(), String> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("не удалось проверить файл: {error}"))?;
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("не удалось проверить файл: {error}"))?;
     if !metadata.is_file() {
         return Err("это не файл".to_string());
     }
@@ -539,7 +560,10 @@ pub(crate) fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
 
     if let Ok(resource_dir) = app.path().resource_dir() {
         // New fixed bundle mapping: tauri.conf.json maps resources directly to $RESOURCE/core/windows.
-        push_unique_path(&mut paths, resource_dir.join("core").join("windows").join("xray.exe"));
+        push_unique_path(
+            &mut paths,
+            resource_dir.join("core").join("windows").join("xray.exe"),
+        );
 
         // Backward compatibility for older builds that used "../resources/..." in list mode.
         // Tauri stores ".." segments under "_up_", so users updating from a broken build can still be recovered.
@@ -577,7 +601,10 @@ pub(crate) fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
                 .join("windows")
                 .join("xray.exe"),
         );
-        push_unique_path(&mut paths, current_dir.join("src-tauri").join("bin").join("xray.exe"));
+        push_unique_path(
+            &mut paths,
+            current_dir.join("src-tauri").join("bin").join("xray.exe"),
+        );
     }
 
     if let Ok(executable) = std::env::current_exe() {
@@ -590,7 +617,10 @@ pub(crate) fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
                     .join("windows")
                     .join("xray.exe"),
             );
-            push_unique_path(&mut paths, parent.join("core").join("windows").join("xray.exe"));
+            push_unique_path(
+                &mut paths,
+                parent.join("core").join("windows").join("xray.exe"),
+            );
         }
     }
 
@@ -635,40 +665,6 @@ pub(crate) fn resolve_core_sidecar_path(core_path: &Path, file_name: &str) -> Op
     core_path.parent().map(|dir| dir.join(file_name))
 }
 
-pub(crate) fn read_runtime_log_excerpt(path: &Path, lines: usize) -> Vec<String> {
-    const MAX_EXCERPT_BYTES: u64 = 128 * 1024;
-
-    let Ok(mut file) = File::open(path) else {
-        return Vec::new();
-    };
-    let file_len = file.metadata().map(|metadata| metadata.len()).unwrap_or_default();
-    let start = file_len.saturating_sub(MAX_EXCERPT_BYTES);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return Vec::new();
-    }
-
-    let mut content = String::new();
-    if file.read_to_string(&mut content).is_err() {
-        return Vec::new();
-    }
-    if start > 0 {
-        if let Some(first_newline) = content.find('\n') {
-            content = content[first_newline + 1..].to_string();
-        }
-    }
-
-    content
-        .lines()
-        .rev()
-        .take(lines)
-        .map(|line| line.trim().to_string())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-}
-
 #[cfg(target_os = "windows")]
 pub(crate) fn harden_runtime_output_dir(path: &Path) {
     let path_string = path.to_string_lossy().to_string();
@@ -706,20 +702,14 @@ pub(crate) fn runtime_output_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("Не удалось определить каталог данных: {error}"))?;
 
     let path = base.join("runtime");
-    fs::create_dir_all(&path).map_err(|error| format!("Не удалось создать runtime каталог: {error}"))?;
+    fs::create_dir_all(&path)
+        .map_err(|error| format!("Не удалось создать runtime каталог: {error}"))?;
     harden_runtime_output_dir(&path);
     Ok(path)
 }
 
-pub(crate) fn cleanup_runtime_config_files(app: &AppHandle) -> Result<(), String> {
-    let dir = runtime_output_dir(app)?;
-    for entry in fs::read_dir(&dir).map_err(|error| format!("Не удалось прочитать runtime каталог: {error}"))? {
-        let path = entry.map_err(|error| format!("Не удалось прочитать runtime файл: {error}"))?.path();
-        let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
-        if name.starts_with("xray-config") && name.ends_with(".json") {
-            let _ = fs::remove_file(path);
-        }
-    }
+pub(crate) fn cleanup_runtime_config_files(_app: &AppHandle) -> Result<(), String> {
+    // Other instances may use matching files. Lifecycle removes only its exact config.
     Ok(())
 }
 
@@ -730,47 +720,6 @@ pub(crate) fn runtime_log_path(app: &AppHandle) -> Result<PathBuf, String> {
 pub(crate) fn append_runtime_event(app: &AppHandle, line: &str) -> Result<(), String> {
     let log_path = routing_event_log_path(app)?;
     append_log_line(&log_path, "ROUTING", line)
-}
-
-pub(crate) fn tail_runtime_log(app: &AppHandle, lines: usize) -> Result<Vec<String>, String> {
-    const MAX_TAIL_BYTES: u64 = 256 * 1024;
-
-    let log_path = runtime_log_path(app)?;
-    if !log_path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut file = File::open(&log_path)
-        .map_err(|error| format!("Не удалось открыть лог runtime: {error}"))?;
-    let file_len = file
-        .metadata()
-        .map_err(|error| format!("Не удалось прочитать размер runtime log: {error}"))?
-        .len();
-    let start = file_len.saturating_sub(MAX_TAIL_BYTES);
-    file.seek(SeekFrom::Start(start))
-        .map_err(|error| format!("Не удалось перейти к хвосту runtime log: {error}"))?;
-
-    let mut content = String::new();
-    file.read_to_string(&mut content)
-        .map_err(|error| format!("Не удалось прочитать хвост runtime log: {error}"))?;
-
-    if start > 0 {
-        if let Some(first_newline) = content.find('\n') {
-            content = content[first_newline + 1..].to_string();
-        }
-    }
-
-    let collected = content
-        .lines()
-        .rev()
-        .take(lines)
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-
-    Ok(collected)
 }
 
 pub(crate) fn strip_windows_exe_suffix(value: &str) -> String {
@@ -861,6 +810,9 @@ pub(crate) fn process_match_candidates(value: &str) -> Vec<String> {
         push_unique_process_match(&mut candidates, backslash_path.to_ascii_lowercase());
     }
 
+    if has_path {
+        return candidates;
+    } // A full path never expands to all same-named exe files.
     let file_name = normalized
         .rsplit('/')
         .next()
@@ -883,122 +835,6 @@ pub(crate) fn process_match_candidates(value: &str) -> Vec<String> {
     }
 
     candidates
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn resolve_service_process_match(service_value: &str) -> Result<Option<(String, String)>, String> {
-    let service_name = service_value.trim();
-    if service_name.is_empty() {
-        return Ok(None);
-    }
-
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'Stop'
-$name = '{}'
-$service = Get-CimInstance Win32_Service | Where-Object {{ $_.Name -ieq $name -or $_.DisplayName -ieq $name }} | Select-Object -First 1 Name, DisplayName, PathName
-if (-not $service) {{
-  ''
-  exit 0
-}}
-$raw = [Environment]::ExpandEnvironmentVariables([string]$service.PathName)
-$exe = $null
-if ($raw -match '^\s*"([^"]+?\.exe)"') {{
-  $exe = $Matches[1]
-}} elseif ($raw -match '^\s*([^ ]+?\.exe)\b') {{
-  $exe = $Matches[1]
-}} elseif ($raw -match '([A-Za-z]:\\[^\"]+?\.exe)') {{
-  $exe = $Matches[1]
-}}
-if (-not $exe) {{
-  $exe = $raw
-}}
-$exe = $exe.Replace('\\', '/')
-$fileName = [System.IO.Path]::GetFileName($exe)
-[pscustomobject]@{{
-  name = $service.Name
-  displayName = $service.DisplayName
-  exePath = $exe
-  isSharedHost = ($fileName -ieq 'svchost.exe') -or ($fileName -ieq 'services.exe')
-}} | ConvertTo-Json -Compress
-"#,
-        ps_quote(service_name)
-    );
-
-    let raw = run_powershell(&script)?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-
-    let payload = serde_json::from_str::<ServiceLookupInfo>(trimmed)
-        .map_err(|error| format!("Не удалось разобрать описание службы {}: {error}", service_name))?;
-
-    if payload.is_shared_host {
-        return Ok(None);
-    }
-
-    let normalized = normalize_process_match(&payload.exe_path);
-    Ok(normalized.map(|value| {
-        (
-            value,
-            format!("{} ({})", payload.name, payload.display_name),
-        )
-    }))
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn resolve_service_process_match(_service_value: &str) -> Result<Option<(String, String)>, String> {
-    Ok(None)
-}
-
-pub(crate) fn build_split_tunnel_rule_plan(entries: &[SplitTunnelEntryPayload]) -> SplitTunnelRulePlan {
-    let mut process_matches = Vec::new();
-    let mut resolved_apps = 0usize;
-    let mut resolved_services = 0usize;
-    let mut skipped_notes = Vec::new();
-
-    for entry in entries.iter().filter(|item| item.enabled) {
-        let raw_value = entry.value.trim();
-        if raw_value.is_empty() {
-            continue;
-        }
-
-        match entry.kind.to_ascii_lowercase().as_str() {
-            "service" => match resolve_service_process_match(raw_value) {
-                Ok(Some((resolved, _label))) => {
-                    let mut added_any = false;
-                    for candidate in process_match_candidates(&resolved) {
-                        added_any |= push_unique_process_match(&mut process_matches, candidate);
-                    }
-                    if added_any {
-                        resolved_services += 1;
-                    }
-                }
-                Ok(None) => skipped_notes.push(format!(
-                    "Служба {} пропущена: Xray может точно разделять только службы с собственным exe-файлом, а не общие svchost/services процессы.",
-                    raw_value
-                )),
-                Err(error) => skipped_notes.push(error),
-            },
-            _ => {
-                let mut added_any = false;
-                for candidate in process_match_candidates(raw_value) {
-                    added_any |= push_unique_process_match(&mut process_matches, candidate);
-                }
-                if added_any {
-                    resolved_apps += 1;
-                }
-            }
-        }
-    }
-
-    SplitTunnelRulePlan {
-        process_matches,
-        resolved_apps,
-        resolved_services,
-        skipped_notes,
-    }
 }
 
 pub(crate) fn private_bypass_cidrs() -> Vec<&'static str> {

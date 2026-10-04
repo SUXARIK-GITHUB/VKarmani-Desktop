@@ -2128,3 +2128,23 @@ html.vk-window-dragging *::after {
     font-size: 10.5px !important;
   }
 }
+
+/* VKarmani 0.13.70: guard against 940–980px WebView layout collapse.
+   At this width the sidebar is hidden, so the workspace must not keep a 96px sidebar column. */
+@media (min-width: 940px) and (max-width: 980px) {
+  .workspace-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .content-area,
+  .content-area.overview-content-area {
+    grid-column: 1 / -1 !important;
+    min-width: 0 !important;
+    width: 100% !important;
+  }
+
+  .vk-sidebar,
+  .sidebar-nav {
+    display: none !important;
+  }
+}

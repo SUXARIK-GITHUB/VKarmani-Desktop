@@ -1,0 +1,9 @@
+.vk-modal-card.split-tunnel-modal { display:flex; flex-direction:column; overflow:hidden; padding:0; }
+.split-tunnel-modal .vk-modal-header { flex:none; }
+.split-tunnel-modal .vk-modal-scroll { min-height:0; overflow-y:auto; }
+.split-tunnel-modal .policy-toolbar { display:grid; grid-template-columns:minmax(0,1fr) minmax(100px,160px); gap:12px; margin-bottom:16px; }
+.split-tunnel-modal select { max-width:100%; color:var(--vk-text,#dce7f7); background:#151a25; border:1px solid #303a4d; border-radius:8px; padding:7px 10px; }
+.split-tunnel-modal .split-entry select { margin-top:6px; }
+.split-tunnel-modal .policy-warning { color:#f3c578; }
+.split-tunnel-modal .running-app-row:disabled { opacity:.55; cursor:not-allowed; }
+@media(max-width:600px) { .split-tunnel-modal .policy-toolbar { grid-template-columns:minmax(0,1fr); } }

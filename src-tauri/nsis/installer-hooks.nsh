@@ -2,14 +2,33 @@
 ; Tauri creates the normal shortcuts using productName = "VKarmani".
 ; Hooks keep upgrades clean and remove legacy duplicate shortcuts.
 
-!macro NSIS_HOOK_PREINSTALL
-  ; Stop a running Xray process before replacing bundled core files.
-  ; If xray.exe is locked during updater/install, Windows can leave a stale or corrupted core file.
-  nsExec::ExecToLog 'taskkill /F /IM xray.exe /T'
+!include "LogicLib.nsh"
+!macro VKARMANI_REQUIRE_UNLOCKED FILE
+  ${If} ${FileExists} "${FILE}"
+  System::Call 'kernel32::CreateFileW(w "${FILE}", i 0x40000000, i 3, p 0, i 3, i 0, p 0) p.r0'
+  ${If} $0 == -1
+    MessageBox MB_OK|MB_ICONEXCLAMATION "Close VKarmani and its runtime before installing or uninstalling. A bundled file is busy or cannot be replaced. No Xray processes were terminated."
+    Abort
+  ${EndIf}
+  System::Call 'kernel32::CloseHandle(p r0)'
+  ${EndIf}
+!macroend
 
-  ; Force a clean copy of runtime core files on reinstall/update.
-  ; The app stores user settings in AppData, not in $INSTDIR\core.
-  RMDir /r "$INSTDIR\core"
+!macro VKARMANI_CHECK_CORE_UNLOCKED
+  !insertmacro VKARMANI_REQUIRE_UNLOCKED "$INSTDIR\core\windows\xray.exe"
+  !insertmacro VKARMANI_REQUIRE_UNLOCKED "$INSTDIR\core\windows\wintun.dll"
+  !insertmacro VKARMANI_REQUIRE_UNLOCKED "$INSTDIR\core\windows\geoip.dat"
+  !insertmacro VKARMANI_REQUIRE_UNLOCKED "$INSTDIR\core\windows\geosite.dat"
+!macroend
+
+!macro NSIS_HOOK_PREINSTALL
+  ; Application cleanup owns its exact child/job. Installer has no authority
+  ; over name/path-matched processes, or an entire pre-existing core directory.
+  !insertmacro VKARMANI_CHECK_CORE_UNLOCKED
+!macroend
+
+!macro NSIS_HOOK_PREUNINSTALL
+  !insertmacro VKARMANI_CHECK_CORE_UNLOCKED
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL

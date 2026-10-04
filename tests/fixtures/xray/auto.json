@@ -1,0 +1,20 @@
+{
+  "remarks": "Автовыбор / General pool",
+  "dns": { "servers": ["https+local://1.1.1.1/dns-query"], "queryStrategy": "UseIPv4", "hosts": {} },
+  "outbounds": [
+    { "tag": "pool-a", "protocol": "vless", "settings": { "vnext": [{ "address": "a.example.com", "port": 443, "users": [{ "id": "123e4567-e89b-12d3-a456-426614174000", "encryption": "none" }] }] }, "streamSettings": { "network": "tcp", "security": "tls", "tlsSettings": { "serverName": "a.example.com" } } },
+    { "tag": "pool-b", "protocol": "trojan", "settings": { "servers": [{ "address": "b.example.com", "port": 443, "password": "synthetic-password" }] }, "streamSettings": { "network": "tcp", "security": "tls", "tlsSettings": { "serverName": "b.example.com" } } },
+    { "tag": "direct", "protocol": "freedom", "settings": {} }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "balancers": [{ "tag": "general-choice", "selector": ["pool-"], "strategy": { "type": "leastLoad", "settings": { "expected": 1 } }, "fallbackTag": "pool-b" }],
+    "rules": [
+      { "type": "field", "domain": ["domain:example.org"], "outboundTag": "direct" },
+      { "type": "field", "network": "tcp,udp", "balancerTag": "general-choice" }
+    ]
+  },
+  "burstObservatory": { "subjectSelector": ["pool-"], "pingConfig": { "destination": "https://example.com/", "connectivity": "https://example.org/", "interval": "1h", "sampling": 2, "timeout": "5s" } },
+  "policy": { "levels": { "0": { "handshake": 4, "connIdle": 300 } } },
+  "futureExtension": { "nullValue": null, "emptyString": "", "emptyList": [], "unicode": "Россия 🌍" }
+}

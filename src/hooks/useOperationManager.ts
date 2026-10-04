@@ -1,5 +1,5 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
-import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { OperationOwnership } from '../utils/operationOwnership';
 
 export type OperationName = string;
 
@@ -25,9 +25,9 @@ const DEFAULT_CONFLICTS: ConflictMap = {
 };
 
 const DEFAULT_OPERATION_TIMEOUTS_MS: OperationTimeoutMap = {
-  connect: 70000,
+  connect: 90000,
   disconnect: 26000,
-  reconnect: 80000,
+  reconnect: 90000,
   updateCheck: 25000,
   updateInstall: 120000,
   proxy: 22000,
@@ -41,31 +41,14 @@ const DEFAULT_OPERATION_TIMEOUTS_MS: OperationTimeoutMap = {
   logout: 26000
 };
 
-function releaseBusyOperation(
-  operation: OperationName,
-  busyActionsRef: MutableRefObject<Record<OperationName, boolean>>,
-  setBusyActions: Dispatch<SetStateAction<Record<OperationName, boolean>>>
-) {
-  if (!busyActionsRef.current[operation]) {
-    return;
-  }
-
-  const nextBusyActions = { ...busyActionsRef.current };
-  delete nextBusyActions[operation];
-  busyActionsRef.current = nextBusyActions;
-  setBusyActions((current) => {
-    if (!current[operation]) {
-      return current;
-    }
-    const next = { ...current };
-    delete next[operation];
-    return next;
-  });
-}
-
 export function useOperationManager(customConflicts: ConflictMap = DEFAULT_CONFLICTS) {
   const conflicts = useMemo(() => customConflicts, [customConflicts]);
   const [busyActions, setBusyActions] = useState<Record<OperationName, boolean>>({});
+  const ownership = useRef(new OperationOwnership());
+  const mounted=useRef(true);
+  const timers=useRef(new Set<number>());
+  useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;for(const timer of timers.current)window.clearTimeout(timer);timers.current.clear();};},[]);
+  const publish=useCallback(()=>{const next=ownership.current.snapshot();busyActionsRef.current=next;if(mounted.current)setBusyActions(next);},[]);
   const busyActionsRef = useRef<Record<OperationName, boolean>>({});
 
   const isBusy = useCallback((operation: OperationName) => Boolean(busyActionsRef.current[operation]), []);
@@ -79,12 +62,9 @@ export function useOperationManager(customConflicts: ConflictMap = DEFAULT_CONFL
   }, [conflicts]);
 
   const run = useCallback(async <T,>(operation: OperationName, task: () => Promise<T>): Promise<T | null> => {
-    if (hasConflict(operation)) {
-      return null;
-    }
-
-    busyActionsRef.current = { ...busyActionsRef.current, [operation]: true };
-    setBusyActions((current) => ({ ...current, [operation]: true }));
+    const token=ownership.current.acquire(operation,conflicts);
+    if(token===null)return null;
+    publish();
 
     let watchdog: number | undefined;
     const timeoutMs = DEFAULT_OPERATION_TIMEOUTS_MS[operation] ?? 30000;
@@ -92,8 +72,9 @@ export function useOperationManager(customConflicts: ConflictMap = DEFAULT_CONFL
     try {
       if (typeof window !== 'undefined') {
         watchdog = window.setTimeout(() => {
-          releaseBusyOperation(operation, busyActionsRef, setBusyActions);
+          if(ownership.current.release(operation,token))publish();
         }, timeoutMs + 2500);
+        timers.current.add(watchdog);
       }
 
       const taskPromise = task();
@@ -106,10 +87,11 @@ export function useOperationManager(customConflicts: ConflictMap = DEFAULT_CONFL
     } finally {
       if (watchdog !== undefined) {
         window.clearTimeout(watchdog);
+        timers.current.delete(watchdog);
       }
-      releaseBusyOperation(operation, busyActionsRef, setBusyActions);
+      if(ownership.current.release(operation,token))publish();
     }
-  }, [hasConflict]);
+  }, [conflicts,publish]);
 
   return {
     busyActions,

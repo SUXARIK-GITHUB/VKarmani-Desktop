@@ -1,4 +1,5 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import {acceptRuntimeSnapshot, connectionFailureState} from './utils/runtimeSnapshot';
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { AppInfoModal } from './components/AppInfoModal';
 import { AuthScreen } from './components/AuthScreen';
 import { DiagnosticsTab } from './components/DiagnosticsTab';
@@ -19,10 +20,11 @@ import { useToastManager } from './hooks/useToastManager';
 import { useSyncedRef } from './hooks/useSyncedRef';
 import { buildDiagnosticsFilename, createSafeDiagnosticsPayload, downloadTextFile } from './utils/diagnosticsExport';
 import { sleep } from './utils/async';
+import { insertRule, rulesOverlap } from './utils/appPolicies';
 import { buildTrafficBars, formatTrafficBytes } from './utils/traffic';
 import { assertNativeRuntimeServerMatches, runtimeConfirmsTargetServer } from './services/connectionGuards';
 import { pickPreferredServer, rankServersForDisplay } from './utils/serverSorting';
-import { buildServerRuntimeFingerprint, isVpnServerLike } from './utils/serverIdentity';
+import { buildServerRuntimeFingerprint, isVpnServerLike, resolveServerReference, migrateServerReferences } from './utils/serverIdentity';
 import { remnawaveClient } from './services/remnawave';
 import {
   appVersion,
@@ -85,6 +87,7 @@ import type {
   SessionRecord,
   TrafficSnapshot,
   SplitTunnelEntry,
+  RoutingPolicy,
   UpdateInfo,
   VpnServer
 } from './types/vpn';
@@ -111,7 +114,7 @@ export default function App() {
   const [sessionHistory, setSessionHistory] = useState<SessionRecord[]>([]);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsSnapshot | null>(null);
   const [profileSyncInfo, setProfileSyncInfo] = useState<ProfileSyncInfo>(remnawaveClient.getProfileSyncInfo());
-  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>({
+  const [runtimeStatus, setRuntimeStatusState] = useState<RuntimeStatus>({
     bridge: isTauriRuntime ? 'tauri' : 'web-preview',
     coreInstalled: false,
     tunnelActive: false,
@@ -172,7 +175,13 @@ export default function App() {
   const splitTunnelEntriesRef = useSyncedRef(splitTunnelEntries);
   const favoriteServerIdsRef = useSyncedRef(favoriteServerIds);
   const proxyStatusRef = useSyncedRef(proxyStatus);
-  const runtimeStatusRef = useSyncedRef(runtimeStatus);
+  const runtimeStatusRef = useRef(runtimeStatus);
+  const setRuntimeStatus = useCallback((value: RuntimeStatus | ((current: RuntimeStatus)=>RuntimeStatus)) => {
+    const current = runtimeStatusRef.current;
+    const next = acceptRuntimeSnapshot(current, typeof value === 'function' ? value(current) : value);
+    runtimeStatusRef.current = next;
+    setRuntimeStatusState(next);
+  }, []);
   const managedReconnectRef = useRef<{ targetServerId: string; previousServerId: string; startedAt: number } | null>(null);
   const runtimeStopIgnoreUntilRef = useRef(0);
   const connectionAttemptSeqRef = useRef(0);
@@ -230,6 +239,7 @@ export default function App() {
         return;
       }
 
+      const recoveryAttempt = nextConnectionAttemptId();
       connectionActionLock.current = false;
       connectionQueueFlushRunning.current = false;
       finishManagedReconnect();
@@ -239,7 +249,7 @@ export default function App() {
       );
 
       void refreshDiagnosticsAndRuntime().then((runtime) => {
-        if (connectionStateRef.current !== observedState) {
+        if (!isConnectionAttemptCurrent(recoveryAttempt) || connectionStateRef.current !== observedState) {
           return;
         }
 
@@ -250,7 +260,7 @@ export default function App() {
           selectedServerIdRef.current = runtimeServerId;
           setSelectedServerId(runtimeServerId);
           setConnectionStateSafe('connected');
-        } else {
+        } else if (connectionFailureState(runtime, recoveryAttempt, connectionAttemptSeqRef.current) === 'idle') {
           setConnectionStateSafe('idle');
           setVpnExternalIp('—');
           setConnectivityProbe(null);
@@ -509,7 +519,7 @@ export default function App() {
     };
 
     void updateTraffic();
-    timer = window.setInterval(() => void updateTraffic(), 4000);
+    timer = window.setInterval(() => void updateTraffic(), 15000);
 
     return () => {
       cancelled = true;
@@ -677,8 +687,15 @@ export default function App() {
             return;
           }
 
+          connectionActionLock.current = false;
+          connectionQueueFlushRunning.current = false;
+          connectionQueueFlushScheduled.current = false;
+          managedReconnectRef.current = null;
+          runtimeStopIgnoreUntilRef.current = 0;
+          clearPendingConnectionQueue();
           lastRuntimeTunnelActive.current = false;
           lostRuntimePollCount.current = 0;
+          postConnectProbeInFlight.current = false;
           setConnectedServerId('');
           connectedServerIdRef.current = '';
           setConnectionStateSafe('idle');
@@ -696,7 +713,7 @@ export default function App() {
           lastNativeRuntimeStopToastAt.current = now;
 
           pushToast(
-            tr(language, 'Xray остановился. Клиент обновил состояние без автоматического переподключения.', 'Xray stopped. The client refreshed state without automatic reconnect.'),
+            tr(language, 'Xray остановился после неудачного автовосстановления. Клиент обновил состояние.', 'Xray stopped after automatic recovery failed. The client refreshed state.'),
             'error'
           );
         });
@@ -744,13 +761,14 @@ export default function App() {
           return;
         }
 
+        if (acceptRuntimeSnapshot(runtimeStatusRef.current, nextRuntime) !== nextRuntime) return;
         const lostTunnel = lastRuntimeTunnelActive.current && !nextRuntime.tunnelActive;
 
         setRuntimeStatus(nextRuntime);
         setDiagnostics(nextDiagnostics);
         setProxyStatus(nextProxy);
 
-        if (!nextRuntime.tunnelActive && shouldIgnoreNativeRuntimeStop()) {
+        if (!nextRuntime.tunnelActive && (nextRuntime.operation || connectionActionLock.current)) {
           void writeNativeRoutingLog('Runtime snapshot временно неактивен во время управляемого подключения/переключения, состояние UI не сбрасываем.');
           return;
         }
@@ -767,8 +785,8 @@ export default function App() {
 
         if (lostTunnel && connectionStateRef.current === 'connected') {
           lostRuntimePollCount.current += 1;
-          if (lostRuntimePollCount.current < 2) {
-            void writeNativeRoutingLog('Runtime snapshot временно неактивен, ждём повторную проверку без переподключения.', `miss=${lostRuntimePollCount.current}`);
+          if (lostRuntimePollCount.current < 4) {
+            void writeNativeRoutingLog('Runtime snapshot временно неактивен, ждём дополнительные проверки/автовосстановление без сброса UI.', `miss=${lostRuntimePollCount.current}`);
             return;
           }
         } else {
@@ -784,22 +802,11 @@ export default function App() {
           return;
         }
 
-        if (nextRuntime.systemProxyEnabled) {
-          try {
-            const restoredProxy = await remnawaveClient.applySystemProxy(false);
-            if (!disposed) {
-              setProxyStatus(restoredProxy);
-            }
-          } catch {
-            // ignore follow-up proxy restore failure here
-          }
-        }
-
         setVpnExternalIp('—');
         setConnectivityProbe(null);
         setSessionDuration(0);
         void refreshPrimaryExternalIp();
-        pushToast(tr(language, 'Runtime остановился или потерял соединение. Состояние клиента обновлено.', 'Runtime stopped or lost connectivity. Client state was refreshed.'), 'error');
+        pushToast(tr(language, 'Runtime остановился или потерял соединение после попыток автовосстановления. Состояние клиента обновлено.', 'Runtime stopped or lost connectivity after recovery attempts. Client state was refreshed.'), 'error');
       } catch {
         // keep last known state
       } finally {
@@ -821,10 +828,19 @@ export default function App() {
   }, [connectionState, language]);
 
   useEffect(() => {
+    if (persistentStateReady) {
+      setFavoriteServerIds((current) => {
+        const migrated = migrateServerReferences(servers, current);
+        if (migrated.join('\0') === current.join('\0')) return current;
+        favoriteServerIdsRef.current = migrated;
+        return migrated;
+      });
+    }
     setSelectedServerId((current: string) => {
-      if (servers.some((server: VpnServer) => server.id === current)) {
-        selectedServerIdRef.current = current;
-        return current;
+      const resolved = resolveServerReference(servers, current);
+      if (resolved) {
+        selectedServerIdRef.current = resolved.id;
+        return resolved.id;
       }
 
       // Во время активного подключения/переключения нельзя автоматически прыгать
@@ -839,11 +855,11 @@ export default function App() {
       selectedServerIdRef.current = nextId;
       return nextId;
     });
-  }, [servers, settings.protocolStrategy]);
+  }, [servers, settings.protocolStrategy, persistentStateReady]);
 
 
   const selectedServer = useMemo(
-    () => servers.find((server: VpnServer) => server.id === selectedServerId) ?? null,
+    () => resolveServerReference(servers, selectedServerId),
     [servers, selectedServerId]
   );
 
@@ -854,7 +870,7 @@ export default function App() {
 
   const visibleSelectedServer = useMemo(
     () => (connectionState === 'connected'
-      ? servers.find((server: VpnServer) => server.id === activeConnectionServerId) ?? selectedServer
+      ? resolveServerReference(servers, activeConnectionServerId) ?? selectedServer
       : selectedServer),
     [activeConnectionServerId, connectionState, selectedServer, servers]
   );
@@ -863,7 +879,8 @@ export default function App() {
       id: entry.id,
       kind: entry.kind,
       value: entry.value.trim(),
-      enabled: entry.enabled
+      enabled: entry.enabled,
+      policy: entry.policy ?? 'VPN'
     }))),
     [splitTunnelEntries]
   );
@@ -993,6 +1010,7 @@ export default function App() {
     try {
       const { runtime, diagnostics: nextDiagnostics, proxyStatus: nextProxy } = await remnawaveClient.loadRuntimeSnapshot();
 
+      if (acceptRuntimeSnapshot(runtimeStatusRef.current, runtime) !== runtime) return null;
       setRuntimeStatus(runtime);
       setDiagnostics(nextDiagnostics);
       setProxyStatus(nextProxy);
@@ -1147,7 +1165,7 @@ export default function App() {
   }
 
   function getServerById(serverId: string) {
-    return serversRef.current.find((server: VpnServer) => server.id === serverId) ?? null;
+    return resolveServerReference(serversRef.current, serverId);
   }
 
   function isActionBusy(action: string) {
@@ -1368,59 +1386,34 @@ export default function App() {
     }
   }
 
-  function handleAddSplitTunnelEntry(kind: SplitTunnelEntry['kind'], rawValue: string) {
-    const normalized = rawValue.trim();
-    if (!normalized) {
-      pushToast(
-        kind === 'app'
-          ? tr(language, 'Укажите exe-файл или путь к программе.', 'Enter an exe name or a program path.')
-          : tr(language, 'Укажите имя службы Windows.', 'Enter a Windows service name.'),
-        'info'
-      );
+  function handleAddSplitTunnelEntry(kind: SplitTunnelEntry['kind'], rawValue: string, policy: RoutingPolicy = 'VPN') {
+    try {
+      const next = insertRule(splitTunnelEntriesRef.current, kind, rawValue, policy, crypto.randomUUID());
+      splitTunnelEntriesRef.current = next;
+      setSplitTunnelEntries(next);
+      pushToast(tr(language, 'Правило добавлено.', 'Rule added.'), 'success');
+      return true;
+    } catch {
+      pushToast(tr(language, 'Проверьте exe/имя службы, лимит 256 и пересечение существующих правил.', 'Check the exe/service identity, the 256-rule limit and overlapping rules.'), 'info');
       return false;
     }
+  }
 
-    const key = `${kind}:${normalized.toLowerCase()}`;
-    let created = false;
-
-    setSplitTunnelEntries((current: SplitTunnelEntry[]) => {
-      if (current.some((entry: SplitTunnelEntry) => `${entry.kind}:${entry.value.toLowerCase()}` === key)) {
-        return current;
-      }
-
-      created = true;
-      return [
-        ...current,
-        {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          kind,
-          value: normalized,
-          enabled: true
-        }
-      ];
-    });
-
-    pushToast(
-      created
-        ? kind === 'app'
-          ? tr(language, 'Программа добавлена в список TUN.', 'Program added to the TUN list.')
-          : tr(language, 'Служба добавлена в список TUN.', 'Service added to the TUN list.')
-        : tr(language, 'Такая запись уже есть в списке.', 'This entry already exists in the list.'),
-      created ? 'success' : 'info'
-    );
-
-    if (created) {
-      void writeNativeInterfaceLog(
-        kind === 'app' ? 'Добавлена программа в TUN список.' : 'Добавлена служба в TUN список.',
-        normalized
-      );
+  function handleChangeSplitTunnelPolicy(entryId: string, policy: RoutingPolicy) {
+    const current = splitTunnelEntriesRef.current;
+    const selected = current.find(entry => entry.id === entryId);
+    if (!selected) return;
+    if (current.some(entry => entry.id !== entryId && entry.enabled && selected.enabled && (entry.policy ?? 'VPN') !== policy && rulesOverlap(entry, selected))) {
+      pushToast(tr(language, 'VPN и DIRECT пересекаются для этой программы.', 'VPN and DIRECT overlap for this application.'), 'info');
+      return;
     }
-
-    return created;
+    const next = current.map(entry => entry.id === entryId ? { ...entry, policy } : entry);
+    splitTunnelEntriesRef.current = next;
+    setSplitTunnelEntries(next);
   }
 
   function handleToggleSplitTunnelEntry(entryId: string) {
-    const nextEntry = splitTunnelEntries.find((entry: SplitTunnelEntry) => entry.id === entryId) ?? null;
+    const nextEntry = splitTunnelEntriesRef.current.find((entry: SplitTunnelEntry) => entry.id === entryId) ?? null;
     if (nextEntry) {
       void writeNativeInterfaceLog(
         nextEntry.enabled ? 'Правило TUN отключено.' : 'Правило TUN включено.',
@@ -1428,20 +1421,20 @@ export default function App() {
       );
     }
 
-    setSplitTunnelEntries((current: SplitTunnelEntry[]) => current.map((entry: SplitTunnelEntry) => (
-      entry.id === entryId
-        ? { ...entry, enabled: !entry.enabled }
-        : entry
-    )));
+    const next = splitTunnelEntriesRef.current.map(entry=>entry.id===entryId?{...entry,enabled:!entry.enabled}:entry);
+    splitTunnelEntriesRef.current=next;
+    setSplitTunnelEntries(next);
   }
 
   function handleRemoveSplitTunnelEntry(entryId: string) {
-    const removedEntry = splitTunnelEntries.find((entry: SplitTunnelEntry) => entry.id === entryId) ?? null;
+    const removedEntry = splitTunnelEntriesRef.current.find((entry: SplitTunnelEntry) => entry.id === entryId) ?? null;
     if (removedEntry) {
       void writeNativeInterfaceLog('Запись удалена из TUN списка.', `${removedEntry.kind}: ${removedEntry.value}`);
     }
 
-    setSplitTunnelEntries((current: SplitTunnelEntry[]) => current.filter((entry: SplitTunnelEntry) => entry.id !== entryId));
+    const next=splitTunnelEntriesRef.current.filter(entry=>entry.id!==entryId);
+    splitTunnelEntriesRef.current=next;
+    setSplitTunnelEntries(next);
     pushToast(tr(language, 'Запись удалена из списка TUN.', 'Entry removed from the TUN list.'), 'info');
   }
 
@@ -1491,12 +1484,12 @@ export default function App() {
     void refreshRunningAppsForSplitTunnel();
   }
 
-  async function handlePickExecutableForSplitTunnel() {
+  async function handlePickExecutableForSplitTunnel(policy: RoutingPolicy = 'VPN') {
     await runActionOnce('pickExecutable', async () => {
       try {
         const pickedPath = await pickNativeExecutablePath();
         if (pickedPath) {
-          handleAddSplitTunnelEntry('app', pickedPath);
+          handleAddSplitTunnelEntry('app', pickedPath, policy);
         }
       } catch (error) {
         pushToast(
@@ -1910,7 +1903,7 @@ export default function App() {
       serversRef.current = result.servers;
       setServers(result.servers);
       saveLastKnownServers(result.servers);
-      setFavoriteServerIds((current) => current.filter((id) => result.servers.some((server: VpnServer) => server.id === id)));
+      setFavoriteServerIds((current) => migrateServerReferences(result.servers, current).filter((id) => result.servers.some((server: VpnServer) => server.id === id)));
       setProfileSyncInfo(result.profile);
       const refreshedSession = remnawaveClient.getCachedSession();
       if (refreshedSession) {
@@ -2018,14 +2011,12 @@ export default function App() {
         serversRef.current = serverPool;
         setServers(serverPool);
         saveLastKnownServers(serverPool);
-        setFavoriteServerIds((current) => current.filter((id) => serverPool.some((server: VpnServer) => server.id === id)));
+        setFavoriteServerIds((current) => migrateServerReferences(serverPool, current).filter((id) => serverPool.some((server: VpnServer) => server.id === id)));
         setProfileSyncInfo(remnawaveClient.getProfileSyncInfo());
 
         const preferredServer = pickPreferredServer(serverPool, currentSettings.protocolStrategy);
         setSelectedServerId((current: string) => {
-          const nextId = serverPool.some((item: VpnServer) => item.id === current)
-            ? current
-            : preferredServer?.id ?? current;
+          const nextId = resolveServerReference(serverPool, current)?.id ?? preferredServer?.id ?? current;
           selectedServerIdRef.current = nextId;
           return nextId;
         });
@@ -2224,155 +2215,73 @@ export default function App() {
       );
       void writeNativeRoutingLog('Управляемое переключение сервера завершено успешно.', `${targetServer.country}, ${targetServer.city} | mode=${currentSettings.tunnelMode}`);
     } catch (error) {
-      const switchError = normalizeNativeError(
-        error,
-        tr(language, 'Не удалось переключить сервер.', 'Failed to switch server.')
-      );
-      let rollbackSucceeded = false;
-
-      if (rollbackSettings && Object.keys(rollbackSettings).length > 0) {
-        settingsRef.current = {
-          ...settingsRef.current,
-          ...rollbackSettings
-        };
-        setSettings((current: AppSettings) => ({
-          ...current,
-          ...rollbackSettings
-        }));
+      if (!isConnectionAttemptCurrent(attemptId)) return;
+      const switchError = normalizeNativeError(error, tr(language, 'Не удалось переключить сервер.', 'Failed to switch server.'));
+      const snapshot = await refreshDiagnosticsAndRuntime();
+      if (!isConnectionAttemptCurrent(attemptId)) return;
+      const recovery = connectionFailureState(snapshot, attemptId, connectionAttemptSeqRef.current, pendingDisconnectAfterBusyRef.current);
+      if ((recovery === 'active' || recovery === 'idle') && rollbackSettings && Object.keys(rollbackSettings).length > 0) {
+        settingsRef.current = { ...settingsRef.current, ...rollbackSettings };
+        setSettings(current => ({ ...current, ...rollbackSettings }));
       }
-
-      if (isNativeConnectStillRunningError(switchError.message)) {
-        void writeNativeRoutingLog('Native connect ещё выполняется после frontend timeout, rollback не запускаем чтобы не конфликтовать с Xray.', switchError.message);
-        let runtimeAfterTimeout: RuntimeStatus | null = null;
-        for (let waitStep = 0; waitStep < 6; waitStep += 1) {
-          await sleep(1500);
-          runtimeAfterTimeout = await refreshDiagnosticsAndRuntime();
-          if (runtimeAfterTimeout?.tunnelActive) {
-            break;
-          }
-        }
-        const runtimeServerId = runtimeAfterTimeout?.lastPreparedServerId || '';
-
-        if (runtimeConfirmsTargetServer(runtimeAfterTimeout, pendingTargetServer.id, buildServerRuntimeFingerprint(pendingTargetServer))) {
-          setConnectedServerId(pendingTargetServer.id);
-          connectedServerIdRef.current = pendingTargetServer.id;
-          selectedServerIdRef.current = pendingTargetServer.id;
-          setSelectedServerId(pendingTargetServer.id);
-          lastRuntimeTunnelActive.current = true;
-          lostRuntimePollCount.current = 0;
+      if (recovery === 'active') {
+        const active = serversRef.current.find(server => runtimeConfirmsTargetServer(snapshot, server.id, buildServerRuntimeFingerprint(server)));
+        if (active) {
+          connectedServerIdRef.current = active.id;
+          setConnectedServerId(active.id);
+          selectedServerIdRef.current = active.id;
+          setSelectedServerId(active.id);
           setConnectionStateSafe('connected');
-          pushToast(
-            `${tr(language, 'Переключение завершилось после ожидания Xray', 'Switch completed after waiting for Xray')}: ${pendingTargetServer.country}, ${pendingTargetServer.city}`,
-            'success'
-          );
-          return;
         }
-
-        if (runtimeAfterTimeout?.tunnelActive && rollbackServer?.id && runtimeServerId === rollbackServer.id) {
-          setConnectedServerId(rollbackServer.id);
-          connectedServerIdRef.current = rollbackServer.id;
-          selectedServerIdRef.current = rollbackServer.id;
-          setSelectedServerId(rollbackServer.id);
-          lastRuntimeTunnelActive.current = true;
-          lostRuntimePollCount.current = 0;
-          setConnectionStateSafe('connected');
-          pushToast(
-            tr(language, 'Xray не подтвердил новый сервер. Оставлено прежнее подключение.', 'Xray did not confirm the new server. The previous connection was kept.'),
-            'info'
-          );
-          return;
-        }
-
-        setConnectivityProbe(null);
-        setVpnExternalIp('—');
-        setSessionDuration(0);
-        setConnectedServerId('');
-        connectedServerIdRef.current = '';
-        setConnectionStateSafe('idle');
+        setErrorText(switchError.message);
         pushToast(switchError.message, 'error');
         return;
       }
-
-      if (rollbackServer?.id) {
-        selectedServerIdRef.current = rollbackServer.id;
-        setSelectedServerId(rollbackServer.id);
-      }
-
-      if (rollbackServer?.runtimeTemplate) {
-        try {
-          void writeNativeRoutingLog('Переключение сервера сорвалось, пробуем вернуть прежний сервер.', `${rollbackServer.country}, ${rollbackServer.city}`);
-          invalidateConnectionProbes();
-          setConnectionStateSafe('connecting');
-          await sleep(120);
-          const rollbackResponse = await remnawaveClient.connect(rollbackServer, {
-            useSystemProxy: shouldUseSystemProxy(settingsRef.current.tunnelMode, settingsRef.current.useSystemProxy),
-            probeAfterConnect: false,
-            tunnelMode: settingsRef.current.tunnelMode,
-            splitTunnelEntries: splitTunnelEntriesRef.current,
-            ipStack: settingsRef.current.ipStack,
-            routingExclusions: settingsRef.current.routingExclusions,
-            reconnect: true
-          });
-
-          const rollbackNativeServerId = rollbackResponse.runtime?.lastPreparedServerId;
-          assertNativeRuntimeServerMatches(
-            rollbackNativeServerId,
-            rollbackServer.id,
-            rollbackResponse.runtime?.lastPreparedServerFingerprint,
-            buildServerRuntimeFingerprint(rollbackServer)
-          );
-
-          setRuntimeStatus((current: RuntimeStatus) => rollbackResponse.runtime ?? current);
-          setConnectivityProbe(rollbackResponse.probe ?? null);
-          if (rollbackResponse.proxy) {
-            setProxyStatus(rollbackResponse.proxy);
-          }
-          setSessionDuration(0);
-          setConnectedServerId(rollbackServer.id);
-          connectedServerIdRef.current = rollbackServer.id;
-          setConnectionStateSafe('connected');
-          rollbackSucceeded = true;
-          lastRuntimeTunnelActive.current = true;
-          lostRuntimePollCount.current = 0;
-          runPostConnectProbe(rollbackServer);
-          void refreshDiagnosticsAndRuntime();
-          scheduleVpnIpRefreshForServer(rollbackServer.id, rollbackResponse.probe?.publicIp ?? rollbackResponse.externalIp);
-          pushToast(
-            tr(language, 'Новый сервер не подключился, прежнее подключение восстановлено.', 'The new server failed, the previous connection was restored.'),
-            'info'
-          );
-        } catch (rollbackError) {
-          void writeNativeRoutingLog(
-            'Rollback на прежний сервер тоже не удался.',
-            normalizeNativeError(rollbackError, 'rollback failed').message
-          );
-        }
-      }
-
-      if (!rollbackSucceeded) {
-        if (proxyStatusRef.current.enabled || shouldUseSystemProxy(settingsRef.current.tunnelMode, settingsRef.current.useSystemProxy)) {
-          try {
-            const restoredProxy = await remnawaveClient.applySystemProxy(false);
-            setProxyStatus(restoredProxy);
-          } catch {
-            // ignore follow-up proxy restore failure
-          }
-        }
-
-        setConnectivityProbe(null);
-        setVpnExternalIp('—');
-        setSessionDuration(0);
-        setConnectedServerId('');
-        connectedServerIdRef.current = '';
-        setConnectionStateSafe('idle');
-        await refreshDiagnosticsAndRuntime();
-        await refreshPrimaryExternalIp();
+      if (recovery !== 'idle') {
+        setErrorText(switchError.message);
         pushToast(switchError.message, 'error');
+        return;
       }
+      if (rollbackServer?.runtimeTemplate && !pendingDisconnectAfterBusyRef.current) {
+        try {
+          const response = await remnawaveClient.connect(rollbackServer, {
+            useSystemProxy: shouldUseSystemProxy(settingsRef.current.tunnelMode, settingsRef.current.useSystemProxy),
+            probeAfterConnect: false, tunnelMode: settingsRef.current.tunnelMode,
+            splitTunnelEntries: splitTunnelEntriesRef.current, ipStack: settingsRef.current.ipStack,
+            routingExclusions: settingsRef.current.routingExclusions, reconnect: true
+          });
+          if (!isConnectionAttemptCurrent(attemptId)) return;
+          assertNativeRuntimeServerMatches(response.runtime?.lastPreparedServerId, rollbackServer.id,
+            response.runtime?.lastPreparedServerFingerprint, buildServerRuntimeFingerprint(rollbackServer));
+          setRuntimeStatus(current => response.runtime ?? current);
+          if (response.proxy) setProxyStatus(response.proxy);
+          connectedServerIdRef.current = rollbackServer.id;
+          setConnectedServerId(rollbackServer.id);
+          selectedServerIdRef.current = rollbackServer.id;
+          setSelectedServerId(rollbackServer.id);
+          setConnectionStateSafe('connected');
+          runPostConnectProbe(rollbackServer);
+          pushToast(tr(language, 'Новый сервер не подключился, прежнее подключение восстановлено.', 'The new server failed, the previous connection was restored.'), 'info');
+          return;
+        } catch (rollbackError) {
+          if (!isConnectionAttemptCurrent(attemptId)) return;
+          void writeNativeRoutingLog('Rollback на прежний сервер тоже не удался.', normalizeNativeError(rollbackError, 'rollback failed').message);
+        }
+      }
+      const finalSnapshot = await refreshDiagnosticsAndRuntime();
+      if (!isConnectionAttemptCurrent(attemptId)) return;
+      if (connectionFailureState(finalSnapshot, attemptId, connectionAttemptSeqRef.current, pendingDisconnectAfterBusyRef.current) === 'idle') {
+        setConnectivityProbe(null); setVpnExternalIp('—'); setSessionDuration(0);
+        setConnectedServerId(''); connectedServerIdRef.current = ''; setConnectionStateSafe('idle');
+      }
+      setErrorText(switchError.message);
+      pushToast(switchError.message, 'error');
     } finally {
-      finishManagedReconnect();
-      connectionActionLock.current = false;
-      scheduleConnectionQueueFlush('after-reconnect');
+      if (isConnectionAttemptCurrent(attemptId)) {
+        finishManagedReconnect();
+        connectionActionLock.current = false;
+        scheduleConnectionQueueFlush('after-reconnect');
+      }
     }
   }
 
@@ -2646,57 +2555,30 @@ export default function App() {
         pushToast(`${tr(language, 'Подключено', 'Connected')}: ${targetServer.country}, ${targetServer.city}`, 'success');
         void writeNativeRoutingLog('VPN подключён успешно.', `${targetServer.country}, ${targetServer.city} | mode=${currentMode}`);
       } catch (error) {
+        if (!isConnectionAttemptCurrent(attemptId)) return;
         const normalizedError = normalizeNativeError(error, tr(language, 'Ошибка подключения.', 'Connection failed.'));
-        void writeNativeRoutingLog('Ошибка VPN подключения.', normalizedError.message);
-
-        if (isNativeConnectStillRunningError(normalizedError.message)) {
-          let runtimeAfterTimeout: RuntimeStatus | null = null;
-          for (let waitStep = 0; waitStep < 6; waitStep += 1) {
-            await sleep(1500);
-            runtimeAfterTimeout = await refreshDiagnosticsAndRuntime();
-            if (runtimeAfterTimeout?.tunnelActive) {
-              break;
-            }
-          }
-          const runtimeServerId = runtimeAfterTimeout?.lastPreparedServerId || '';
-
-          if (runtimeConfirmsTargetServer(runtimeAfterTimeout, targetServer.id, buildServerRuntimeFingerprint(targetServer))) {
-            setErrorText('');
-            setConnectedServerId(runtimeServerId);
-            connectedServerIdRef.current = runtimeServerId;
-            selectedServerIdRef.current = runtimeServerId;
-            setSelectedServerId(runtimeServerId);
-            lastRuntimeTunnelActive.current = true;
-            lostRuntimePollCount.current = 0;
+        const snapshot = await refreshDiagnosticsAndRuntime();
+        if (!isConnectionAttemptCurrent(attemptId)) return;
+        const recovery = connectionFailureState(snapshot, attemptId, connectionAttemptSeqRef.current, pendingDisconnectAfterBusyRef.current);
+        if (recovery === 'active') {
+          const active = serversRef.current.find(server => runtimeConfirmsTargetServer(snapshot, server.id, buildServerRuntimeFingerprint(server)));
+          if (active) {
+            setConnectedServerId(active.id); connectedServerIdRef.current = active.id;
             setConnectionStateSafe('connected');
-            pushToast(tr(language, 'Xray ответил с задержкой. Состояние подключения обновлено.', 'Xray answered with a delay. Connection state was refreshed.'), 'info');
-            return;
           }
+        } else if (recovery === 'idle') {
+          setVpnExternalIp('—'); setConnectivityProbe(null); setSessionDuration(0);
+          setConnectedServerId(''); connectedServerIdRef.current = ''; setConnectionStateSafe('idle');
         }
-
-        if (proxyStatusRef.current.enabled || shouldUseSystemProxy(settingsRef.current.tunnelMode, settingsRef.current.useSystemProxy)) {
-          try {
-            const restoredProxy = await remnawaveClient.applySystemProxy(false);
-            setProxyStatus(restoredProxy);
-          } catch {
-            // Backend cleanup still runs on request_disconnect/app exit; this is best-effort UI recovery.
-          }
-        }
-
         setErrorText(normalizedError.message);
-        setVpnExternalIp('—');
-        setConnectivityProbe(null);
-        setSessionDuration(0);
-        setConnectedServerId('');
-        connectedServerIdRef.current = '';
-        setConnectionStateSafe('idle');
-        await refreshDiagnosticsAndRuntime();
-        await refreshPrimaryExternalIp();
+        void writeNativeRoutingLog('Ошибка VPN подключения.', normalizedError.message);
         pushToast(normalizedError.message, 'error');
       }
     } finally {
-      connectionActionLock.current = false;
-      scheduleConnectionQueueFlush('after-connection-toggle');
+      if (isConnectionAttemptCurrent(attemptId)) {
+        connectionActionLock.current = false;
+        scheduleConnectionQueueFlush('after-connection-toggle');
+      }
     }
   }
 
@@ -2751,7 +2633,7 @@ export default function App() {
     let installSucceeded = false;
     void setNativeTrayUpdateState(Boolean(updateInfoRef.current.available), true);
     try {
-      if (connectionStateRef.current === 'connected') {
+      if (isTauriRuntime || connectionStateRef.current === 'connected') {
         setUpdateInfo((current: UpdateInfo) => ({
           ...current,
           status: 'installing',
@@ -2766,7 +2648,7 @@ export default function App() {
           setConnectionStateSafe('idle');
           await refreshDiagnosticsAndRuntime();
         } catch (error) {
-          setConnectionStateSafe('idle');
+          await refreshDiagnosticsAndRuntime().catch(() => undefined);
           const message = normalizeNativeError(error, tr(language, 'Не удалось остановить VPN перед обновлением.', 'Failed to stop VPN before update.')).message;
           setUpdateInfo((current: UpdateInfo) => ({
             ...current,
@@ -3135,6 +3017,8 @@ export default function App() {
         onClose={() => setIsSplitTunnelOpen(false)}
         onAddEntry={handleAddSplitTunnelEntry}
         onToggleEntry={handleToggleSplitTunnelEntry}
+        onChangePolicy={handleChangeSplitTunnelPolicy}
+        tunnelMode={settings.tunnelMode}
         onRemoveEntry={handleRemoveSplitTunnelEntry}
         onPickExecutable={handlePickExecutableForSplitTunnel}
         onRefreshRunningApps={refreshRunningAppsForSplitTunnel}

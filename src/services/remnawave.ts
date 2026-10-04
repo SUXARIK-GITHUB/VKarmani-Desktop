@@ -33,11 +33,12 @@ import {
   remnawaveSubscriptionUrl,
   requestNativeConnect,
   requestNativeDisconnect,
+  rollbackFailedNativeConnect,
   runNativeConnectivityProbe,
   setNativeSystemProxy
 } from './runtime';
 import { parseXrayJsonSubscriptionToServers } from './remnawave/subscriptionParser';
-import { assertNativeRuntimeServerMatches } from './connectionGuards';
+import { assertNativeRuntimeServerMatches, nativeConnectFailurePreservesRuntime } from './connectionGuards';
 import { buildServerRuntimeFingerprint } from '../utils/serverIdentity';
 
 const delay = (value: number) => new Promise<void>((resolve) => window.setTimeout(resolve, value));
@@ -684,6 +685,7 @@ function isRealMultiNodeSubscription(servers: VpnServer[]) {
 }
 
 function isPreferredUserFacingSubscription(result: ParsedXrayJsonProfileResult & { profileName?: string }) {
+  if (result.servers.some((server) => server.runtimeTemplate?.fullConfig)) return true;
   if (!isRealMultiNodeSubscription(result.servers)) {
     return false;
   }
@@ -697,6 +699,7 @@ function readyServerCount(servers: VpnServer[]) {
 }
 
 function shouldKeepPreviousFullProfile(previousServers: VpnServer[], importedServers: VpnServer[]) {
+  if (importedServers.some((server) => server.runtimeTemplate?.fullConfig)) return false;
   const previousReady = readyServerCount(previousServers);
   const importedReady = readyServerCount(importedServers);
 
@@ -718,7 +721,7 @@ function isSuspiciousSingleXrayJsonResult(
   result: (ParsedXrayJsonProfileResult & { score: number; profileName?: string }) | null,
   expectedMinimumServers = 0
 ) {
-  if (!result || result.servers.length !== 1) {
+  if (!result || result.servers.length !== 1 || result.servers.some((server) => server.runtimeTemplate?.fullConfig)) {
     return false;
   }
 
@@ -937,7 +940,9 @@ function proxyStatusFromRuntime(runtime: RuntimeStatus): ProxyStatus {
     enabled: Boolean(runtime.systemProxyEnabled),
     server: runtime.proxyServer,
     bypass: runtime.proxyBypass,
-    method: runtime.bridge === 'tauri' ? 'wininet-registry' : 'mock',
+    method: runtime.bridge === 'tauri' ? 'wininet-api' : 'mock',
+    autoConfigUrl: runtime.proxyAutoConfigUrl,
+    autoDetect: runtime.proxyAutoDetect,
     scope: 'current-user',
     checkedAt: new Date().toLocaleString('ru-RU')
   };
@@ -1203,12 +1208,12 @@ export class RemnawaveClient {
       const networkMode = options.tunnelMode ?? 'proxy';
       const ipStack = options.ipStack ?? 'ipv4';
       const activeSplitTunnelEntries = (options.splitTunnelEntries ?? []).filter((entry) => entry.enabled && entry.value.trim());
-      let runtimeStarted = false;
-      let systemProxyEnabled = false;
+      let startedConfigPath: string | undefined;
 
       try {
         const runtime = await requestNativeConnect(exists, networkMode, activeSplitTunnelEntries, ipStack, Boolean(options.reconnect), options.routingExclusions);
-        runtimeStarted = true;
+        startedConfigPath = runtime.configPath;
+        if (!startedConfigPath) throw new Error('Native runtime не подтвердил ownership config path.');
 
         assertNativeRuntimeServerMatches(
           runtime.lastPreparedServerId,
@@ -1219,8 +1224,7 @@ export class RemnawaveClient {
 
         let proxy: ProxyStatus | null = null;
         if (networkMode !== 'tun' && options.useSystemProxy) {
-          proxy = await setNativeSystemProxy(true);
-          systemProxyEnabled = Boolean(proxy.enabled);
+          proxy = await setNativeSystemProxy(true, startedConfigPath);
         }
 
         let probe: ConnectivityProbe | null = null;
@@ -1253,35 +1257,13 @@ export class RemnawaveClient {
         // и может усилить зависание/гонку при переключении сервера. Короткая занятость
         // runtime-lock тоже не означает, что новый сервер окончательно не стартовал:
         // App.tsx повторит старт выбранного сервера без rollback на случайный/старый узел.
-        if (nativeConnectStillRunning || runtimeTemporarilyBusy) {
+        if (nativeConnectStillRunning || runtimeTemporarilyBusy || nativeConnectFailurePreservesRuntime(errorMessage)) {
           throw error;
         }
 
-        // Даже если native connect упал до ответа, пробуем остановить Xray,
-        // чтобы не оставить сиротский процесс и включённый proxy/TUN после ошибки.
-        try {
-          await requestNativeDisconnect();
-        } catch {
-          window.setTimeout(() => {
-            void requestNativeDisconnect().catch(() => undefined);
-          }, 1200);
-        }
-
-        if (systemProxyEnabled) {
-          try {
-            await setNativeSystemProxy(false);
-          } catch {
-            // ignore cleanup failure here
-          }
-        }
-
-        if (runtimeStarted) {
-          try {
-            await requestNativeDisconnect();
-          } catch {
-            // ignore cleanup failure here
-          }
-        }
+        // Native owns partial-start rollback. A rejected connect must not issue
+        // a later disconnect that could cancel another operation or a preserved runtime.
+        if (startedConfigPath) await rollbackFailedNativeConnect(startedConfigPath).catch(() => undefined);
 
         throw error;
       }

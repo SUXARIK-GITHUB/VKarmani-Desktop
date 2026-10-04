@@ -8,12 +8,12 @@ const uuid = '123e4567-e89b-12d3-a456-426614174000';
 
 describe('Remnawave Xray JSON profile parser', () => {
   it('builds only Xray JSON profile endpoint candidates', () => {
-    const candidates = __remnawaveTest.buildXrayJsonUrlCandidates('https://sub.vkarmani.com/1NJDc37GHnsdRnvX', '1NJDc37GHnsdRnvX');
+    const candidates = __remnawaveTest.buildXrayJsonUrlCandidates('https://sub.vkarmani.com/syntheticQaKey16', 'syntheticQaKey16');
 
     expect(candidates).toEqual([
-      'https://sub.vkarmani.com/api/sub/1NJDc37GHnsdRnvX/json',
-      'https://sub.vkarmani.com/api/subscriptions/by-short-uuid/1NJDc37GHnsdRnvX/json',
-      'https://sub.vkarmani.com/1NJDc37GHnsdRnvX/json'
+      'https://sub.vkarmani.com/api/sub/syntheticQaKey16/json',
+      'https://sub.vkarmani.com/api/subscriptions/by-short-uuid/syntheticQaKey16/json',
+      'https://sub.vkarmani.com/syntheticQaKey16/json'
     ]);
     expect(candidates.every((url) => url.endsWith('/json'))).toBe(true);
   });
@@ -237,7 +237,7 @@ describe('Remnawave Xray JSON profile parser', () => {
   });
 
 
-  it('hides BADGER and MALLARD composite Xray JSON configs from the user-facing server list', () => {
+  it('keeps independent full configs even when their labels resemble internal codenames', () => {
     const outbound = (tag: string, host: string) => ({
       tag,
       protocol: 'vless',
@@ -264,17 +264,10 @@ describe('Remnawave Xray JSON profile parser', () => {
 
     const servers = __remnawaveTest.parseXrayJsonSubscriptionToServers(JSON.stringify(payload));
 
-    expect(servers).toHaveLength(7);
-    expect(servers.map((server) => server.rawLabel)).toEqual([
-      '🇵🇱 VKarmani Smart | MSK',
-      'Germany | All',
-      'Netherland | All',
-      'France | All',
-      'Sweden | All',
-      'United States | All',
-      'United Kingdom | All'
-    ]);
-    expect(servers.some((server) => /badger|mallard/i.test(`${server.rawLabel ?? ''} ${server.country} ${server.host ?? ''}`))).toBe(false);
+    // Full configs have no references between these entries. Names are not
+    // evidence of internal membership, so the new graph model keeps all nine.
+    expect(servers).toHaveLength(9);
+    expect(servers.map((server) => server.rawLabel)).toEqual(payload.map((config) => config.remarks));
   });
 
 

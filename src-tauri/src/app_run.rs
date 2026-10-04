@@ -11,7 +11,8 @@ pub(crate) fn build_tray_menu(
     update_busy: bool,
 ) -> tauri::Result<Menu<tauri::Wry>> {
     let show_item = MenuItem::with_id(app, "show", "Открыть VKarmani", true, None::<&str>)?;
-    let connect_item = MenuItem::with_id(app, "connect", "Быстрое подключение", true, None::<&str>)?;
+    let connect_item =
+        MenuItem::with_id(app, "connect", "Быстрое подключение", true, None::<&str>)?;
     let disconnect_item = MenuItem::with_id(app, "disconnect", "Отключиться", true, None::<&str>)?;
     let update_label = if update_busy {
         "Обновление: выполняется…"
@@ -20,9 +21,27 @@ pub(crate) fn build_tray_menu(
     } else {
         "Проверить обновления"
     };
-    let update_item = MenuItem::with_id(app, "update_action", update_label, !update_busy, None::<&str>)?;
-    let restart_app_item = MenuItem::with_id(app, "restart_app", "Перезапустить программу", true, None::<&str>)?;
-    let restart_proxy_item = MenuItem::with_id(app, "restart_proxy", "Перезапустить прокси", true, None::<&str>)?;
+    let update_item = MenuItem::with_id(
+        app,
+        "update_action",
+        update_label,
+        !update_busy,
+        None::<&str>,
+    )?;
+    let restart_app_item = MenuItem::with_id(
+        app,
+        "restart_app",
+        "Перезапустить программу",
+        true,
+        None::<&str>,
+    )?;
+    let restart_proxy_item = MenuItem::with_id(
+        app,
+        "restart_proxy",
+        "Перезапустить прокси",
+        true,
+        None::<&str>,
+    )?;
     let logout_item = MenuItem::with_id(app, "logout", "Выйти из ЛК", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
 
@@ -81,18 +100,33 @@ pub(crate) fn tray_runtime_flags(app: &AppHandle) -> (bool, bool, bool, bool, bo
         .map(|value| *value)
         .unwrap_or(false);
 
-    (connected, proxy_active, authorized, update_available, update_busy)
+    (
+        connected,
+        proxy_active,
+        authorized,
+        update_available,
+        update_busy,
+    )
 }
 
 pub(crate) fn refresh_tray_menu(app: &AppHandle) {
-    let (connected, proxy_active, authorized, update_available, update_busy) = tray_runtime_flags(app);
+    let (connected, proxy_active, authorized, update_available, update_busy) =
+        tray_runtime_flags(app);
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        match build_tray_menu(app, connected, proxy_active, authorized, update_available, update_busy) {
+        match build_tray_menu(
+            app,
+            connected,
+            proxy_active,
+            authorized,
+            update_available,
+            update_busy,
+        ) {
             Ok(menu) => {
                 let _ = tray.set_menu(Some(menu));
             }
             Err(error) => {
-                let _ = append_interface_event(app, &format!("Не удалось обновить меню трея: {error}"));
+                let _ =
+                    append_interface_event(app, &format!("Не удалось обновить меню трея: {error}"));
             }
         }
     }
@@ -106,26 +140,36 @@ pub fn run() {
     let builder = tauri::Builder::default();
 
     #[cfg(not(debug_assertions))]
-    let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-        let _ = append_interface_event(app, "Повторный запуск: активируем уже открытое окно VKarmani.");
-        reveal_main_window(app);
-        let _ = app.emit("vkarmani://tray-action", "show");
-    }));
+    let builder =
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let _ = append_interface_event(
+                app,
+                "Повторный запуск: активируем уже открытое окно VKarmani.",
+            );
+            reveal_main_window(app);
+            let _ = app.emit("vkarmani://tray-action", "show");
+        }));
 
     builder
         .manage(AppState::default())
         .setup(|app| {
-            let _ = interface_logs_dir(&app.handle());
-            let _ = routing_logs_dir(&app.handle());
-            let _ = ensure_log_tree(&app.handle());
-            let _ = cleanup_tun_routes(TUN_INTERFACE_NAME, &[]);
-            let _ = cleanup_runtime_config_files(&app.handle());
+            let _ = interface_logs_dir(app.handle());
+            let _ = routing_logs_dir(app.handle());
+            let _ = ensure_log_tree(app.handle());
+            let _ = cleanup_tun_routes_for_app(app.handle(), TUN_INTERFACE_NAME, &[]);
+            let _ = cleanup_runtime_config_files(app.handle());
             let state = app.state::<AppState>();
-            let _ = recover_orphaned_system_proxy(&app.handle(), &state, "startup_recovery");
+            let _ = recover_orphaned_system_proxy(app.handle(), &state, "startup_recovery");
             start_runtime_watchdog(app.handle().clone());
-            let _ = append_interface_event(&app.handle(), "Приложение запущено. Структура логов проверена.");
-            let _ = append_runtime_event(&app.handle(), "Routing/runtime лог инициализирован. Ожидание действий пользователя.");
-            let menu = build_tray_menu(&app.handle(), false, false, false, false, false)?;
+            let _ = append_interface_event(
+                app.handle(),
+                "Приложение запущено. Структура логов проверена.",
+            );
+            let _ = append_runtime_event(
+                app.handle(),
+                "Routing/runtime лог инициализирован. Ожидание действий пользователя.",
+            );
+            let menu = build_tray_menu(app.handle(), false, false, false, false, false)?;
 
             let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID);
             if let Some(icon) = app.default_window_icon() {
@@ -169,7 +213,11 @@ pub fn run() {
                         reveal_main_window(app);
                         let _ = app.emit(
                             "vkarmani://tray-action",
-                            if update_available { "install_update" } else { "check_updates" },
+                            if update_available {
+                                "install_update"
+                            } else {
+                                "check_updates"
+                            },
                         );
                     }
                     "restart_app" => {
@@ -190,7 +238,7 @@ pub fn run() {
                         let _ = append_interface_event(app, "Tray: выход из приложения.");
                         cleanup_application(app, "tray_quit");
                         app.exit(0)
-                    },
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -200,15 +248,16 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        reveal_main_window(&tray.app_handle());
+                        reveal_main_window(tray.app_handle());
                     }
                 })
                 .build(app)?;
 
-            reveal_main_window(&app.handle());
-            let _ = append_interface_event(&app.handle(), "Главное окно активировано при запуске.");
+            reveal_main_window(app.handle());
+            let _ = append_interface_event(app.handle(), "Главное окно активировано при запуске.");
 
-            app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -227,6 +276,7 @@ pub fn run() {
             set_tray_update_state,
             request_connect,
             request_disconnect,
+            rollback_failed_connect,
             cache_profile_sync,
             write_interface_log,
             write_routing_log,
@@ -249,6 +299,7 @@ pub fn run() {
             traffic_snapshot,
             read_runtime_log,
             list_running_apps,
+            list_windows_services,
             native_app_info,
             pick_executable_path,
             restart_application
