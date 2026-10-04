@@ -7,14 +7,15 @@ import { countActiveRoutingExclusions, normalizeRoutingDomainInput, normalizeRou
 interface SettingsTabProps {
   settings: AppSettings;
   language: UiLanguage;
-  onToggleSetting: (key: keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode' | 'ipStack' | 'routingExclusions'>) => void;
+  onToggleSetting: (key: keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode' | 'ipStack' | 'routingExclusions' | 'tunRoutingMode'>) => void;
   onTunnelModeChange: (value: AppSettings['tunnelMode']) => void;
   onIpStackChange: (value: AppSettings['ipStack']) => void;
+  onTunRoutingModeChange: (value: AppSettings['tunRoutingMode']) => void;
   onLanguageChange: (value: UiLanguage) => void;
   onRoutingExclusionsChange: (value: RoutingExclusionSettings) => void;
 }
 
-type ToggleKey = keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode' | 'ipStack' | 'routingExclusions'>;
+type ToggleKey = keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode' | 'ipStack' | 'routingExclusions' | 'tunRoutingMode'>;
 type SectionId = 'general' | 'network' | 'routes' | 'tunnel' | 'split' | 'proxy' | 'startup' | 'notifications' | 'diagnostics';
 
 interface ToggleItem {
@@ -91,7 +92,7 @@ function SettingsSection({ id, kicker, title, icon: Icon, children }: { id: Sect
   );
 }
 
-export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeChange, onIpStackChange, onLanguageChange, onRoutingExclusionsChange }: SettingsTabProps) {
+export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeChange, onIpStackChange, onTunRoutingModeChange, onLanguageChange, onRoutingExclusionsChange }: SettingsTabProps) {
   const [activeSection, setActiveSection] = useState<SectionId>('general');
   const scrollSpyFrameRef = useRef<number | null>(null);
   const nextLanguage: UiLanguage = language === 'ru' ? 'en' : 'ru';
@@ -342,6 +343,7 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
             {sections.network.map((item) => (
               <ToggleRow key={item.key} item={item} enabled={Boolean(settings[item.key])} onClick={() => onToggleSetting(item.key)} language={language} />
             ))}
+            <SimpleToggleRow title={tr(language, 'Сортировать серверы по пингу', 'Sort servers by ping')} description={tr(language, 'Сортирует серверы от меньшей задержки к большей. Если выключено, сохраняется порядок из подписки.', 'Sorts servers from lower to higher latency. When off, subscription order is preserved.')} icon={Wifi} enabled={settings.sortServersByPing} onClick={() => onToggleSetting('sortServersByPing')} language={language} />
           </div>
           <div className="settings-mode-card-inline">
             <div>
@@ -475,7 +477,7 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
             <div>
               <h4>{settings.tunnelMode === 'tun' ? 'TUN' : 'Proxy'}</h4>
               <p>{settings.tunnelMode === 'tun'
-                ? tr(language, 'TUN-режим шифрует выбранный системный трафик через VPN.', 'TUN mode routes selected system traffic through VPN.')
+                ? tr(language, 'TUN направляет трафик через VPN согласно выбранному режиму приложений.', 'TUN routes traffic through VPN according to the selected application mode.')
                 : tr(language, 'Proxy-режим использует локальные SOCKS/HTTP порты.', 'Proxy mode uses local SOCKS/HTTP ports.')}</p>
             </div>
             <div className="settings-mode-switch">
@@ -486,6 +488,7 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
         </SettingsSection>
 
         <SettingsSection id="split" kicker={tr(language, 'Раздельное туннелирование', 'Split tunneling')} title={tr(language, 'Маршрутизация приложений', 'App routing')} icon={Split}>
+          <label className="split-field"><span>{tr(language, 'Трафик TUN', 'TUN traffic')}</span><select value={settings.tunRoutingMode} onChange={event => onTunRoutingModeChange(event.target.value as AppSettings['tunRoutingMode'])}><option value="all">{tr(language, 'Все приложения', 'All applications')}</option><option value="selected">{tr(language, 'Только выбранные VPN-приложения', 'Selected VPN applications only')}</option><option value="exclude">{tr(language, 'Все, кроме DIRECT', 'All except DIRECT')}</option></select></label>
           <div className="settings-note-card">
             <strong>{tr(language, 'Раздельное туннелирование управляется на главном экране TUN-режима', 'Split tunneling is managed from the main TUN-mode screen')}</strong>
             <span>{tr(language, 'Здесь можно быстро переключить режим туннеля. Списки приложений и служб применяются при переподключении.', 'Here you can quickly switch tunnel mode. App and service lists apply on reconnect.')}</span>

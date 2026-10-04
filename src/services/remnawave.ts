@@ -950,6 +950,8 @@ function proxyStatusFromRuntime(runtime: RuntimeStatus): ProxyStatus {
 
 export class RemnawaveClient {
   private cachedServers: VpnServer[] = [];
+  private profileSyncGeneration = 0;
+  invalidateProfileSync() { this.profileSyncGeneration++; }
   private cachedSession: RemnawaveSession | null = null;
   private cachedDevices: DeviceRecord[] = [buildLocalDeviceRecord()];
   private profileSyncInfo: ProfileSyncInfo = {
@@ -1081,6 +1083,7 @@ export class RemnawaveClient {
   }
 
   async syncProfile(accessKey: string, allowDemoFallback = allowDemoFallbackByEnv) {
+    const generation = ++this.profileSyncGeneration;
     const key = resolveAccessKey(accessKey);
     const candidates = buildXrayJsonProfileCandidates(key, this.cachedSession);
     const previousServers = [...this.cachedServers];
@@ -1105,6 +1108,9 @@ export class RemnawaveClient {
       const keepPreviousProfile = shouldKeepPreviousFullProfile(previousServers, importedServers);
       const activeServers = keepPreviousProfile ? previousServers : importedServers;
 
+      if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
+      await cacheNativeProfileSync(activeServers.length, xrayJsonResult.url.includes('/api/sub/') ? 'Публичная Xray JSON подписка' : 'Panel API');
+      if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
       this.cachedServers = activeServers;
       const readyCount = readyServerCount(activeServers);
       this.profileSyncInfo = {
@@ -1121,12 +1127,13 @@ export class RemnawaveClient {
         accessKeyKind: key.kind
       };
 
-      await cacheNativeProfileSync(activeServers.length, this.profileSyncInfo.sourceLabel);
+
       return {
         servers: this.cachedServers,
         profile: this.profileSyncInfo
       };
     } catch (error) {
+      if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
       const message = error instanceof Error ? error.message : 'Не удалось синхронизировать профиль.';
       const restoredCount = previousServers.length;
       this.cachedServers = previousServers;
@@ -1181,6 +1188,7 @@ export class RemnawaveClient {
       useSystemProxy?: boolean;
       probeAfterConnect?: boolean;
       tunnelMode?: TunnelMode;
+      tunRoutingMode?: 'all' | 'selected' | 'exclude';
       splitTunnelEntries?: SplitTunnelEntry[];
       routingExclusions?: RoutingExclusionSettings;
       ipStack?: IpStack;
@@ -1202,16 +1210,19 @@ export class RemnawaveClient {
       throw new Error('Сервер не найден в активном профиле. Сначала обновите профиль или выберите другой узел.');
     }
 
-    this.cachedServers = [exists, ...this.cachedServers.filter((item) => item.id !== exists.id)];
+    this.cachedServers = this.cachedServers.some(item => item.id === exists.id)
+      ? this.cachedServers.map(item => item.id === exists.id ? exists : item)
+      : [...this.cachedServers, exists];
 
     if (isTauriRuntime) {
       const networkMode = options.tunnelMode ?? 'proxy';
       const ipStack = options.ipStack ?? 'ipv4';
-      const activeSplitTunnelEntries = (options.splitTunnelEntries ?? []).filter((entry) => entry.enabled && entry.value.trim());
+      const tunRoutingMode = options.tunRoutingMode ?? 'selected';
+      const activeSplitTunnelEntries = (options.splitTunnelEntries ?? []).filter((entry) => entry.enabled);
       let startedConfigPath: string | undefined;
 
       try {
-        const runtime = await requestNativeConnect(exists, networkMode, activeSplitTunnelEntries, ipStack, Boolean(options.reconnect), options.routingExclusions);
+        const runtime = await requestNativeConnect(exists, networkMode, activeSplitTunnelEntries, ipStack, Boolean(options.reconnect), options.routingExclusions, tunRoutingMode);
         startedConfigPath = runtime.configPath;
         if (!startedConfigPath) throw new Error('Native runtime не подтвердил ownership config path.');
 
@@ -1235,7 +1246,9 @@ export class RemnawaveClient {
         return {
           externalIp: probe?.publicIp ?? 'Определяется после проверки маршрута',
           dnsMode: networkMode === 'tun'
-            ? activeSplitTunnelEntries.length
+            ? tunRoutingMode !== 'selected'
+              ? `TUN → ${ipStack.toUpperCase()} → весь трафик через VPN, кроме DIRECT exclusions`
+              : activeSplitTunnelEntries.length
               ? `TUN режим → ${ipStack.toUpperCase()} → только выбранные программы и службы идут через VPN, остальное выходит напрямую`
               : `TUN режим → ${ipStack.toUpperCase()} → список маршрутизации пуст, поэтому обычный трафик остаётся прямым`
             : options.useSystemProxy

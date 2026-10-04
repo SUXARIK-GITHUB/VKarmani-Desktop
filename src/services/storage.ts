@@ -28,6 +28,8 @@ export const defaultSettings: AppSettings = {
   autoUpdate: true,
   autoInstallUpdates: false,
   themeGlow: true,
+  sortServersByPing: false,
+  tunRoutingMode: 'all',
   releaseChannel: 'stable',
   protocolStrategy: 'auto',
   profileSyncOnLogin: true,
@@ -40,13 +42,13 @@ export const defaultSettings: AppSettings = {
   routingExclusions: { ...defaultRoutingExclusions, domains: [], ips: [] }
 };
 
-function normalizeStoredSettings(value: unknown): AppSettings {
+export function normalizeStoredSettings(value: unknown, hasLegacyRules = false): AppSettings {
   if (!value || typeof value !== 'object') {
-    return defaultSettings;
+    return { ...defaultSettings, tunRoutingMode: hasLegacyRules ? 'selected' : 'all' };
   }
 
   const candidate = value as Partial<AppSettings>;
-  const booleanKeys: Array<keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'tunnelMode' | 'ipStack' | 'routingExclusions'>> = [
+  const booleanKeys: Array<keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'tunnelMode' | 'ipStack' | 'routingExclusions' | 'tunRoutingMode'>> = [
     'launchOnStartup',
     'runAsAdmin',
     'showDiagnostics',
@@ -57,13 +59,15 @@ function normalizeStoredSettings(value: unknown): AppSettings {
     'autoUpdate',
     'autoInstallUpdates',
     'themeGlow',
+    'sortServersByPing',
     'profileSyncOnLogin',
     'allowDemoFallback',
     'useSystemProxy',
     'probeOnConnect'
   ];
 
-  const next: AppSettings = { ...defaultSettings };
+  const next: AppSettings = { ...defaultSettings, tunRoutingMode: hasLegacyRules ? 'selected' : 'all' };
+  if (candidate.tunRoutingMode === 'all' || candidate.tunRoutingMode === 'selected' || candidate.tunRoutingMode === 'exclude') next.tunRoutingMode = candidate.tunRoutingMode;
 
   for (const key of booleanKeys) {
     if (typeof candidate[key] === 'boolean') {
@@ -144,6 +148,7 @@ function normalizeStoredServers(value: unknown): VpnServer[] {
       ...item,
       id,
       source: 'subscription',
+      sourceOrder: Number.isSafeInteger(item.sourceOrder) && (item.sourceOrder ?? -1) >= 0 ? item.sourceOrder : servers.length,
       latencyStatus: item.latencyStatus === 'ok' || item.latencyStatus === 'failed' ? item.latencyStatus : 'unchecked',
       latency: typeof item.latency === 'number' ? item.latency : null
     });
@@ -510,12 +515,12 @@ export function loadSettings() {
   try {
     const rawValue = window.localStorage.getItem(SETTINGS_STORAGE);
     if (!rawValue) {
-      return defaultSettings;
+      return normalizeStoredSettings(null, loadSplitTunnelEntries().length > 0);
     }
 
-    return normalizeStoredSettings(JSON.parse(rawValue) as unknown);
+    return normalizeStoredSettings(JSON.parse(rawValue) as unknown, loadSplitTunnelEntries().length > 0);
   } catch {
-    return defaultSettings;
+    return normalizeStoredSettings(null, loadSplitTunnelEntries().length > 0);
   }
 }
 
@@ -527,7 +532,9 @@ export function saveSettings(value: AppSettings) {
 
 export async function loadSettingsBackup() {
   const value = await loadNativeClientStateValue<unknown>(NATIVE_SETTINGS_KEY);
-  return value ? normalizeStoredSettings(value) : null;
+  const entries = await loadNativeClientStateValue<unknown>(NATIVE_SPLIT_TUNNEL_KEY);
+  const hasLegacyRules = normalizeStoredRules(entries).length > 0;
+  return value || hasLegacyRules ? normalizeStoredSettings(value, hasLegacyRules) : null;
 }
 
 export function loadSplitTunnelEntries() {
@@ -541,12 +548,8 @@ export function loadSplitTunnelEntries() {
       return [] as SplitTunnelEntry[];
     }
 
-    const parsed = JSON.parse(rawValue) as unknown;
-    if (!Array.isArray(parsed)) {
-      return [] as SplitTunnelEntry[];
-    }
-
-    return normalizeStoredRules(parsed);
+    try { return normalizeStoredRules(JSON.parse(rawValue) as unknown); }
+    catch { return normalizeStoredRules(rawValue); }
   } catch {
     return [] as SplitTunnelEntry[];
   }
@@ -560,11 +563,7 @@ export function saveSplitTunnelEntries(value: SplitTunnelEntry[]) {
 
 export async function loadSplitTunnelEntriesBackup() {
   const value = await loadNativeClientStateValue<unknown>(NATIVE_SPLIT_TUNNEL_KEY);
-  if (!Array.isArray(value)) {
-    return null;
-  }
-
-  return normalizeStoredRules(value);
+  return value === null || value === undefined ? null : normalizeStoredRules(value);
 }
 
 

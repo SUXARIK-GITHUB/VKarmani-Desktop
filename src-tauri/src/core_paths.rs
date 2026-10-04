@@ -745,7 +745,9 @@ pub(crate) fn extract_executable_value(value: &str) -> String {
             .unwrap_or_else(|| rest.trim_end_matches('"').to_string())
     } else {
         let lower = trimmed.to_ascii_lowercase();
-        if let Some(index) = lower.find(".exe") {
+        if let Some((index, _)) = lower.match_indices(".exe").find(|(i, _)| {
+            trimmed[i + 4..].is_empty() || trimmed[i + 4..].starts_with(char::is_whitespace)
+        }) {
             trimmed[..index + 4].to_string()
         } else {
             trimmed.to_string()

@@ -401,7 +401,7 @@ describe('Server display ranking', () => {
       server('failed', null, 'failed'),
       server('fast', 25),
       server('unchecked', null, 'unchecked')
-    ], 'auto', ['favorite']);
+    ], 'auto', ['favorite'], true);
 
     expect(ranked.map((item) => item.id)).toEqual(['favorite', 'fast', 'slow', 'unchecked', 'failed']);
   });
@@ -411,7 +411,7 @@ describe('Server display ranking', () => {
       server('middle', 80),
       server('fast', 15),
       server('slow', 140)
-    ], 'auto');
+    ], 'auto', [], true);
 
     expect(ranked.map((item) => item.id)).toEqual(['fast', 'middle', 'slow']);
   });

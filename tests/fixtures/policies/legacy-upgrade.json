@@ -1,0 +1,37 @@
+{
+  "settings": {
+    "tunnelMode": "tun"
+  },
+  "splitTunnelEntries": [
+    {
+      "id": "chat",
+      "kind": "app",
+      "value": "Discord.exe",
+      "enabled": true
+    },
+    {
+      "id": "messenger",
+      "kind": "app",
+      "value": "Telegram.exe",
+      "enabled": true
+    },
+    {
+      "id": "script",
+      "kind": "app",
+      "value": "legacy-helper.bat",
+      "enabled": true
+    },
+    {
+      "id": "legacy-service",
+      "kind": "service",
+      "value": "backgroundTaskHost.exe",
+      "enabled": true
+    },
+    {
+      "id": "legacy-jar",
+      "kind": "service",
+      "value": "legacy-installer.jar",
+      "enabled": true
+    }
+  ]
+}

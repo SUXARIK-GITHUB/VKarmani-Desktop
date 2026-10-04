@@ -90,7 +90,8 @@ function compareServersByLatency(left: VpnServer, right: VpnServer) {
 export function rankServersForDisplay(
   servers: VpnServer[],
   strategy: AppSettings['protocolStrategy'],
-  favoriteServerIds: string[] = []
+  favoriteServerIds: string[] = [],
+  sortServersByPing = false
 ) {
   const favoriteRank = new Map(
     migrateServerReferences(servers, favoriteServerIds)
@@ -99,8 +100,10 @@ export function rankServersForDisplay(
       .map((id, index): [string, number] => [id, index])
   );
 
-  return rankServers(servers, strategy)
-    .map((server, index) => ({ server, index }))
+  const scoped = strategy === 'xray-only' && servers.some(server => server.runtimeTemplate)
+    ? servers.filter(server => server.runtimeTemplate) : servers;
+  return scoped
+    .map((server, index) => ({ server, index: Number.isSafeInteger(server.sourceOrder) && (server.sourceOrder ?? -1) >= 0 ? server.sourceOrder! : index }))
     .sort((left, right) => {
       const leftFavoriteRank = favoriteRank.get(left.server.id);
       const rightFavoriteRank = favoriteRank.get(right.server.id);
@@ -111,13 +114,12 @@ export function rankServersForDisplay(
         return leftFavoriteRank - rightFavoriteRank;
       }
 
-      const latencyOrder = compareServersByLatency(left.server, right.server);
+      const latencyOrder = sortServersByPing ? compareServersByLatency(left.server, right.server) : 0;
       if (latencyOrder !== 0) {
         return latencyOrder;
       }
 
-      // После избранного и пинга оставляем прежний production-порядок:
-      // runtime-ready/recommended/reality strategy/country-city.
+      // Stable logical source order is independent of recommendation/protocol/ping.
       return left.index - right.index;
     })
     .map((item) => item.server);

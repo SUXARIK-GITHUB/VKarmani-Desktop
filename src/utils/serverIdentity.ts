@@ -32,3 +32,10 @@ export function isVpnServerLike(value: unknown): value is VpnServer {
     && typeof candidate.city === 'string'
     && typeof candidate.protocol === 'string';
 }
+
+// A catalog refresh must not replace or drop the graph owned by a live runtime.
+export function resolveConnectedProfile(servers: VpnServer[], serverId: string, fingerprint: string | undefined, retained: VpnServer | null): VpnServer | null {
+  const current = resolveServerReference(servers, serverId);
+  if (current && (!fingerprint || buildServerRuntimeFingerprint(current) === fingerprint)) return current;
+  return retained?.id === serverId ? retained : null;
+}

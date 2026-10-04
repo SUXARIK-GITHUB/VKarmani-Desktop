@@ -589,7 +589,15 @@ pub(crate) fn build_xray_config(
         ip_stack,
         send_through_ip,
         if network_mode == "tun" {
-            Some(build_split_tunnel_rule_plan(split_tunnel_entries)?)
+            // Empty policy fixtures represent ordinary all-application TUN.
+            Some(build_split_tunnel_rule_plan_for_mode(
+                split_tunnel_entries,
+                if split_tunnel_entries.is_empty() {
+                    "all"
+                } else {
+                    "selected"
+                },
+            )?)
         } else {
             None
         },
@@ -611,6 +619,7 @@ pub(crate) fn build_xray_config_with_plan(
         prepared_policy.ok_or("POLICY_PLAN_REQUIRED")?
     } else {
         SplitTunnelRulePlan {
+            default_vpn: false,
             process_matches: Vec::new(),
             direct_process_matches: Vec::new(),
             resolved_apps: 0,
@@ -759,7 +768,10 @@ pub(crate) fn build_xray_config_with_plan(
                 .expect("selected rule");
             routing_rules.insert(selected_index, json!({"inboundTag":["tun-in"],"process":plan.process_matches.clone(),"ip":["::/0"],"outboundTag":"block","ruleTag":"tun-selected-ipv6-guard"}));
         }
-        routing_rules.push(json!({"inboundTag":["tun-in"],"outboundTag":"direct","ruleTag":"tun-unselected-direct"}));
+        if plan.default_vpn && ip_stack == "ipv4" {
+            routing_rules.push(json!({"inboundTag":["tun-in"],"ip":["::/0"],"outboundTag":"block","ruleTag":"tun-default-ipv6-guard"}));
+        }
+        routing_rules.push(json!({"inboundTag":["tun-in"],"outboundTag":if plan.default_vpn {"proxy"} else {"direct"},"ruleTag":if plan.default_vpn {"tun-all-vpn"} else {"tun-unselected-direct"}}));
     }
 
     let domain_strategy = if network_mode == "tun" {

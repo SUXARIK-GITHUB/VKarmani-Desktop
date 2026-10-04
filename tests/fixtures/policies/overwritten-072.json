@@ -1,0 +1,28 @@
+{
+  "settings": {
+    "tunnelMode": "tun"
+  },
+  "splitTunnelEntries": [
+    {
+      "id": "chat",
+      "kind": "app",
+      "value": "Discord.exe",
+      "enabled": true,
+      "policy": "VPN"
+    },
+    {
+      "id": "messenger",
+      "kind": "app",
+      "value": "Telegram.exe",
+      "enabled": true,
+      "policy": "VPN"
+    },
+    {
+      "id": "invalid-3",
+      "kind": "app",
+      "value": "<invalid stored policy>",
+      "enabled": true,
+      "policy": "VPN"
+    }
+  ]
+}

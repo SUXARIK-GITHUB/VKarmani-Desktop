@@ -1,8 +1,9 @@
 import { FolderOpen, Plus, RefreshCw, Trash2, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { tr, type UiLanguage } from '../i18n';
-import type { RoutingPolicy, RunningAppInfo, SplitTunnelEntry, TunnelMode, WindowsServiceInfo } from '../types/vpn';
+import type { RoutingPolicy, RunningAppInfo, SplitTunnelEntry, TunnelMode, TunRoutingMode, WindowsServiceInfo } from '../types/vpn';
 import { listNativeWindowsServices } from '../services/runtime';
+import { activePolicyEntries } from '../utils/appPolicies';
 import '../styles/policies.css';
 
 interface SplitTunnelModalProps {
@@ -16,6 +17,7 @@ interface SplitTunnelModalProps {
   onAddEntry: (kind: SplitTunnelEntry['kind'], value: string, policy?: RoutingPolicy) => boolean;
   onChangePolicy: (entryId: string, policy: RoutingPolicy) => void;
   tunnelMode: TunnelMode;
+  tunRoutingMode: TunRoutingMode;
   onToggleEntry: (entryId: string) => void;
   onRemoveEntry: (entryId: string) => void;
   onPickExecutable: (policy?: RoutingPolicy) => Promise<void> | void;
@@ -38,6 +40,7 @@ export function SplitTunnelModal({
   onToggleEntry,
   onChangePolicy,
   tunnelMode,
+  tunRoutingMode,
   onRemoveEntry,
   onPickExecutable,
   onRefreshRunningApps
@@ -79,7 +82,7 @@ export function SplitTunnelModal({
   const query = appSearch.trim().toLowerCase();
   const filteredEntries = entries.filter(entry => `${entry.kind} ${entry.value} ${entry.policy ?? 'VPN'}`.toLowerCase().includes(query));
   const filteredServices = services.filter(service => `${service.name} ${service.displayName} ${service.exePath}`.toLowerCase().includes(query));
-  const activeCount = useMemo(() => entries.filter((entry) => entry.enabled && entry.value.trim()).length, [entries]);
+  const activeCount = useMemo(() => activePolicyEntries(entries, tunRoutingMode).length, [entries, tunRoutingMode]);
   const filteredRunningApps = useMemo(() => {
     const query = appSearch.trim().toLowerCase();
     if (!query) {
@@ -129,7 +132,7 @@ export function SplitTunnelModal({
 
         <div className="vk-modal-scroll">
           <p className="split-tunnel-help">
-            {tr(language, 'В TUN: выбранные VPN-программы идут через VPN, DIRECT и остальные — напрямую. Путь к exe относится только к этому файлу; имя exe — ко всем процессам с этим именем.', 'In TUN: VPN applications use the VPN; DIRECT and unselected apps go directly. An exe path targets that file; an exe name targets every process with that name.')}
+            {tunRoutingMode === 'selected' ? tr(language, 'Выбранные VPN-программы идут через VPN, DIRECT и остальные — напрямую.', 'Selected VPN applications use the VPN; DIRECT and unselected apps go directly.') : tr(language, 'Все приложения идут через VPN, кроме DIRECT. Сохранённые VPN-правила выбранных приложений сейчас не применяются.', 'All applications use the VPN except DIRECT. Saved selected-application VPN rules are inactive in this mode.')} {' '}{tr(language, 'Путь к exe относится только к этому файлу; имя exe — ко всем процессам с этим именем.', 'An exe path targets that file; an exe name targets every process with that name.')}
           </p>
           {tunnelMode === 'proxy' && <p className="split-tunnel-help policy-warning">{tr(language, 'Сейчас Proxy: эти process rules работают только в TUN. Программа, вручную использующая SOCKS/HTTP proxy, не получает строгую DIRECT-изоляцию.', 'Proxy mode: these process rules apply only in TUN. An app manually using SOCKS/HTTP proxy has no strict DIRECT isolation.')}</p>}
           <div className="policy-toolbar">
@@ -191,6 +194,7 @@ export function SplitTunnelModal({
                   <div>
                     <strong>{entry.kind === 'app' ? tr(language, 'Приложение', 'Application') : tr(language, 'Служба', 'Service')}</strong>
                     <small>{entry.value}</small>
+                    {entry.invalidReason && <small className="policy-warning">{tr(language, 'Правило из старых настроек отключено: проверьте тип и exe/имя службы. Исходная запись сохранена.', 'Legacy rule disabled: review target type and exe/service name. Original entry is preserved.')} ({entry.invalidReason})</small>}
                     <select aria-label={tr(language, `Политика: ${entry.value}`, `Policy: ${entry.value}`)} value={entry.policy ?? 'VPN'} onChange={event => onChangePolicy(entry.id, event.target.value as RoutingPolicy)}><option value="VPN">VPN</option><option value="DIRECT">DIRECT</option></select>
                   </div>
                   <button type="button" className="split-entry-delete" onClick={() => onRemoveEntry(entry.id)} aria-label={tr(language, 'Удалить', 'Delete')}>

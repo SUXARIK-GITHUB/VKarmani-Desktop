@@ -939,6 +939,7 @@ pub(crate) async fn request_connect(
     runtime_template: Value,
     canonical_template_json: String,
     network_mode: Option<String>,
+    tun_routing_mode: Option<String>,
     ip_stack: Option<String>,
     reconnect: Option<bool>,
     split_tunnel_entries: Option<Vec<SplitTunnelEntryPayload>>,
@@ -961,6 +962,7 @@ pub(crate) async fn request_connect(
             server_fingerprint: Some(verified_fingerprint),
             runtime_template,
             network_mode,
+            tun_routing_mode,
             ip_stack,
             reconnect,
             split_tunnel_entries,
@@ -1022,6 +1024,7 @@ struct ConnectRequest {
     server_fingerprint: Option<String>,
     runtime_template: RuntimeTemplate,
     network_mode: Option<String>,
+    tun_routing_mode: Option<String>,
     ip_stack: Option<String>,
     reconnect: Option<bool>,
     split_tunnel_entries: Option<Vec<SplitTunnelEntryPayload>>,
@@ -1037,6 +1040,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         server_fingerprint,
         runtime_template,
         network_mode,
+        tun_routing_mode,
         ip_stack,
         reconnect,
         split_tunnel_entries,
@@ -1094,15 +1098,14 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
 
     let reconnect_requested = reconnect.unwrap_or(false);
 
-    let active_split_tunnel_entries = split_tunnel_entries
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|entry| entry.enabled && !entry.value.trim().is_empty())
-        .collect::<Vec<_>>();
-
-    if normalized_network_mode == "tun" && active_split_tunnel_entries.is_empty() {
-        return Err("Для TUN режима нужно добавить хотя бы одну включённую программу или службу. Пустой TUN не запускается, чтобы случайно не пустить весь трафик мимо VPN.".into());
-    }
+    let policy_mode = tun_routing_mode.as_deref().unwrap_or("selected");
+    let stored_entries = split_tunnel_entries.unwrap_or_default();
+    let active_split_tunnel_entries = if normalized_network_mode == "tun" {
+        active_policy_entries(&stored_entries, policy_mode)
+            .map_err(|e| format!("CONNECT_PREFLIGHT: {e}"))?
+    } else {
+        vec![]
+    };
 
     let (outbound_host, outbound_port) = extract_outbound_address_and_port(&runtime_template);
 
@@ -1124,7 +1127,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     let request_hash = sha256_hex_bytes(
         serde_json::to_string(&json!({
             "templateHash": server_fingerprint, "mode": normalized_network_mode,
-            "ipStack": normalized_ip_stack, "policies": active_split_tunnel_entries,
+            "ipStack": normalized_ip_stack, "policyMode": policy_mode, "policies": active_split_tunnel_entries,
             "exclusions": routing_exclusions,
         }))
         .map_err(|_| "Не удалось вычислить request identity".to_string())?
@@ -1150,7 +1153,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
 
     let prepared_policy = if normalized_network_mode == "tun" {
         Some(
-            build_split_tunnel_rule_plan(&active_split_tunnel_entries)
+            build_split_tunnel_rule_plan_for_mode(&active_split_tunnel_entries, policy_mode)
                 .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?,
         )
     } else {
@@ -1212,16 +1215,6 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         Some(runtime_trace_path.as_path()),
     )
     .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
-
-    if normalized_network_mode == "tun"
-        && split_tunnel_plan.process_matches.is_empty()
-        && split_tunnel_plan.direct_process_matches.is_empty()
-    {
-        for note in &split_tunnel_plan.skipped_notes {
-            let _ = append_runtime_event(&app, note);
-        }
-        return Err("TUN режим не запущен: выбранные программы/службы не удалось превратить в безопасные правила процессов. Добавьте обычный .exe файл приложения или выберите Proxy режим.".into());
-    }
 
     #[cfg(target_os = "windows")]
     if let Some(route) = physical_route.as_ref() {
@@ -2297,15 +2290,39 @@ pub(crate) fn server_ping_blocking(
     })
 }
 
+static PING_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct PingPermit;
+impl PingPermit {
+    fn acquire() -> Result<Self, String> {
+        PING_IN_FLIGHT
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |count| (count < 4).then_some(count + 1),
+            )
+            .map(|_| Self)
+            .map_err(|_| "PING_BUSY: native ping budget exhausted".into())
+    }
+}
+impl Drop for PingPermit {
+    fn drop(&mut self) {
+        PING_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn server_ping(
     host: String,
     port: u16,
     app: AppHandle,
 ) -> Result<ConnectivityProbe, String> {
-    tauri::async_runtime::spawn_blocking(move || server_ping_blocking(host, port, Some(app)))
-        .await
-        .map_err(|error| format!("Проверка пинга была прервана: {error}"))?
+    let permit = PingPermit::acquire()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        server_ping_blocking(host, port, Some(app))
+    })
+    .await
+    .map_err(|error| format!("Проверка пинга была прервана: {error}"))?
 }
 
 pub(crate) fn parse_xray_stat_value(raw: &str) -> Option<u64> {
@@ -3014,4 +3031,20 @@ pub(crate) async fn read_runtime_log(
     tauri::async_runtime::spawn_blocking(move || read_runtime_log_blocking(app, lines))
         .await
         .map_err(|error| format!("Чтение runtime-лога было прервано: {error}"))?
+}
+
+#[cfg(test)]
+mod ping_budget_tests {
+    use super::*;
+    #[test]
+    fn renderer_cancellation_cannot_accumulate_unbounded_native_ping_tasks() {
+        let permits = (0..4)
+            .map(|_| PingPermit::acquire().unwrap())
+            .collect::<Vec<_>>();
+        assert!(PingPermit::acquire().is_err());
+        drop(permits);
+        let permit = PingPermit::acquire().unwrap();
+        drop(permit);
+        assert_eq!(PING_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
 }

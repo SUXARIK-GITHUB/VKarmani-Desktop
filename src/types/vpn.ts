@@ -12,6 +12,7 @@ export type TunnelMode = 'proxy' | 'tun';
 export type IpStack = 'ipv4' | 'ipv6';
 export type SplitTunnelEntryKind = 'app' | 'service';
 export type RoutingPolicy = 'VPN' | 'DIRECT';
+export type TunRoutingMode = 'all' | 'selected' | 'exclude';
 
 export interface RoutingExclusionSettings {
   enabled: boolean;
@@ -47,6 +48,8 @@ export interface SplitTunnelEntry {
   value: string;
   enabled: boolean;
   policy?: RoutingPolicy;
+  schemaVersion?: 2;
+  invalidReason?: string;
 }
 
 export interface WindowsServiceInfo {
@@ -82,6 +85,7 @@ export interface VpnServer {
   city: string;
   countryCode?: string;
   flag: string;
+  sourceOrder?: number;
   latency?: number | null;
   latencyCheckedAt?: string;
   latencyStatus?: 'unchecked' | 'checking' | 'ok' | 'failed';
@@ -253,6 +257,8 @@ export interface AppSettings {
   autoUpdate: boolean;
   autoInstallUpdates: boolean;
   themeGlow: boolean;
+  sortServersByPing: boolean;
+  tunRoutingMode: TunRoutingMode;
   releaseChannel: ReleaseChannel;
   protocolStrategy: 'auto' | 'reality-first' | 'xray-only';
   profileSyncOnLogin: boolean;

@@ -20,11 +20,11 @@ import { useToastManager } from './hooks/useToastManager';
 import { useSyncedRef } from './hooks/useSyncedRef';
 import { buildDiagnosticsFilename, createSafeDiagnosticsPayload, downloadTextFile } from './utils/diagnosticsExport';
 import { sleep } from './utils/async';
-import { insertRule, rulesOverlap } from './utils/appPolicies';
+import { activePolicyEntries, isSelectedTunPolicyEmpty, insertRule, rulesOverlap } from './utils/appPolicies';
 import { buildTrafficBars, formatTrafficBytes } from './utils/traffic';
 import { assertNativeRuntimeServerMatches, runtimeConfirmsTargetServer } from './services/connectionGuards';
 import { pickPreferredServer, rankServersForDisplay } from './utils/serverSorting';
-import { buildServerRuntimeFingerprint, isVpnServerLike, resolveServerReference, migrateServerReferences } from './utils/serverIdentity';
+import { resolveConnectedProfile, buildServerRuntimeFingerprint, isVpnServerLike, resolveServerReference, migrateServerReferences } from './utils/serverIdentity';
 import { remnawaveClient } from './services/remnawave';
 import {
   appVersion,
@@ -156,6 +156,7 @@ export default function App() {
   const updateInfoRef = useSyncedRef(updateInfo);
   const authorizedAccessKeyRef = useRef('');
   const persistentRestoreStarted = useRef(false);
+  const migrationNoticeShown = useRef(false);
   const hasAutoCheckedUpdates = useRef(false);
 
   const hasTriedFavoriteAutoConnect = useRef(false);
@@ -165,6 +166,7 @@ export default function App() {
   const lastNativeRuntimeStopToastAt = useRef(0);
   const lastAppliedSplitTunnelSignature = useRef('');
   const initialProtocolStrategy = useRef(settings.protocolStrategy);
+  const activeRuntimeProfileRef = useRef<VpnServer | null>(null);
   const connectionActionLock = useRef(false);
   const updaterActionLock = useRef(false);
   const selectedServerIdRef = useSyncedRef(selectedServerId);
@@ -198,6 +200,8 @@ export default function App() {
   const postConnectProbeInFlight = useRef(false);
   const manualRefreshInFlight = useRef(false);
   const profileSyncInFlightRef = useRef(false);
+  const profileSyncGenerationRef = useRef(0);
+  useEffect(() => () => { profileSyncGenerationRef.current++; remnawaveClient.invalidateProfileSync(); }, []);
   const snapshotRefreshQueued = useRef(false);
   const trayConnectActionRef = useRef<() => void>(() => undefined);
   const trayRestartProxyActionRef = useRef<() => void>(() => undefined);
@@ -208,7 +212,8 @@ export default function App() {
     pingProgress,
     checkingPingServerIds,
     refreshPing: handleRefreshPing,
-    scheduleAutoPing
+    scheduleAutoPing,
+    cancelPing
   } = usePingManager({
     servers,
     setServers,
@@ -870,25 +875,32 @@ export default function App() {
 
   const visibleSelectedServer = useMemo(
     () => (connectionState === 'connected'
-      ? resolveServerReference(servers, activeConnectionServerId) ?? selectedServer
+      ? getConnectedRuntimeServer() ?? selectedServer
       : selectedServer),
-    [activeConnectionServerId, connectionState, selectedServer, servers]
+    [activeConnectionServerId, connectionState, selectedServer, servers, runtimeStatus.lastPreparedServerFingerprint]
   );
   const splitTunnelSignature = useMemo(
-    () => JSON.stringify(splitTunnelEntries.map((entry: SplitTunnelEntry) => ({
+    () => JSON.stringify([settings.tunRoutingMode, splitTunnelEntries.map((entry: SplitTunnelEntry) => ({
       id: entry.id,
       kind: entry.kind,
       value: entry.value.trim(),
       enabled: entry.enabled,
       policy: entry.policy ?? 'VPN'
-    }))),
-    [splitTunnelEntries]
+    }))]),
+    [splitTunnelEntries, settings.tunRoutingMode]
   );
 
   const activeSplitTunnelCount = useMemo(
-    () => splitTunnelEntries.filter((entry: SplitTunnelEntry) => entry.enabled && entry.value.trim()).length,
-    [splitTunnelEntries]
+    () => activePolicyEntries(splitTunnelEntries, settings.tunRoutingMode).length,
+    [splitTunnelEntries, settings.tunRoutingMode]
   );
+
+  useEffect(() => {
+    if (!persistentStateReady || migrationNoticeShown.current) return;
+    migrationNoticeShown.current = true;
+    const count = splitTunnelEntries.filter(entry => entry.invalidReason).length;
+    if (count) pushToast(tr(language, `${count} правил TUN из старых настроек отключено. Исходные записи сохранены: проверьте список приложений.`, `${count} legacy TUN rules disabled. Original entries preserved: review the application list.`), 'info');
+  }, [persistentStateReady, splitTunnelEntries, language, pushToast]);
 
   const favoriteServerIdSet = useMemo(() => new Set(favoriteServerIds), [favoriteServerIds]);
   const deferredSearchValue = useDeferredValue(searchValue);
@@ -907,7 +919,7 @@ export default function App() {
 
   const filteredServers = useMemo(() => {
     const normalized = deferredSearchValue.trim().toLowerCase();
-    const displayRankedServers = rankServersForDisplay(servers, settings.protocolStrategy, favoriteServerIds);
+    const displayRankedServers = rankServersForDisplay(servers, settings.protocolStrategy, favoriteServerIds, settings.sortServersByPing);
 
     if (!normalized) {
       return displayRankedServers;
@@ -927,7 +939,7 @@ export default function App() {
 
       return haystack.includes(normalized);
     });
-  }, [deferredSearchValue, servers, settings.protocolStrategy, favoriteServerIds]);
+  }, [deferredSearchValue, servers, settings.protocolStrategy, favoriteServerIds, settings.sortServersByPing]);
 
   useEffect(() => {
     if (settings.tunnelMode !== 'tun' || !selectedServer) {
@@ -980,7 +992,7 @@ export default function App() {
       ? tr(language, 'Сначала синхронизируйте профиль и выберите сервер.', 'Sync the profile and choose a server first.')
       : !selectedServer.runtimeTemplate
         ? tr(language, 'У выбранного сервера ещё нет runtime-конфига.', 'The selected server has no runtime config yet.')
-        : settings.tunnelMode === 'tun' && activeSplitTunnelCount === 0
+        : settings.tunnelMode === 'tun' && isSelectedTunPolicyEmpty(splitTunnelEntries, settings.tunRoutingMode)
           ? tr(language, 'Для TUN добавьте хотя бы одну программу или службу.', 'Add at least one app or service for TUN.')
           : ''
     : '';
@@ -1160,10 +1172,6 @@ export default function App() {
     return mode === 'proxy' && enabledBySettings;
   }
 
-  function getActiveSplitTunnelEntries(entries = splitTunnelEntriesRef.current) {
-    return entries.filter((entry: SplitTunnelEntry) => entry.enabled && entry.value.trim());
-  }
-
   function getServerById(serverId: string) {
     return resolveServerReference(serversRef.current, serverId);
   }
@@ -1181,6 +1189,7 @@ export default function App() {
   }
 
   function nextConnectionAttemptId() {
+    cancelPing();
     connectionAttemptSeqRef.current += 1;
     return connectionAttemptSeqRef.current;
   }
@@ -1228,7 +1237,7 @@ export default function App() {
 
   function getConnectedRuntimeServer() {
     const runtimeServerId = getConnectedRuntimeServerId();
-    return runtimeServerId ? getServerById(runtimeServerId) : null;
+    return resolveConnectedProfile(serversRef.current, runtimeServerId, runtimeStatusRef.current.lastPreparedServerFingerprint, activeRuntimeProfileRef.current);
   }
 
   async function waitForConnectionActionToFinish(timeoutMs = 45_000) {
@@ -1414,10 +1423,11 @@ export default function App() {
 
   function handleToggleSplitTunnelEntry(entryId: string) {
     const nextEntry = splitTunnelEntriesRef.current.find((entry: SplitTunnelEntry) => entry.id === entryId) ?? null;
+    if (nextEntry?.invalidReason) { pushToast(tr(language, 'Это правило отключено при миграции. Проверьте запись и добавьте корректный exe или имя службы.', 'This rule was disabled during migration. Review it and add a valid exe or service name.'), 'info'); return; }
     if (nextEntry) {
       void writeNativeInterfaceLog(
         nextEntry.enabled ? 'Правило TUN отключено.' : 'Правило TUN включено.',
-        `${nextEntry.kind}: ${nextEntry.value}`
+        `target=${nextEntry.kind}; rule=${splitTunnelEntriesRef.current.indexOf(nextEntry) + 1}`
       );
     }
 
@@ -1429,7 +1439,7 @@ export default function App() {
   function handleRemoveSplitTunnelEntry(entryId: string) {
     const removedEntry = splitTunnelEntriesRef.current.find((entry: SplitTunnelEntry) => entry.id === entryId) ?? null;
     if (removedEntry) {
-      void writeNativeInterfaceLog('Запись удалена из TUN списка.', `${removedEntry.kind}: ${removedEntry.value}`);
+      void writeNativeInterfaceLog('Запись удалена из TUN списка.', `target=${removedEntry.kind}; rule=${splitTunnelEntriesRef.current.indexOf(removedEntry) + 1}`);
     }
 
     const next=splitTunnelEntriesRef.current.filter(entry=>entry.id!==entryId);
@@ -1660,13 +1670,12 @@ export default function App() {
   async function handleTunnelModeChange(nextMode: AppSettings['tunnelMode']) {
     const currentSettings = settingsRef.current;
     const currentConnectionState = connectionStateRef.current;
-    const activeSplitEntries = getActiveSplitTunnelEntries();
 
     if (nextMode === currentSettings.tunnelMode && !pendingTunnelModeRef.current) {
       return;
     }
 
-    if (currentConnectionState !== 'idle' && nextMode === 'tun' && activeSplitEntries.length === 0) {
+    if (currentConnectionState !== 'idle' && nextMode === 'tun' && isSelectedTunPolicyEmpty(splitTunnelEntriesRef.current, settingsRef.current.tunRoutingMode)) {
       pushToast(
         tr(language, 'Для TUN сначала добавьте хотя бы одну программу или службу. Текущее подключение оставлено без изменений.', 'For TUN, add at least one program or service first. The current connection was left unchanged.'),
         'info'
@@ -1696,7 +1705,7 @@ export default function App() {
 
       updateTunnelModePreference(nextMode);
 
-      if (nextMode === 'tun' && activeSplitEntries.length === 0) {
+      if (nextMode === 'tun' && isSelectedTunPolicyEmpty(splitTunnelEntriesRef.current, settingsRef.current.tunRoutingMode)) {
         pushToast(
           tr(language, 'Выбран TUN режим. Сначала добавьте программы или службы, затем подключайтесь.', 'TUN mode selected. Add apps or services first, then connect.'),
           'info'
@@ -1732,6 +1741,7 @@ export default function App() {
           useSystemProxy: shouldUseSystemProxy(nextMode, previousUseSystemProxy),
           probeAfterConnect: false,
           tunnelMode: nextMode,
+          tunRoutingMode: settingsRef.current.tunRoutingMode,
           splitTunnelEntries: splitTunnelEntriesRef.current,
           ipStack: settingsRef.current.ipStack,
               routingExclusions: settingsRef.current.routingExclusions
@@ -1742,6 +1752,7 @@ export default function App() {
         }
         setSessionDuration(0);
         setConnectedServerId(serverForReconnect.id);
+        activeRuntimeProfileRef.current = serverForReconnect;
         connectedServerIdRef.current = serverForReconnect.id;
         setConnectionStateSafe('connected');
         runPostConnectProbe(serverForReconnect);
@@ -1782,6 +1793,7 @@ export default function App() {
               useSystemProxy: shouldUseSystemProxy(previousMode, previousUseSystemProxy),
               probeAfterConnect: false,
               tunnelMode: previousMode,
+              tunRoutingMode: settingsRef.current.tunRoutingMode,
               splitTunnelEntries: splitTunnelEntriesRef.current,
               ipStack: settingsRef.current.ipStack,
               routingExclusions: settingsRef.current.routingExclusions
@@ -1792,6 +1804,7 @@ export default function App() {
             }
             setSessionDuration(0);
             setConnectedServerId(serverForReconnect.id);
+            activeRuntimeProfileRef.current = serverForReconnect;
             connectedServerIdRef.current = serverForReconnect.id;
             setConnectionStateSafe('connected');
             rollbackSucceeded = true;
@@ -1889,6 +1902,8 @@ export default function App() {
     }
 
     profileSyncInFlightRef.current = true;
+    const syncGeneration = ++profileSyncGenerationRef.current;
+    cancelPing();
 
     try {
       void writeNativeInterfaceLog('Запущена синхронизация профиля Remnawave.');
@@ -1900,6 +1915,9 @@ export default function App() {
       }));
 
       const result = await remnawaveClient.syncProfile(normalizedAccessKey, settingsRef.current.allowDemoFallback);
+      if (syncGeneration !== profileSyncGenerationRef.current) return null;
+      const connectedProfile = getConnectedRuntimeServer();
+      if (connectedProfile) activeRuntimeProfileRef.current = connectedProfile;
       serversRef.current = result.servers;
       setServers(result.servers);
       saveLastKnownServers(result.servers);
@@ -1943,6 +1961,7 @@ export default function App() {
 
       return result;
     } catch (error) {
+      if (syncGeneration !== profileSyncGenerationRef.current) return null;
       const message = normalizeNativeError(error, tr(language, 'Не удалось синхронизировать профиль.', 'Failed to sync profile.')).message;
       setProfileSyncInfo((current: ProfileSyncInfo) => ({
         ...current,
@@ -1955,8 +1974,7 @@ export default function App() {
       }
       return null;
     } finally {
-      profileSyncInFlightRef.current = false;
-      setIsSyncingProfile(false);
+      if (syncGeneration === profileSyncGenerationRef.current) { profileSyncInFlightRef.current = false; setIsSyncingProfile(false); }
     }
   }
 
@@ -2120,19 +2138,6 @@ export default function App() {
       }
       pendingTargetServer = targetServer;
 
-      if (currentSettings.tunnelMode === 'tun' && getActiveSplitTunnelEntries(currentSplitTunnelEntries).length === 0) {
-        if (rollbackServer?.id) {
-          selectedServerIdRef.current = rollbackServer.id;
-          setSelectedServerId(rollbackServer.id);
-        }
-        pushToast(
-          tr(language, 'Для TUN сначала добавьте хотя бы одну программу или службу.', 'For TUN, add at least one program or service first.'),
-          'info'
-        );
-        setConnectionStateSafe(rollbackServer ? 'connected' : 'idle');
-        return;
-      }
-
       void writeNativeRoutingLog(
         'Начато управляемое переключение сервера.',
         `${rollbackServer ? `${rollbackServer.country}, ${rollbackServer.city}` : 'нет активного сервера'} → ${targetServer.country}, ${targetServer.city} | mode=${currentSettings.tunnelMode}`
@@ -2147,6 +2152,7 @@ export default function App() {
         useSystemProxy: shouldUseSystemProxy(currentSettings.tunnelMode, currentSettings.useSystemProxy),
         probeAfterConnect: false,
         tunnelMode: currentSettings.tunnelMode,
+        tunRoutingMode: currentSettings.tunRoutingMode,
         splitTunnelEntries: currentSplitTunnelEntries,
         ipStack: currentSettings.ipStack,
         routingExclusions: currentSettings.routingExclusions,
@@ -2200,6 +2206,7 @@ export default function App() {
       }
       setSessionDuration(0);
       setConnectedServerId(targetServer.id);
+      activeRuntimeProfileRef.current = targetServer;
       connectedServerIdRef.current = targetServer.id;
       selectedServerIdRef.current = targetServer.id;
       setSelectedServerId(targetServer.id);
@@ -2246,7 +2253,7 @@ export default function App() {
         try {
           const response = await remnawaveClient.connect(rollbackServer, {
             useSystemProxy: shouldUseSystemProxy(settingsRef.current.tunnelMode, settingsRef.current.useSystemProxy),
-            probeAfterConnect: false, tunnelMode: settingsRef.current.tunnelMode,
+            probeAfterConnect: false, tunnelMode: settingsRef.current.tunnelMode, tunRoutingMode: settingsRef.current.tunRoutingMode,
             splitTunnelEntries: splitTunnelEntriesRef.current, ipStack: settingsRef.current.ipStack,
             routingExclusions: settingsRef.current.routingExclusions, reconnect: true
           });
@@ -2255,6 +2262,7 @@ export default function App() {
             response.runtime?.lastPreparedServerFingerprint, buildServerRuntimeFingerprint(rollbackServer));
           setRuntimeStatus(current => response.runtime ?? current);
           if (response.proxy) setProxyStatus(response.proxy);
+          activeRuntimeProfileRef.current = rollbackServer;
           connectedServerIdRef.current = rollbackServer.id;
           setConnectedServerId(rollbackServer.id);
           selectedServerIdRef.current = rollbackServer.id;
@@ -2427,9 +2435,9 @@ export default function App() {
       const currentMode = currentSettings.tunnelMode;
       const currentSplitTunnelEntries = splitTunnelEntriesRef.current;
       const selectedId = selectedServerIdRef.current.trim();
-      const requestedServer = explicitServerOverride ?? (selectedId ? getServerById(selectedId) : null);
+      const requestedServer = explicitServerOverride ?? (currentState === 'connected' ? getConnectedRuntimeServer() : selectedId ? getServerById(selectedId) : null);
       const allowPreferredFallback = Boolean(explicitServerOverride) || !selectedId;
-      let targetServer = await resolveServerForConnection(requestedServer, allowPreferredFallback);
+      let targetServer = currentState === 'connected' ? requestedServer : await resolveServerForConnection(requestedServer, allowPreferredFallback);
       if (!targetServer) {
         const message = requestedServer
           ? tr(language, 'Для выбранного сервера нет готового live-конфига. Обновите профиль или выберите другой сервер.', 'The selected server has no ready live config. Sync the profile or choose another server.')
@@ -2470,13 +2478,6 @@ export default function App() {
         }
 
         void refreshPrimaryExternalIp();
-        if (currentMode === 'tun' && getActiveSplitTunnelEntries(currentSplitTunnelEntries).length === 0) {
-          pushToast(
-            tr(language, 'Для TUN сначала добавьте хотя бы одну программу или службу.', 'For TUN, add at least one program or service.'),
-            'info'
-          );
-          return;
-        }
         void writeNativeRoutingLog(
           'Пользователь запускает VPN подключение.',
           `${targetServer.country}, ${targetServer.city} | mode=${currentMode}`
@@ -2490,6 +2491,7 @@ export default function App() {
             useSystemProxy: shouldUseSystemProxy(currentMode, currentSettings.useSystemProxy),
             probeAfterConnect: false,
             tunnelMode: currentMode,
+            tunRoutingMode: currentSettings.tunRoutingMode,
             splitTunnelEntries: currentSplitTunnelEntries,
             ipStack: currentSettings.ipStack,
               routingExclusions: currentSettings.routingExclusions
@@ -2514,6 +2516,7 @@ export default function App() {
               useSystemProxy: shouldUseSystemProxy(currentMode, currentSettings.useSystemProxy),
               probeAfterConnect: false,
               tunnelMode: currentMode,
+              tunRoutingMode: currentSettings.tunRoutingMode,
               splitTunnelEntries: currentSplitTunnelEntries,
               ipStack: currentSettings.ipStack,
               routingExclusions: currentSettings.routingExclusions
@@ -2543,6 +2546,7 @@ export default function App() {
         }
         setSessionDuration(0);
         setConnectedServerId(targetServer.id);
+        activeRuntimeProfileRef.current = targetServer;
         connectedServerIdRef.current = targetServer.id;
         selectedServerIdRef.current = targetServer.id;
         setSelectedServerId(targetServer.id);
@@ -2719,7 +2723,7 @@ export default function App() {
     void handleCheckUpdates(true, settings.autoInstallUpdates);
   }, [settings.autoUpdate, settings.autoInstallUpdates, settings.releaseChannel]);
 
-  function toggleSetting(key: keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode' | 'ipStack' | 'routingExclusions'>) {
+  function toggleSetting(key: keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode' | 'ipStack' | 'routingExclusions' | 'tunRoutingMode'>) {
     setSettings((current: AppSettings) => {
       const next = { ...current, [key]: !current[key] };
       settingsRef.current = next;
@@ -2750,6 +2754,7 @@ export default function App() {
   }
 
   async function handleClearAccessKey() {
+    profileSyncGenerationRef.current++; remnawaveClient.invalidateProfileSync(); cancelPing();
     await runActionOnce('logout', async () => {
       try {
         clearPendingConnectionQueue();
@@ -2987,6 +2992,7 @@ export default function App() {
                 onToggleSetting={toggleSetting}
                 onTunnelModeChange={(value) => void handleTunnelModeChange(value)}
                 onIpStackChange={(value) => void handleIpStackChange(value)}
+                onTunRoutingModeChange={value => { settingsRef.current = { ...settingsRef.current, tunRoutingMode: value }; setSettings(current => ({ ...current, tunRoutingMode: value })); }}
                 onLanguageChange={(value) => setSettings((current: AppSettings) => ({ ...current, language: value }))}
                 onRoutingExclusionsChange={(value) => {
                   settingsRef.current = { ...settingsRef.current, routingExclusions: value };
@@ -3019,6 +3025,7 @@ export default function App() {
         onToggleEntry={handleToggleSplitTunnelEntry}
         onChangePolicy={handleChangeSplitTunnelPolicy}
         tunnelMode={settings.tunnelMode}
+        tunRoutingMode={settings.tunRoutingMode}
         onRemoveEntry={handleRemoveSplitTunnelEntry}
         onPickExecutable={handlePickExecutableForSplitTunnel}
         onRefreshRunningApps={refreshRunningAppsForSplitTunnel}

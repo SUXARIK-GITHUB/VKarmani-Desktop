@@ -185,6 +185,7 @@ pub(crate) struct SplitTunnelEntryPayload {
 
 #[derive(Debug)]
 pub(crate) struct SplitTunnelRulePlan {
+    pub(crate) default_vpn: bool,
     pub(crate) process_matches: Vec<String>,
     pub(crate) direct_process_matches: Vec<String>,
     pub(crate) resolved_apps: usize,

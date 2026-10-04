@@ -1,0 +1,46 @@
+{
+  "splitTunnelEntries": [
+    {
+      "id": "chat",
+      "kind": "app",
+      "value": "Discord.exe",
+      "enabled": true,
+      "policy": "VPN",
+      "schemaVersion": 2
+    },
+    {
+      "id": "messenger",
+      "kind": "app",
+      "value": "Telegram.exe",
+      "enabled": true,
+      "policy": "VPN",
+      "schemaVersion": 2
+    },
+    {
+      "id": "script",
+      "kind": "app",
+      "value": "legacy-helper.bat",
+      "enabled": false,
+      "policy": "VPN",
+      "schemaVersion": 2,
+      "invalidReason": "RULE_INVALID"
+    },
+    {
+      "id": "legacy-service",
+      "kind": "app",
+      "value": "backgroundTaskHost.exe",
+      "enabled": true,
+      "policy": "VPN",
+      "schemaVersion": 2
+    },
+    {
+      "id": "legacy-jar",
+      "kind": "service",
+      "value": "legacy-installer.jar",
+      "enabled": false,
+      "policy": "VPN",
+      "schemaVersion": 2,
+      "invalidReason": "RULE_INVALID"
+    }
+  ]
+}

@@ -36,6 +36,8 @@ function toSafeSettings(settings: AppSettings) {
     autoInstallUpdates: settings.autoInstallUpdates,
     releaseChannel: settings.releaseChannel,
     protocolStrategy: settings.protocolStrategy,
+    sortServersByPing: settings.sortServersByPing,
+    tunRoutingMode: settings.tunRoutingMode,
     profileSyncOnLogin: settings.profileSyncOnLogin,
     allowDemoFallback: settings.allowDemoFallback,
     useSystemProxy: settings.useSystemProxy,

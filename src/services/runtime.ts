@@ -281,7 +281,8 @@ export async function requestNativeConnect(
   splitTunnelEntries: SplitTunnelEntry[] = [],
   ipStack: IpStack = 'ipv4',
   reconnect = false,
-  routingExclusions?: RoutingExclusionSettings
+  routingExclusions?: RoutingExclusionSettings,
+  tunRoutingMode: 'all' | 'selected' | 'exclude' = 'selected'
 ) {
   if (!isTauriRuntime) {
     return getNativeRuntimeStatus();
@@ -299,6 +300,7 @@ export async function requestNativeConnect(
     runtimeTemplate,
     canonicalTemplateJson: canonicalJson(runtimeTemplate),
     networkMode,
+    tunRoutingMode,
     splitTunnelEntries,
     ipStack,
     reconnect,

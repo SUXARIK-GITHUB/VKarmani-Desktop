@@ -1244,6 +1244,8 @@ function parseXrayConfigArray(payload: unknown, seed: string): VpnServer[] {
   };
 
   for (const { path, value } of arrays) {
+    const configList = value.some(item => isRecord(item) && Object.prototype.hasOwnProperty.call(item, 'outbounds'));
+    if (configList && value.some(item => !isRecord(item) || !Object.prototype.hasOwnProperty.call(item, 'outbounds'))) throw new XrayConfigError('GRAPH', `${path}: invalid configuration entry`);
     for (const item of value) {
       if (servers.length >= MAX_IMPORTED_SERVERS) break;
       pushServer(parseXrayConfigObject(item, `${seed}:${path}`, servers.length));
@@ -1926,7 +1928,7 @@ export function parseXrayJsonSubscriptionToServers(rawText: string): VpnServer[]
   const servers = parseXrayJsonOnlyServersFromPayload(parsed, 'xray-json');
   // Legacy structured rawHosts have no reference graph. Full configs are never
   // hidden by brand names: internal members are determined by their graph.
-  if (servers.some((server) => server.runtimeTemplate?.fullConfig)) return withUniqueSubscriptionIds(servers);
+  if (servers.some((server) => server.runtimeTemplate?.fullConfig)) return withUniqueSubscriptionIds(servers).map((server, sourceOrder) => ({ ...server, sourceOrder }));
   const visibleServers = filterRemnawaveCascadeBackendMembers(servers);
-  return withUniqueSubscriptionIds(isTechnicalOnlyCascadeBackendSet(visibleServers) ? [] : visibleServers);
+  return withUniqueSubscriptionIds(isTechnicalOnlyCascadeBackendSet(visibleServers) ? [] : visibleServers).map((server, sourceOrder) => ({ ...server, sourceOrder }));
 }
