@@ -42,6 +42,7 @@ pub(crate) fn build_runtime_status(
                 runtime.child.id(),
                 runtime.config_hash.clone(),
                 runtime.self_restart_count,
+                traffic_runtime_id(runtime),
             ))
         })
     });
@@ -107,6 +108,9 @@ pub(crate) fn build_runtime_status(
 
     static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     RuntimeStatus {
+        runtime_id: runtime_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.11.clone()),
         native_instance_id: INSTANCE
             .get_or_init(|| {
                 format!(

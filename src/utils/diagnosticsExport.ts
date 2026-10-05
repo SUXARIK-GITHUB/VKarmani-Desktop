@@ -6,6 +6,7 @@ import type {
   ProxyStatus,
   RemnawaveSession,
   RuntimeStatus,
+  TrafficSnapshot,
   UpdateInfo
 } from '../types/vpn';
 import { redactSensitiveText } from './redaction';
@@ -21,6 +22,8 @@ export interface SafeDiagnosticsExportInput {
   settings: AppSettings;
   session: RemnawaveSession | null;
   nativeLogLines: string[];
+  trafficSnapshot?: TrafficSnapshot | null;
+  trafficSampleCount?: number;
 }
 
 function toSafeSettings(settings: AppSettings) {
@@ -90,6 +93,8 @@ export function createSafeDiagnosticsPayload(input: SafeDiagnosticsExportInput):
     runtime: runtime && {bridge:runtime.bridge,coreFound:runtime.coreInstalled,active:runtime.tunnelActive,mode:runtime.networkMode,pid:runtime.xrayPid,revision:runtime.runtimeRevision,configHash:runtime.runtimeConfigHash,operation:operation(runtime.operation),lastOperation:operation(runtime.lastOperation),proxyOwnership:text(runtime.proxyOwnership),routeOwnership:text(runtime.routeOwnership),ownedRouteCount:runtime.ownedRoutes?.length ?? 0,reconnectAttempt:runtime.reconnectAttempt,lastExitCode:runtime.lastExitCode},
     proxy: {enabled:input.proxyStatus.enabled,autoDetect:input.proxyStatus.autoDetect,hasPac:Boolean(input.proxyStatus.autoConfigUrl),method:input.proxyStatus.method},
     probe: input.connectivityProbe && {success:input.connectivityProbe.success,httpPortOpen:input.connectivityProbe.httpPortOpen,socksPortOpen:input.connectivityProbe.socksPortOpen,latencyMs:input.connectivityProbe.latencyMs,checkedAt:text(input.connectivityProbe.checkedAt),message:text(input.connectivityProbe.message)},
+    traffic: {source:input.trafficSnapshot?.source ?? 'unavailable',checkedAt:text(input.trafficSnapshot?.checkedAt),runtimeId:text(input.trafficSnapshot?.runtimeId),sessionId:input.trafficSnapshot?.sessionId,receivedBytes:input.trafficSnapshot?.source === 'unavailable' ? null : input.trafficSnapshot?.receivedBytes,sentBytes:input.trafficSnapshot?.source === 'unavailable' ? null : input.trafficSnapshot?.sentBytes,unavailableReason:text(input.trafficSnapshot?.unavailableReason),sampleCount:input.trafficSampleCount ?? 0,baseline:'first measured counters; gaps and source transitions are not estimated'},
+    packetLoss: {source:'unavailable',value:null,reason:'No end-to-end packet-loss sampler; HTTP/TCP failures and interface discards are different metrics.'},
     subscription: {state:runtime?.subscriptionState ?? 'unconfirmed',source:input.session?.source,refreshAfter:runtime?.subscriptionRefreshAfter},
     profileSync: {status:input.profileSyncInfo.status,source:input.profileSyncInfo.source,configCount:input.profileSyncInfo.configCount,readyCount:input.profileSyncInfo.readyCount,message:text(input.profileSyncInfo.message)},
     update: {status:input.updateInfo.status,currentVersion:text(input.updateInfo.currentVersion),available:input.updateInfo.available,version:text(input.updateInfo.version)},

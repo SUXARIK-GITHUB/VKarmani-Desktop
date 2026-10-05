@@ -82,10 +82,10 @@ mod regression_cases {
     }
 
     #[test]
-    fn xray_stat_parser_reads_cli_value() {
+    fn rejects_obsolete_text_stats_output() {
         let output =
             "stat: <\n  name: \"outbound>>>proxy>>>traffic>>>downlink\"\n  value: 123456\n>";
-        assert_eq!(parse_xray_stat_value(output), Some(123456));
+        assert!(parse_client_inbound_stats(output).is_err()); // Old text output is not the bundled core JSON contract.
     }
 
     fn full_template(config: Value, kind: &str) -> RuntimeTemplate {

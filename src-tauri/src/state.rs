@@ -16,11 +16,13 @@ pub(crate) struct ManagedCore {
     pub(crate) server_id: String,
     pub(crate) server_fingerprint: Option<String>,
     pub(crate) started_at: String,
+    pub(crate) telemetry_epoch: u64,
     pub(crate) network_mode: String,
     pub(crate) tun_interface_name: Option<String>,
     pub(crate) tun_server_ips: Vec<String>,
     pub(crate) self_restart_count: u8,
     pub(crate) last_self_restart_at: Option<String>,
+    pub(crate) physical_binding: Option<DefaultRouteSnapshot>,
 }
 
 #[derive(Default)]
@@ -30,6 +32,8 @@ pub(crate) struct AppState {
     pub(crate) profile_count: Mutex<usize>,
     pub(crate) last_sync_source: Mutex<Option<String>>,
     pub(crate) runtime: Mutex<Option<ManagedCore>>,
+    pub(crate) traffic: Mutex<TrafficAccumulator>,
+    pub(crate) physical_recovery: Mutex<PhysicalRecoveryPolicy>,
     pub(crate) starting_runtime: Mutex<Option<StartingCore>>,
     pub(crate) last_exit_code: Mutex<Option<i32>>,
     pub(crate) operation_lock: Mutex<()>,
@@ -63,6 +67,7 @@ pub(crate) struct BootstrapInfo {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RuntimeStatus {
+    pub(crate) runtime_id: Option<String>,
     pub(crate) native_instance_id: String,
     pub(crate) bridge: String,
     pub(crate) core_installed: bool,
@@ -155,10 +160,14 @@ pub(crate) struct ConnectivityProbe {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TrafficSnapshot {
+    pub(crate) baseline_changed: bool,
     pub(crate) received_bytes: u64,
     pub(crate) sent_bytes: u64,
     pub(crate) checked_at: String,
     pub(crate) source: String,
+    pub(crate) runtime_id: String,
+    pub(crate) session_id: u64,
+    pub(crate) unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,12 +225,13 @@ pub(crate) struct IpifyResponse {
     pub(crate) ip: String,
 }
 
-#[cfg(target_os = "windows")]
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct DefaultRouteSnapshot {
     pub(crate) interface_index: u32,
     pub(crate) next_hop: String,
     pub(crate) interface_alias: String,
     pub(crate) source_ip: String,
+    pub(crate) interface_luid: u64,
+    pub(crate) dns_servers: Vec<String>,
 }

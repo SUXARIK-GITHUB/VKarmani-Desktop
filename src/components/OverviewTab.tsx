@@ -71,10 +71,6 @@ function formatLatency(server: VpnServer | null | undefined, language: UiLanguag
   }
 
   if (server?.latencyStatus === 'failed') {
-    const failedLatency = Number(server.latency);
-    if (server.latency !== null && server.latency !== undefined && Number.isFinite(failedLatency)) {
-      return `${Math.max(1, Math.round(failedLatency))} мс`;
-    }
     return tr(language, 'Нет ответа', 'No response');
   }
 
@@ -172,7 +168,7 @@ export function OverviewTab({
           <span className="vk-flag-large"><ServerFlag server={selectedServer} size="large" /></span>
           <div className="vk-hero-server-copy">
             <strong>{selectedName}</strong>
-            <span>{selectedMeta} · {selectedProtocol}</span>
+              {!isConnected && <span>{selectedMeta} · {selectedProtocol}</span>}
           </div>
           <div className="vk-hero-latency" title={selectedServer?.runtimeTemplate?.profileKind === 'auto' ? tr(language, 'Auto: минимальный измеренный пинг доступного участника; не текущий маршрут Xray.', 'Auto: lowest measured reachable member ping; not the current Xray route.') : undefined}>
             <Signal size={26} />
@@ -280,7 +276,7 @@ export function OverviewTab({
           </div>
           <div className="vk-traffic-chart" aria-hidden="true">
             {trafficChartBars.map((height, index) => (
-              <span key={`${height}-${index}`} style={{ height: `${height}%` }} />
+              <span key={index} style={{ height: `${height}%` }} />
             ))}
           </div>
           <div className="vk-traffic-stats">
@@ -313,7 +309,7 @@ export function OverviewTab({
             </div>
             <div className="vk-session-line">
               <span className="vk-session-line-label">{tr(language, 'Потеря пакетов', 'Packet loss')}</span>
-              <strong className="vk-session-line-value">{packetLossText}</strong>
+              <strong className="vk-session-line-value" title={tr(language, 'Нет достоверного измерения сквозной потери пакетов. HTTP/TCP и счётчики интерфейса её не измеряют.', 'No reliable end-to-end packet-loss measurement. HTTP/TCP and interface counters do not measure it.')}>{packetLossText}</strong>
             </div>
           </div>
         </article>

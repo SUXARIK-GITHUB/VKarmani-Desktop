@@ -1,6 +1,7 @@
 use super::*;
 
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+const RETAIN_LOG_BYTES: u64 = MAX_LOG_BYTES / 2;
 static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 struct SafeLog {
     file: File,
@@ -51,6 +52,7 @@ pub(crate) fn validate_or_create_log(path: &Path) -> Result<(), String> {
         .ok_or_else(|| "LOG_OPEN".into())
         .map(|_| ())
 }
+#[cfg(test)]
 pub(crate) fn reset_bounded_log(path: &Path) -> Result<(), String> {
     let _guard = LOG_WRITE_LOCK.lock().map_err(|_| "LOG_LOCK")?;
     let log = open_safe_log(path, true)?.ok_or("LOG_OPEN")?;
@@ -63,7 +65,47 @@ pub(crate) fn append_bounded_log(path: &Path, line: &str) -> Result<(), String> 
     if log.file.metadata().map_err(|_| "LOG_METADATA")?.len() + line.len() as u64 + 1
         > MAX_LOG_BYTES
     {
+        // Read only a bounded tail, discard its partial first line (which can
+        // start inside UTF-8 or a credential), and redact complete lines again.
+        let size = log.file.metadata().map_err(|_| "LOG_METADATA")?.len();
+        let start = size.saturating_sub(RETAIN_LOG_BYTES);
+        log.file
+            .seek(SeekFrom::Start(start))
+            .map_err(|_| "LOG_SEEK")?;
+        let mut bytes = Vec::new();
+        (&mut log.file)
+            .take(RETAIN_LOG_BYTES)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "LOG_READ")?;
+        let content = String::from_utf8_lossy(&bytes);
+        let complete = if start > 0 {
+            content.split_once('\n').map(|(_, tail)| tail).unwrap_or("")
+        } else {
+            &content
+        };
+        let retained = complete
+            .lines()
+            .map(|row| redact_sensitive(&row.chars().take(4096).collect::<String>()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Redaction can expand short credentials. Bound the resulting bytes,
+        // trimming at a complete line rather than at a UTF-8 byte boundary.
+        let retained = if retained.len() > RETAIN_LOG_BYTES as usize {
+            retained.as_bytes()[retained.len() - RETAIN_LOG_BYTES as usize..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|offset| &retained[retained.len() - RETAIN_LOG_BYTES as usize + offset + 1..])
+                .unwrap_or("")
+        } else {
+            &retained
+        };
         log.file.set_len(0).map_err(|_| "LOG_TRUNCATE")?;
+        log.file.seek(SeekFrom::Start(0)).map_err(|_| "LOG_SEEK")?;
+        writeln!(
+            log.file,
+            "[VKarmani log compacted; oldest lines discarded]\n{retained}"
+        )
+        .map_err(|_| "LOG_WRITE")?;
     }
     log.file.seek(SeekFrom::End(0)).map_err(|_| "LOG_SEEK")?;
     writeln!(log.file, "{line}").map_err(|_| "LOG_WRITE".into())
@@ -144,6 +186,58 @@ pub(crate) fn tail_runtime_log(app: &AppHandle, lines: usize) -> Result<Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rotation_keeps_recent_utf8_and_redacts_preserved_lines() {
+        let path =
+            std::env::temp_dir().join(format!("vkarmani-log-rotation-{}.txt", std::process::id()));
+        let recent =
+            "\nuseful before rotation Я\nAuthorization: Bearer synthetic-rotation-secret\n";
+        fs::write(
+            &path,
+            format!("{}{}", "x".repeat(MAX_LOG_BYTES as usize), recent),
+        )
+        .unwrap();
+        append_bounded_log(&path, "latest Ю").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("useful before rotation Я"));
+        assert!(text.contains("latest Ю"));
+        assert!(!text.contains("synthetic-rotation-secret"));
+        assert!(fs::metadata(&path).unwrap().len() <= MAX_LOG_BYTES);
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn repeated_unicode_rotations_keep_disk_and_reader_bounded() {
+        let path =
+            std::env::temp_dir().join(format!("vkarmani-log-stress-{}.txt", std::process::id()));
+        let _ = fs::remove_file(&path);
+        for index in 0..2400 {
+            append_bounded_log(&path, &format!("event {index} {}", "Ю".repeat(3000))).unwrap();
+            assert!(fs::metadata(&path).unwrap().len() <= MAX_LOG_BYTES);
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("event 2399"));
+        assert!(text.contains("event 2398"));
+        assert!(bounded_log_tail(&path, usize::MAX).unwrap().len() <= 200);
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn rotation_byte_limit_survives_redaction_expansion_and_utf8_boundary() {
+        let path =
+            std::env::temp_dir().join(format!("vkarmani-log-expansion-{}.txt", std::process::id()));
+        let contents = format!(
+            "{}\n{}\nuseful recent Ю\n",
+            "Я".repeat(MAX_LOG_BYTES as usize / 2),
+            "key=x\n".repeat(160_000)
+        );
+        fs::write(&path, contents).unwrap();
+        append_bounded_log(&path, "latest data Я").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("key=x"));
+        assert!(text.contains("useful recent Ю"));
+        assert!(text.ends_with("latest data Я\n"));
+        assert!(fs::metadata(&path).unwrap().len() <= MAX_LOG_BYTES);
+        fs::remove_file(path).unwrap();
+    }
     #[cfg(target_os = "windows")]
     #[test]
     fn hardlinked_log_is_rejected_without_modifying_target() {

@@ -95,11 +95,6 @@ pub(crate) fn log_timestamp_string() -> String {
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
-pub(crate) fn local_day_folder_name() -> String {
-    let (year, month, day, _, _, _, _) = utc_date_parts();
-    format!("{year:04}-{month:02}-{day:02}")
-}
-
 #[allow(dead_code)]
 pub(crate) fn looks_like_launch_root(path: &Path) -> bool {
     path.join("package.json").exists()
@@ -172,22 +167,24 @@ pub(crate) fn app_logs_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(logs_root)
 }
 
-pub(crate) fn daily_log_root(app: &AppHandle) -> Result<PathBuf, String> {
-    let root = app_logs_base_dir(app)?.join(local_day_folder_name());
+pub(crate) fn bounded_log_root(app: &AppHandle) -> Result<PathBuf, String> {
+    // Three rolling sinks, not a new directory every day. Historical daily
+    // directories may belong to an installed build and are never swept here.
+    let root = app_logs_base_dir(app)?.join("rolling-v1");
     ensure_safe_log_directory(&root)
         .map_err(|error| format!("Не удалось создать каталог логов дня: {error}"))?;
     Ok(root)
 }
 
 pub(crate) fn interface_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let path = daily_log_root(app)?.join("Interface");
+    let path = bounded_log_root(app)?.join("Interface");
     ensure_safe_log_directory(&path)
         .map_err(|error| format!("Не удалось создать Interface каталог: {error}"))?;
     Ok(path)
 }
 
 pub(crate) fn routing_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let path = daily_log_root(app)?.join("routing");
+    let path = bounded_log_root(app)?.join("routing");
     ensure_safe_log_directory(&path)
         .map_err(|error| format!("Не удалось создать routing каталог: {error}"))?;
     Ok(path)

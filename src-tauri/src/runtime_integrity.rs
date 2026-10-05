@@ -159,6 +159,45 @@ mod windows {
             .map_err(|_| "PROVENANCE_SEEK")?;
         Ok(file)
     }
+    pub(super) fn read_config(path: &Path, hash: &str) -> Result<Value, String> {
+        let _parents = lock_ancestors(path)?;
+        let mut file = verified_file(path, None, hash)?;
+        if file.metadata().map_err(|_| "CONFIG_METADATA")?.len() > 2 * 1024 * 1024 {
+            return Err("CONFIG_TOO_LARGE".into());
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|_| "CONFIG_READ")?;
+        serde_json::from_slice(&bytes).map_err(|_| "CONFIG_JSON_INVALID".into())
+    }
+    #[test]
+    fn recovery_config_reader_verifies_hash_json_limit_and_preserves_input() {
+        let dir =
+            std::env::temp_dir().join(format!("vkarmani-recovery-reader-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("config.json");
+        let bytes = br#"{"outbounds":[],"synthetic":true}"#;
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            read_config(&path, &sha256_hex_bytes(bytes)).unwrap()["synthetic"],
+            json!(true)
+        );
+        assert!(read_config(&path, &"0".repeat(64))
+            .unwrap_err()
+            .contains("HASH_MISMATCH"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::write(&path, b"not json").unwrap();
+        assert!(read_config(&path, &sha256_hex_bytes(b"not json"))
+            .unwrap_err()
+            .contains("JSON_INVALID"));
+        let large = vec![b' '; 2 * 1024 * 1024 + 1];
+        fs::write(&path, &large).unwrap();
+        assert!(read_config(&path, &sha256_hex_bytes(&large))
+            .unwrap_err()
+            .contains("TOO_LARGE"));
+        assert_eq!(fs::metadata(&path).unwrap().len(), large.len() as u64);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
     static STAGE_ARTIFACT_LOCK: Mutex<()> = Mutex::new(());
     fn stage_verified_artifact(
         source: &mut impl Read,
@@ -542,6 +581,17 @@ pub(crate) fn prepare_core_launch(
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (core, config);
+        Err("WINDOWS_RUNTIME_REQUIRED".into())
+    }
+}
+pub(crate) fn read_verified_runtime_config(path: &Path, hash: &str) -> Result<Value, String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::read_config(path, hash)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (path, hash);
         Err("WINDOWS_RUNTIME_REQUIRED".into())
     }
 }

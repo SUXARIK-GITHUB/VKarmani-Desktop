@@ -55,7 +55,7 @@ export function useSettingsNavigation<T extends string>(ids: readonly T[]) {
           }
           return;
         }
-        const next = activeSettingsSection(geometry.sections, container.scrollTop, geometry.offset);
+        const next = activeSettingsSection(geometry.sections, container.scrollTop, geometry.offset, container.scrollHeight - container.clientHeight);
         if (next) setActiveSection(current => current === next ? current : next);
       });
     };
@@ -70,8 +70,6 @@ export function useSettingsNavigation<T extends string>(ids: readonly T[]) {
       lock.current = null; update();
     };
     const resize = () => {
-      const geometry = measure(), last = sections[sections.length - 1]?.element;
-      container.style.setProperty('--settings-scroll-tail', `${Math.max(22, container.clientHeight - geometry.offset - (last?.getBoundingClientRect().height ?? 0))}px`);
       if (lock.current) navigate(lock.current);
       update();
     };
@@ -93,7 +91,6 @@ export function useSettingsNavigation<T extends string>(ids: readonly T[]) {
       container.removeEventListener('scroll', update); container.removeEventListener('scrollend', scrollEnd); container.removeEventListener('wheel', interrupt);
       container.removeEventListener('pointerdown', interrupt); container.removeEventListener('keydown', interrupt);
       if (frame !== null) cancelAnimationFrame(frame);
-      container.style.removeProperty('--settings-scroll-tail');
       measureRef.current = null; updateRef.current = null; lock.current = null;
     };
   }, [ids, navigate]);

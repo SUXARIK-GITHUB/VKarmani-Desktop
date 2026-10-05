@@ -319,15 +319,6 @@ pub(crate) fn normalize_socket_host(host: &str) -> String {
     host.trim().trim_matches('[').trim_matches(']').to_string()
 }
 
-pub(crate) fn format_endpoint_for_display(host: &str, port: u16) -> String {
-    let normalized = normalize_socket_host(host);
-    if normalized.contains(':') {
-        format!("[{normalized}]:{port}")
-    } else {
-        format!("{normalized}:{port}")
-    }
-}
-
 pub(crate) fn resolve_socket_addresses(
     host: &str,
     port: u16,
@@ -626,11 +617,132 @@ fn wait_for_restarted_xray_ready(
     }
 }
 
+struct PreparedNetworkConfig {
+    path: PathBuf,
+    hash: String,
+    binding: DefaultRouteSnapshot,
+    committed: bool,
+    _parents: Vec<File>,
+}
+impl Drop for PreparedNetworkConfig {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+fn current_physical_binding() -> Result<DefaultRouteSnapshot, String> {
+    #[cfg(target_os = "windows")]
+    {
+        default_route_snapshot()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("WINDOWS_NETWORK_REQUIRED".into())
+    }
+}
+fn prepare_network_config(
+    runtime: &ManagedCore,
+    fresh: DefaultRouteSnapshot,
+) -> Result<PreparedNetworkConfig, String> {
+    let prior = runtime
+        .physical_binding
+        .as_ref()
+        .ok_or("NETWORK_PRIOR_BINDING_UNKNOWN")?;
+    let original =
+        read_verified_runtime_config(Path::new(&runtime.config_path), &runtime.config_hash)?;
+    let config = rebind_tun_config(&original, prior, &fresh)?;
+    validate_full_config_graph(&config)?;
+    let bytes = serde_json::to_vec_pretty(&config).map_err(|_| "NETWORK_CONFIG_SERIALIZE")?;
+    let path = Path::new(&runtime.config_path)
+        .parent()
+        .ok_or("NETWORK_CONFIG_PARENT")?
+        .join(format!(
+            "xray-config-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+    let parents = lock_runtime_parent_paths(&path)?;
+    write_new_runtime_config(&path, &bytes)?;
+    let prepared = PreparedNetworkConfig {
+        path,
+        hash: sha256_hex_bytes(&bytes),
+        binding: fresh,
+        committed: false,
+        _parents: parents,
+    };
+    // Xray constructs/starts its TUN adapter inside core.New even for -test.
+    // Check provider transports without constructing another live TUN. The
+    // unchanged full config is validated only after confirmed owned-child stop.
+    let mut projection = config.clone();
+    projection["inbounds"]
+        .as_array_mut()
+        .ok_or("NETWORK_CONFIG_INBOUNDS")?
+        .retain(|inbound| inbound["protocol"] != "tun");
+    let projection_bytes =
+        serde_json::to_vec_pretty(&projection).map_err(|_| "NETWORK_CONFIG_SERIALIZE")?;
+    let projection_path = prepared.path.with_extension("preflight.json");
+    let projection_parents = lock_runtime_parent_paths(&projection_path)?;
+    write_new_runtime_config(&projection_path, &projection_bytes)?;
+    let projection_guard = PreparedNetworkConfig {
+        path: projection_path,
+        hash: sha256_hex_bytes(&projection_bytes),
+        binding: prepared.binding.clone(),
+        committed: false,
+        _parents: projection_parents,
+    };
+    validate_xray_config_with_core(
+        Path::new(&runtime.core_path),
+        &projection_guard.path,
+        &projection_guard.hash,
+    )?;
+    Ok(prepared)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod recovery_config_tests {
+    use super::*;
+    #[test]
+    fn prepared_recovery_cleanup_pins_parent_and_preserves_other_files() {
+        let dir =
+            std::env::temp_dir().join(format!("vkarmani-recovery-config-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let foreign = dir.join("foreign.txt");
+        fs::write(&foreign, b"preserve").unwrap();
+        let path = dir.join("new-config.json");
+        let parents = lock_runtime_parent_paths(&path).unwrap();
+        write_new_runtime_config(&path, b"{}").unwrap();
+        let prepared = PreparedNetworkConfig {
+            path: path.clone(),
+            hash: sha256_hex_bytes(b"{}"),
+            binding: DefaultRouteSnapshot {
+                interface_index: 12,
+                interface_luid: 1212,
+                interface_alias: "Ethernet".into(),
+                source_ip: "192.0.2.12".into(),
+                next_hop: "192.0.2.1".into(),
+                dns_servers: vec![],
+            },
+            committed: false,
+            _parents: parents,
+        };
+        assert!(fs::rename(&dir, dir.with_extension("replaced")).is_err());
+        drop(prepared);
+        assert!(!path.exists());
+        assert_eq!(fs::read(&foreign).unwrap(), b"preserve");
+        fs::remove_file(foreign).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+}
 fn try_self_restart_xray_runtime(
     app: &AppHandle,
     state: &tauri::State<AppState>,
     mut runtime: ManagedCore,
     exit_code: Option<i32>,
+    mut prepared_network: Option<PreparedNetworkConfig>,
 ) -> Result<(), Box<(ManagedCore, String)>> {
     if runtime.self_restart_count >= MAX_XRAY_SELF_RESTARTS {
         let restart_count = runtime.self_restart_count;
@@ -641,6 +753,30 @@ fn try_self_restart_xray_runtime(
                 restart_count, MAX_XRAY_SELF_RESTARTS
             ),
         )));
+    }
+
+    // Crash recovery also re-evaluates physical state instead of reviving a
+    // stale saved sendThrough/interface. Unknown physical egress fails closed.
+    if runtime.network_mode == "tun" && prepared_network.is_none() {
+        let fresh = match current_physical_binding() {
+            Ok(value) => value,
+            Err(error) => return Err(Box::new((runtime, error))),
+        };
+        if runtime.physical_binding.as_ref() != Some(&fresh) {
+            prepared_network = match prepare_network_config(&runtime, fresh) {
+                Ok(value) => Some(value),
+                Err(error) => return Err(Box::new((runtime, error))),
+            };
+        }
+    }
+    if let Some(prepared) = prepared_network.as_ref() {
+        let old_path = runtime.config_path.clone();
+        // Caller has confirmed old child termination before replacing config.
+        runtime.child.release_integrity();
+        runtime.config_path = prepared.path.to_string_lossy().into_owned();
+        runtime.config_hash = prepared.hash.clone();
+        runtime.physical_binding = Some(prepared.binding.clone());
+        let _ = fs::remove_file(old_path);
     }
 
     let core_path = PathBuf::from(&runtime.core_path);
@@ -692,6 +828,23 @@ fn try_self_restart_xray_runtime(
             "OPERATION_CANCELLED: ожидается отключение.".into(),
         )));
     }
+    // Retire the old journal before a replacement TUN can reuse the old index
+    // with a new LUID. Only exact owned routes are eligible for cleanup.
+    if runtime.network_mode == "tun" {
+        if let Err(error) =
+            cleanup_tun_routes_for_app(app, TUN_INTERFACE_NAME, &runtime.tun_server_ips)
+        {
+            return Err(Box::new((
+                runtime,
+                format!("NETWORK_RECOVERY_ROUTE_CLEANUP: {error}"),
+            )));
+        }
+        if let Err(error) =
+            validate_xray_config_with_core(&core_path, &config_path, &runtime.config_hash)
+        {
+            return Err(Box::new((runtime, error)));
+        }
+    }
 
     let mut child =
         match spawn_xray_runtime_child(&core_path, &config_path, &log_path, &runtime.config_hash) {
@@ -733,13 +886,26 @@ fn try_self_restart_xray_runtime(
         let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
         return Err(Box::new((runtime, error)));
     }
+    if runtime.network_mode == "tun"
+        && current_physical_binding().ok().as_ref() != runtime.physical_binding.as_ref()
+    {
+        let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+        return Err(Box::new((runtime, "NETWORK_CHANGED_DURING_RESTART".into())));
+    }
     runtime.child = child;
     runtime.started_at = unix_now_string();
+    runtime.telemetry_epoch = next_telemetry_epoch();
     runtime.self_restart_count = attempt;
     runtime.last_self_restart_at = Some(unix_now_string());
-
-    if let Ok(mut runtime_guard) = state.runtime.lock() {
-        *runtime_guard = Some(runtime);
+    match state.runtime.lock() {
+        Ok(mut runtime_guard) => *runtime_guard = Some(runtime),
+        Err(_) => {
+            let _ = terminate_child_with_timeout(&mut runtime.child, Duration::from_secs(3));
+            return Err(Box::new((runtime, "NETWORK_RUNTIME_PUBLISH_FAILED".into())));
+        }
+    }
+    if let Some(prepared) = prepared_network.as_mut() {
+        prepared.committed = true;
     }
     if let Ok(mut connected_guard) = state.connected.lock() {
         *connected_guard = true;
@@ -863,7 +1029,7 @@ pub(crate) fn sync_runtime_liveness(app: &AppHandle, state: &tauri::State<AppSta
         return;
     };
 
-    match try_self_restart_xray_runtime(app, state, runtime, exit_code) {
+    match try_self_restart_xray_runtime(app, state, runtime, exit_code, None) {
         Ok(()) => {
             operation.commit();
         }
@@ -874,13 +1040,138 @@ pub(crate) fn sync_runtime_liveness(app: &AppHandle, state: &tauri::State<AppSta
     }
 }
 
+fn sync_physical_network(app: &AppHandle, state: &tauri::State<AppState>) {
+    if state
+        .stop_requested
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+    let Ok(serialization) = state.operation_lock.try_lock() else {
+        return;
+    };
+    let (epoch, active) = {
+        let Ok(runtime) = state.runtime.lock() else {
+            return;
+        };
+        let Some(runtime) = runtime.as_ref().filter(|runtime| {
+            runtime.network_mode == "tun" && runtime.self_restart_count < MAX_XRAY_SELF_RESTARTS
+        }) else {
+            return;
+        };
+        let Some(active) = runtime.physical_binding.clone() else {
+            return;
+        };
+        (runtime.telemetry_epoch, active)
+    };
+    let observed = current_physical_binding().ok();
+    #[cfg(target_os = "windows")]
+    let tick = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+    #[cfg(not(target_os = "windows"))]
+    let tick = 0;
+    #[cfg(target_os = "windows")]
+    let suspend_clock = suspend_elapsed_ms(tick);
+    #[cfg(not(target_os = "windows"))]
+    let suspend_clock = None;
+    let should_recover = state
+        .physical_recovery
+        .lock()
+        .map(|mut policy| {
+            policy.record_suspend_clock(suspend_clock);
+            policy.observe(tick, epoch, &active, observed.clone())
+        })
+        .unwrap_or(false);
+    if !should_recover {
+        return;
+    }
+    let Some(fresh) = observed else {
+        return;
+    };
+    let Ok(mut operation) =
+        adopt_runtime_operation(state, serialization, "reconnect", Duration::from_secs(45))
+    else {
+        return;
+    };
+    let prepared = {
+        let Ok(runtime) = state.runtime.lock() else {
+            return;
+        };
+        let Some(runtime) = runtime
+            .as_ref()
+            .filter(|runtime| runtime.telemetry_epoch == epoch)
+        else {
+            return;
+        };
+        prepare_network_config(runtime, fresh.clone())
+    };
+    let prepared = match prepared {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = append_runtime_event(
+                app,
+                &format!("NETWORK_RECOVERY_PREFLIGHT: {error}; active runtime retained."),
+            );
+            return;
+        }
+    };
+    if operation.check().is_err() || current_physical_binding().ok().as_ref() != Some(&fresh) {
+        return;
+    }
+    let runtime_to_stop = {
+        let Ok(mut guard) = state.runtime.lock() else {
+            return;
+        };
+        if guard.as_ref().map(|runtime| runtime.telemetry_epoch) != Some(epoch) {
+            return;
+        }
+        guard.take()
+    };
+    let Some(runtime) = runtime_to_stop else {
+        return;
+    };
+    if operation.stage("stopping").is_err() {
+        if let Ok(mut guard) = state.runtime.lock() {
+            *guard = Some(runtime);
+        }
+        return;
+    }
+    let _=append_runtime_event(app,"NETWORK_RECOVERY: stable physical state/resume observed; restarting the exact owned TUN child with fresh interface/source/DNS observation.");
+    match run_owned_recovery(
+        runtime,
+        |runtime| {
+            terminate_child_with_timeout(&mut runtime.child, Duration::from_secs(3)).is_some()
+        },
+        |runtime| try_self_restart_xray_runtime(app, state, runtime, None, Some(prepared)),
+    ) {
+        OwnedRecoveryOutcome::Retained(runtime) => {
+            if let Ok(mut guard) = state.runtime.lock() {
+                *guard = Some(runtime);
+            }
+            let _=append_runtime_event(app,"NETWORK_RECOVERY_STOP_UNCONFIRMED: runtime retained; no replacement child or routes.");
+        }
+        OwnedRecoveryOutcome::Started => {
+            operation.commit();
+            let _ = app.emit("vkarmani://network-recovered", "tun");
+        }
+        OwnedRecoveryOutcome::Failed(failure) => {
+            let (runtime, error) = *failure;
+            finalize_unexpected_xray_exit(app, state, runtime, None, &error);
+        }
+    }
+}
+
 pub(crate) fn start_runtime_watchdog(app: AppHandle) {
     std::thread::spawn(move || {
         let mut last_orphan_sweep = Instant::now();
+        let mut network_tick = 0u8;
         loop {
             std::thread::sleep(Duration::from_secs(2));
             let state = app.state::<AppState>();
             sync_runtime_liveness(&app, &state);
+            network_tick = network_tick.wrapping_add(1);
+            if network_tick % 2 == 0 {
+                sync_physical_network(&app, &state);
+            }
 
             if last_orphan_sweep.elapsed() < Duration::from_secs(8) {
                 continue;

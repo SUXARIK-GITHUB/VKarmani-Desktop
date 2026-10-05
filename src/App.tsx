@@ -21,7 +21,7 @@ import { useSyncedRef } from './hooks/useSyncedRef';
 import { buildDiagnosticsFilename, createSafeDiagnosticsPayload, downloadTextFile } from './utils/diagnosticsExport';
 import { sleep } from './utils/async';
 import { activePolicyEntries, isSelectedTunPolicyEmpty, insertRule, rulesOverlap } from './utils/appPolicies';
-import { buildTrafficBars, formatTrafficBytes } from './utils/traffic';
+import { appendTrafficSample, buildTrafficBars, formatTrafficBytes, validTrafficSnapshot, type TrafficSample } from './utils/traffic';
 import { assertNativeRuntimeServerMatches, runtimeConfirmsTargetServer } from './services/connectionGuards';
 import { pickPreferredServer, rankServersForDisplay } from './utils/serverSorting';
 import { resolveConnectedProfile, buildServerRuntimeFingerprint, isVpnServerLike, resolveServerReference, migrateServerReferences } from './utils/serverIdentity';
@@ -33,6 +33,7 @@ import {
   getIntegrationMeta,
   getNativeAppInfo,
   getNativeTrafficSnapshot,
+  beginNativeTrafficSession,
   readNativeRuntimeLog,
   repairNativeRuntimeEnvironment,
   isTauriRuntime,
@@ -133,7 +134,8 @@ export default function App() {
   const [vpnExternalIp, setVpnExternalIp] = useState('—');
   const [sessionDuration, setSessionDuration] = useState(0);
   const [connectedAt, setConnectedAt] = useState<number | null>(null);
-  const [trafficBaseline, setTrafficBaseline] = useState<TrafficSnapshot | null>(null);
+  const trafficSessionRef = useRef<Promise<number> | null>(null);
+  const [trafficHistory, setTrafficHistory] = useState<TrafficSample[]>([]);
   const [trafficCurrent, setTrafficCurrent] = useState<TrafficSnapshot | null>(null);
   const [searchValue, setSearchValue] = useState('');
   const [isSyncingProfile, setIsSyncingProfile] = useState(false);
@@ -441,12 +443,11 @@ export default function App() {
 
   useEffect(() => {
     if (connectionState === 'connected') {
-      setConnectedAt((current) => current ?? Date.now());
+      setConnectedAt((current) => current ?? performance.now());
       return;
     }
 
-    setConnectedAt(null);
-    setSessionDuration(0);
+    if (connectionState === 'idle') { setConnectedAt(null); setSessionDuration(0); }
   }, [connectionState]);
 
   useEffect(() => {
@@ -455,7 +456,7 @@ export default function App() {
     }
 
     const updateDuration = () => {
-      setSessionDuration(Math.max(0, Math.floor((Date.now() - connectedAt) / 1000)));
+      setSessionDuration(Math.max(0, Math.floor((performance.now() - connectedAt) / 1000)));
     };
 
     updateDuration();
@@ -466,72 +467,38 @@ export default function App() {
 
 
   useEffect(() => {
-    let cancelled = false;
-    let timer: number | undefined;
-    let inFlight = false;
-
-    if (connectionState !== 'connected') {
-      setTrafficBaseline(null);
-      setTrafficCurrent(null);
-      return undefined;
+    let cancelled = false, inFlight = false;
+    if (connectionState === 'idle') {
+      trafficSessionRef.current = null;
+      setTrafficCurrent(null); setTrafficHistory([]);
+      return;
     }
-
-    const startedAt = connectedAt ?? Date.now();
-
+    if (connectionState !== 'connected') { setTrafficCurrent(null); return; }
+    // Native monotonic token survives clock changes and UI/runtime transitions.
+    const session = trafficSessionRef.current ?? beginNativeTrafficSession();
+    trafficSessionRef.current = session;
+    const runtimeId = runtimeStatus.runtimeId;
     const updateTraffic = async () => {
-      if (inFlight) {
-        return;
-      }
-
+      if (inFlight) return;
       inFlight = true;
       try {
-        const snapshot = await getNativeTrafficSnapshot();
-        if (cancelled) {
-          return;
+        const sessionId = await session;
+        if (cancelled || trafficSessionRef.current !== session) return;
+        const snapshot = await getNativeTrafficSnapshot(sessionId);
+        if (cancelled || trafficSessionRef.current !== session) return;
+        if (snapshot.sessionId !== sessionId || (runtimeId && snapshot.runtimeId !== runtimeId)) {
+          setTrafficCurrent(null); return;
         }
-
-        if (snapshot.source === 'unavailable') {
-          const elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
-          const estimated: TrafficSnapshot = {
-            receivedBytes: Math.max(0, elapsedSeconds * 18_000),
-            sentBytes: Math.max(0, elapsedSeconds * 6_000),
-            checkedAt: new Date().toLocaleString('ru-RU'),
-            source: 'session-estimate'
-          };
-          setTrafficBaseline((current) => current ?? { ...estimated, receivedBytes: 0, sentBytes: 0 });
-          setTrafficCurrent(estimated);
-          return;
-        }
-
-        setTrafficBaseline((current) => current ?? snapshot);
         setTrafficCurrent(snapshot);
-      } catch {
-        if (!cancelled) {
-          const elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
-          const estimated: TrafficSnapshot = {
-            receivedBytes: Math.max(0, elapsedSeconds * 18_000),
-            sentBytes: Math.max(0, elapsedSeconds * 6_000),
-            checkedAt: new Date().toLocaleString('ru-RU'),
-            source: 'session-estimate'
-          };
-          setTrafficBaseline((current) => current ?? { ...estimated, receivedBytes: 0, sentBytes: 0 });
-          setTrafficCurrent(estimated);
-        }
-      } finally {
-        inFlight = false;
-      }
+        if (validTrafficSnapshot(snapshot)) setTrafficHistory(history => appendTrafficSample(history, snapshot, performance.now()));
+      } catch { if (!cancelled) setTrafficCurrent(null); }
+      finally { inFlight = false; }
     };
-
     void updateTraffic();
-    timer = window.setInterval(() => void updateTraffic(), 15000);
-
-    return () => {
-      cancelled = true;
-      if (timer !== undefined) {
-        window.clearInterval(timer);
-      }
-    };
-  }, [connectionState, connectedAt]);
+    // One bounded CLI query in Proxy; native GetIfEntry2 in TUN. No overlapping polls.
+    const timer = window.setInterval(() => void updateTraffic(), 30000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [connectionState, runtimeStatus.runtimeId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -897,17 +864,11 @@ export default function App() {
   const favoriteServerIdSet = useMemo(() => new Set(favoriteServerIds), [favoriteServerIds]);
   const deferredSearchValue = useDeferredValue(searchValue);
 
-  const trafficReceivedBytes = Math.max(0, (trafficCurrent?.receivedBytes ?? 0) - (trafficBaseline?.receivedBytes ?? 0));
-  const trafficSentBytes = Math.max(0, (trafficCurrent?.sentBytes ?? 0) - (trafficBaseline?.sentBytes ?? 0));
-  const trafficChartBars = useMemo(
-    () => buildTrafficBars(trafficReceivedBytes, trafficSentBytes, sessionDuration),
-    [trafficReceivedBytes, trafficSentBytes, sessionDuration]
-  );
-  const packetLossText = connectivityProbe?.packetLossPct !== undefined
-    ? `${connectivityProbe.packetLossPct}%`
-    : connectivityProbe?.success
-      ? '0%'
-      : '—';
+  const trafficReceivedBytes = validTrafficSnapshot(trafficCurrent) ? trafficCurrent.receivedBytes : null;
+  const trafficSentBytes = validTrafficSnapshot(trafficCurrent) ? trafficCurrent.sentBytes : null;
+  const trafficChartBars = useMemo(() => validTrafficSnapshot(trafficCurrent) ? buildTrafficBars(trafficHistory) : [], [trafficCurrent, trafficHistory]);
+  // No end-to-end loss measurement exists. HTTP/TCP success is not packet loss.
+  const packetLossText = '—';
 
   const filteredServers = useMemo(() => {
     const normalized = deferredSearchValue.trim().toLowerCase();
@@ -2736,7 +2697,8 @@ export default function App() {
         updateInfo: updateInfoRef.current,
         settings: settingsRef.current,
         session,
-        nativeLogLines
+        nativeLogLines,
+        trafficSnapshot: trafficCurrent, trafficSampleCount: trafficHistory.length
       });
 
       downloadTextFile(buildDiagnosticsFilename(), payload);
@@ -2917,8 +2879,8 @@ export default function App() {
                 onRefreshPing={() => void handleRefreshPing()}
                 onToggleFavoriteServer={handleToggleFavoriteServer}
                 favoriteServerIds={favoriteServerIds}
-                trafficReceivedText={formatTrafficBytes(trafficReceivedBytes)}
-                trafficSentText={formatTrafficBytes(trafficSentBytes)}
+                trafficReceivedText={formatTrafficBytes(trafficReceivedBytes, settings.language)}
+                trafficSentText={formatTrafficBytes(trafficSentBytes, settings.language)}
                 trafficChartBars={trafficChartBars}
                 vpnExternalIp={connectionState === 'connected' ? vpnExternalIp : '—'}
                 packetLossText={packetLossText}

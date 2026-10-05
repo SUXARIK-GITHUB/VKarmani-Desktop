@@ -56,7 +56,7 @@ export function applyPingBatch(current: VpnServer[], snapshot: VpnServer[], batc
   // Pointer identity covers replacement even when IDs/endpoint labels are equal.
   if (current !== snapshot) return current;
   const results = new Map(batch.results.map(result => [result.id, result]));
-  const checkedAt = new Date().toLocaleString('ru-RU');
+  const checkedAt = new Date().toISOString();
   return current.map(server => {
     const result = results.get(server.id);
     if (!result || result.status === 'cancelled') return server;

@@ -297,6 +297,7 @@ pub fn run() {
             repair_runtime_environment,
             server_ping,
             traffic_snapshot,
+            traffic_session_start,
             read_runtime_log,
             list_running_apps,
             list_windows_services,

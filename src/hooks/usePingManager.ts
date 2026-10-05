@@ -22,6 +22,7 @@ interface UsePingManagerArgs {
 interface PingOptions {
   silent?: boolean;
   reason?: string;
+  activeOnly?: boolean;
 }
 
 export function usePingManager({
@@ -52,6 +53,8 @@ export function usePingManager({
   const controllerRef = useRef<AbortController | null>(null);
   const autoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
+  const lastActiveRuntimeRef = useRef(runtimeStatus.runtimeId);
+  const pendingRuntimeRefreshRef = useRef(false);
 
   useEffect(() => {
     serversRef.current = servers;
@@ -98,12 +101,13 @@ export function usePingManager({
   const refreshPing = useCallback(async (options: PingOptions = {}) => {
     if (inFlightRef.current) return;
     const snapshot = serversRef.current;
-    const targets = getPingableServers();
+    const activeId = connectionStateRef.current === 'connected'
+      ? connectedServerIdRef.current || runtimeStatusRef.current.lastPreparedServerId || selectedServerIdRef.current : selectedServerIdRef.current;
+    const targets = getPingableServers().filter(server => !options.activeOnly || server.id === activeId);
     if (!targets.length) return;
     const runId = ++runIdRef.current;
     const controller = new AbortController(); controllerRef.current = controller;
-    const activeId = connectionStateRef.current === 'connected'
-      ? connectedServerIdRef.current || runtimeStatusRef.current.lastPreparedServerId || selectedServerIdRef.current : selectedServerIdRef.current;
+
     inFlightRef.current = true;
     setIsCheckingPing(true);
     // One checking state for every target; retain previous latency until the batch
@@ -145,9 +149,40 @@ export function usePingManager({
       }
 
       void writeNativeInterfaceLog('Автоматическая проверка пинга запланирована.', reason);
-      void refreshPing({ silent: true, reason });
+      void refreshPing({ silent: true, reason, activeOnly: true });
     }, delayMs);
   }, [refreshPing]);
+
+  useEffect(() => {
+    if (connectionState !== 'connected') return;
+    const previousRuntime = lastActiveRuntimeRef.current;
+    if (previousRuntime && !runtimeStatus.runtimeId) {
+      pendingRuntimeRefreshRef.current = true;
+      if (inFlightRef.current) cancelPing();
+      return;
+    }
+    if (runtimeStatus.runtimeId) lastActiveRuntimeRef.current = runtimeStatus.runtimeId;
+    const runtimeChanged = Boolean(previousRuntime && runtimeStatus.runtimeId && previousRuntime !== runtimeStatus.runtimeId);
+    if (runtimeChanged) {
+      pendingRuntimeRefreshRef.current = true;
+      cancelPing();
+    }
+    const checkActive = (force = false) => {
+      const id = connectedServerIdRef.current || runtimeStatusRef.current.lastPreparedServerId || selectedServerIdRef.current;
+      const server = serversRef.current.find(item => item.id === id);
+      const checked = server?.latencyCheckedAt ? Date.parse(server.latencyCheckedAt) : NaN;
+      const fresh = (server?.latencyStatus === 'ok' || server?.latencyStatus === 'failed') && Number.isFinite(checked) && Date.now()-checked >= 0 && Date.now()-checked < 60000;
+      if (server && !inFlightRef.current && (force || pendingRuntimeRefreshRef.current || !fresh)) {
+        pendingRuntimeRefreshRef.current = false;
+        void refreshPing({silent:true,reason:'active-profile',activeOnly:true});
+      }
+    };
+    const timer = window.setTimeout(() => checkActive(runtimeChanged), 450);
+    // Focus/pageshow invalidate latency after sleep/resume; never modify VPN state.
+    const resume = () => checkActive(true);
+    window.addEventListener('focus', resume); window.addEventListener('pageshow', resume);
+    return () => { window.clearTimeout(timer); window.removeEventListener('focus',resume);window.removeEventListener('pageshow',resume); };
+  }, [connectionState, connectedServerId, runtimeStatus.xrayPid, runtimeStatus.runtimeId, isCheckingPing, refreshPing, cancelPing]);
 
   useEffect(() => { if (inFlightRef.current) cancelPing(); }, [servers, connectionState, selectedServerId, connectedServerId, cancelPing]);
   useEffect(() => {

@@ -392,33 +392,27 @@ export async function pingNativeServer(server: VpnServer): Promise<ConnectivityP
   const { host, port } = endpoint;
 
   if (!isTauriRuntime) {
-    const started = performance.now();
-    await new Promise((resolve) => window.setTimeout(resolve, 80 + Math.round(Math.random() * 40)));
-    return {
-      success: true,
-      checkedAt: new Date().toLocaleString('ru-RU'),
-      httpPortOpen: false,
-      socksPortOpen: false,
-      latencyMs: Math.max(1, Math.round(performance.now() - started)),
-      packetLossPct: 0,
-      message: 'Web-preview имитирует TCP ping. В нативной сборке используется реальная TCP-проверка host:port.'
-    };
+    return { success:false, checkedAt:new Date().toISOString(), httpPortOpen:false, socksPortOpen:false,
+      message:'Endpoint measurement requires the native runtime; preview contains no synthetic latency.' };
   }
 
   return invokeTauri<ConnectivityProbe>('server_ping', { host, port });
 }
 
-export async function getNativeTrafficSnapshot(): Promise<TrafficSnapshot> {
+export async function beginNativeTrafficSession(): Promise<number> {
+  return isTauriRuntime ? invokeTauri<number>('traffic_session_start') : 0;
+}
+export async function getNativeTrafficSnapshot(sessionId: number): Promise<TrafficSnapshot> {
   if (!isTauriRuntime) {
     return {
       receivedBytes: 0,
       sentBytes: 0,
       checkedAt: new Date().toLocaleString('ru-RU'),
-      source: 'mock'
+      source: 'unavailable'
     };
   }
 
-  return invokeTauri<TrafficSnapshot>('traffic_snapshot');
+  return invokeTauri<TrafficSnapshot>('traffic_snapshot', { sessionId });
 }
 
 export async function runNativeConnectivityProbe(): Promise<ConnectivityProbe> {

@@ -438,6 +438,7 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
         </SettingsSection>
 
         <SettingsSection id="proxy" kicker={tr(language, 'Системный прокси', 'System proxy')} title={tr(language, 'Интеграция Windows', 'Windows integration')} icon={Globe2}>
+          <p className="hint-text">{tr(language, 'Системный HTTP/HTTPS-прокси. Для полного трафика приложений, включая UDP, используйте TUN.', 'System HTTP/HTTPS proxy. For full application traffic, including UDP, use TUN.')}</p>
           <div className="settings-list-modern">
             {sections.proxy.map((item) => (
               <ToggleRow key={item.key} item={item} enabled={Boolean(settings[item.key])} onClick={() => onToggleSetting(item.key)} language={language} />

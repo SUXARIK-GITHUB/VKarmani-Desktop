@@ -954,32 +954,7 @@ pub(crate) fn resolve_ipv4_addresses(host: &str, port: u16) -> Vec<String> {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn default_route_snapshot() -> Result<DefaultRouteSnapshot, String> {
-    let raw = run_powershell(
-        r#"
-$ErrorActionPreference = 'Stop'
-$route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore |
-  Where-Object { $_.State -eq 'Alive' -and $_.NextHop -ne '0.0.0.0' -and $_.InterfaceAlias -ne 'vkarmani-tun' } |
-  Sort-Object @{Expression={ $_.RouteMetric + $_.InterfaceMetric }} | Select-Object -First 1
-if (-not $route) { throw 'No original default route' }
-$adapter = Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $route.InterfaceIndex } | Select-Object -First 1
-if ($adapter.Status -ne 'Up') { throw 'Default adapter not Up' }
-$address = Get-NetIPAddress -InterfaceIndex $route.InterfaceIndex -AddressFamily IPv4 |
-  Where-Object { $_.AddressState -eq 'Preferred' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1
-if (-not $address) { throw 'No preferred source IPv4' }
-@{ InterfaceIndex=$route.InterfaceIndex; NextHop=$route.NextHop; InterfaceAlias=$route.InterfaceAlias; SourceIp=$address.IPAddress } | ConvertTo-Json -Compress
-"#,
-    )?;
-    let route: DefaultRouteSnapshot =
-        serde_json::from_str(&raw).map_err(|_| "Invalid default route snapshot".to_string())?;
-    if route.interface_index == 0
-        || route.interface_alias.is_empty()
-        || route.interface_alias == TUN_INTERFACE_NAME
-        || route.source_ip.parse::<Ipv4Addr>().is_err()
-        || route.next_hop.parse::<Ipv4Addr>().is_err()
-    {
-        return Err("TUN_BINDING_INVALID: original interface/source address not confirmed".into());
-    }
-    Ok(route)
+    read_physical_binding()
 }
 
 pub(crate) fn bind_tun_outbounds(config: &mut Value, interface: &str) -> Result<(), String> {

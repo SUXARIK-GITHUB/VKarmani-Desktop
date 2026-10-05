@@ -1994,8 +1994,7 @@ html.vk-window-dragging *::after {
   align-items: start !important;
 }
 
-.vk-traffic-stat-label,
-.vk-traffic-stat-value {
+.vk-traffic-stat-label {
   display: block;
   min-width: 0;
   overflow: hidden;
@@ -2148,3 +2147,7 @@ html.vk-window-dragging *::after {
     display: none !important;
   }
 }
+
+/* Keep complete traffic values inside the existing card at the minimum width. */
+.vk-traffic-stat-value { overflow:visible; text-overflow:clip; font-size:clamp(11px,1.3vw,14px); }
+.vk-traffic-stat { grid-template-columns:18px minmax(0,1fr); grid-template-areas:"icon label" "value value"; row-gap:4px; }

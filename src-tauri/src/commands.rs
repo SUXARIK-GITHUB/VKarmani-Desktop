@@ -1180,6 +1180,8 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     let send_through_ip = physical_route.as_ref().map(|route| route.source_ip.clone());
     #[cfg(not(target_os = "windows"))]
     let send_through_ip: Option<String> = None;
+    #[cfg(not(target_os = "windows"))]
+    let physical_route: Option<DefaultRouteSnapshot> = None;
 
     if normalized_network_mode == "tun" && outbound_ips.is_empty() {
         return Err(format!(
@@ -1264,7 +1266,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     }
     ensure_runtime_ports_available()?;
 
-    reset_bounded_log(&runtime_trace_path).map_err(|error| format!("CONNECT_LOG: {error}"))?;
+    validate_or_create_log(&runtime_trace_path).map_err(|error| format!("CONNECT_LOG: {error}"))?;
     _operation_guard.stage("validating")?;
     write_new_runtime_config(&config_path, config_text.as_bytes())
         .map_err(|error| format!("Не удалось записать config: {error}"))?;
@@ -1524,6 +1526,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
                 .clone()
                 .filter(|value| !value.trim().is_empty()),
             started_at: unix_now_string(),
+            telemetry_epoch: next_telemetry_epoch(),
             network_mode: normalized_network_mode.clone(),
             tun_interface_name: if normalized_network_mode == "tun" {
                 Some(TUN_INTERFACE_NAME.to_string())
@@ -1537,6 +1540,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
             },
             self_restart_count: 0,
             last_self_restart_at: None,
+            physical_binding: physical_route,
         });
     }
     if let Ok(mut guard) = state.connected.lock() {
@@ -2031,7 +2035,7 @@ pub(crate) fn connectivity_probe_blocking() -> Result<ConnectivityProbe, String>
             socks_port_open,
             public_ip: None,
             latency_ms: None,
-            packet_loss_pct: Some(100),
+            packet_loss_pct: None,
             message: format!(
                 "HTTP inbound 127.0.0.1:{HTTP_PORT} не отвечает. Сначала запустите runtime."
             ),
@@ -2053,240 +2057,68 @@ pub(crate) fn connectivity_probe_blocking() -> Result<ConnectivityProbe, String>
         socks_port_open,
         public_ip: Some(public_ip),
         latency_ms: Some(started.elapsed().as_millis()),
-        packet_loss_pct: Some(0),
+        packet_loss_pct: None,
         message: "Маршрут через локальный Xray runtime отвечает.".into(),
     })
-}
-
-pub(crate) fn collect_digits_after_marker(raw: &str, marker: &str) -> Vec<u128> {
-    let mut values = Vec::new();
-    let lower = raw.to_lowercase();
-    let mut offset = 0usize;
-
-    while let Some(found) = lower[offset..].find(marker) {
-        let start = offset + found + marker.len();
-        let tail = &lower[start..];
-        let digits = tail
-            .chars()
-            .skip_while(|ch| ch.is_whitespace())
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect::<String>();
-
-        if let Ok(value) = digits.parse::<u128>() {
-            values.push(value.max(1));
-        }
-
-        offset = start.saturating_add(1);
-        if offset >= lower.len() {
-            break;
-        }
-    }
-
-    values
-}
-
-pub(crate) fn parse_ping_loss_percent(raw: &str) -> Option<u8> {
-    let lower = raw.to_lowercase();
-    for marker in ["loss", "потер"] {
-        if let Some(marker_index) = lower.find(marker) {
-            let prefix = &lower[..marker_index];
-            if let Some(percent_index) = prefix.rfind('%') {
-                let before_percent = &prefix[..percent_index];
-                let digits = before_percent
-                    .chars()
-                    .rev()
-                    .skip_while(|ch| ch.is_whitespace())
-                    .take_while(|ch| ch.is_ascii_digit())
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect::<String>();
-
-                if let Ok(value) = digits.parse::<u8>() {
-                    return Some(value.min(100));
-                }
-            }
-        }
-    }
-
-    None
-}
-
-pub(crate) fn parse_ping_output(raw: &str) -> Option<(u128, u8)> {
-    let mut samples = Vec::new();
-    for marker in ["time=", "time<", "время=", "время<"] {
-        samples.extend(collect_digits_after_marker(raw, marker));
-    }
-
-    let average_candidates = [
-        collect_digits_after_marker(raw, "average ="),
-        collect_digits_after_marker(raw, "average="),
-        collect_digits_after_marker(raw, "avg ="),
-        collect_digits_after_marker(raw, "avg="),
-        collect_digits_after_marker(raw, "среднее ="),
-        collect_digits_after_marker(raw, "среднее="),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-
-    let latency_ms = average_candidates.first().copied().or_else(|| {
-        if samples.is_empty() {
-            None
-        } else {
-            Some(samples.iter().sum::<u128>() / samples.len() as u128)
-        }
-    })?;
-
-    let packet_loss =
-        parse_ping_loss_percent(raw).unwrap_or(if samples.is_empty() { 100 } else { 0 });
-    Some((latency_ms.max(1), packet_loss))
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn windows_icmp_ping(host: &str) -> Option<(u128, u8)> {
-    let normalized_host = normalize_socket_host(host);
-    if normalized_host.is_empty() {
-        return None;
-    }
-
-    let force_ipv6 = normalized_host.parse::<Ipv6Addr>().is_ok();
-    let mut command = Command::new(system_program("ping").ok()?);
-    if force_ipv6 {
-        command.args(["-6", "-n", "3", "-w", "1200", &normalized_host]);
-    } else {
-        // Большинство пользователей работает без IPv6. Принудительно проверяем IPv4,
-        // чтобы ping не зависал на AAAA-записях и не показывал ложные 1 мс.
-        command.args(["-4", "-n", "3", "-w", "1200", &normalized_host]);
-    }
-
-    let output = run_command_with_timeout(command, Duration::from_secs(6), "icmp ping")
-        .unwrap_or_else(|error| error);
-    parse_ping_output(&output)
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn windows_icmp_ping(_host: &str) -> Option<(u128, u8)> {
-    None
-}
-
-pub(crate) fn tcp_connect_latency(
-    addresses: &[std::net::SocketAddr],
-    timeout: Duration,
-) -> Option<u128> {
-    let mut best: Option<u128> = None;
-    let mut ordered = addresses.to_vec();
-    ordered.sort_by_key(|address| if address.is_ipv4() { 0 } else { 1 });
-
-    let deadline = Instant::now() + timeout;
-    for address in ordered {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let started = Instant::now();
-        if TcpStream::connect_timeout(&address, remaining.min(Duration::from_millis(350))).is_ok() {
-            let elapsed = started.elapsed().as_millis().max(1);
-            best = Some(best.map_or(elapsed, |current| current.min(elapsed)));
-        }
-    }
-
-    best
-}
-
-pub(crate) fn run_tcp_ping_samples(
-    addresses: &[std::net::SocketAddr],
-    attempts: u8,
-    timeout: Duration,
-) -> (u8, Option<u128>, u8) {
-    let safe_attempts = attempts.max(1);
-    let mut success_count: u8 = 0;
-    let mut total_ms: u128 = 0;
-
-    for attempt in 0..safe_attempts {
-        if let Some(latency) = tcp_connect_latency(addresses, timeout) {
-            success_count += 1;
-            total_ms += latency;
-        }
-
-        if attempt + 1 < safe_attempts {
-            std::thread::sleep(Duration::from_millis(80));
-        }
-    }
-
-    let packet_loss =
-        (((safe_attempts - success_count) as f32 / safe_attempts as f32) * 100.0).round() as u8;
-    let latency_ms = if success_count > 0 {
-        Some((total_ms / success_count as u128).max(1))
-    } else {
-        None
-    };
-
-    (success_count, latency_ms, packet_loss)
 }
 
 pub(crate) fn server_ping_blocking(
     host: String,
     port: u16,
-    app: Option<AppHandle>,
+    _app: Option<AppHandle>,
 ) -> Result<ConnectivityProbe, String> {
-    let checked_at = unix_now_string();
     let normalized_host = normalize_socket_host(&host);
-    if normalized_host.is_empty() {
-        return Err("У выбранного сервера нет host для проверки пинга.".into());
+    if normalized_host.is_empty() || port == 0 {
+        return Err("PING_INVALID_ENDPOINT".into());
     }
-
-    let addresses = resolve_socket_addresses(&normalized_host, port)?;
-    let _ = app; // Ping never changes the machine routing table.
-    let endpoint = format_endpoint_for_display(&normalized_host, port);
-
-    // Для VPN-сервера важнее не ICMP, а доступность реального host:port.
-    // Поэтому TCP-проверка идёт первой и с короткими timeout, чтобы UI не выглядел зависшим.
-    let (success_count, latency_ms, packet_loss) =
-        run_tcp_ping_samples(&addresses, 3, Duration::from_millis(850));
-    if success_count > 0 {
-        return Ok(ConnectivityProbe {
-            success: true,
-            checked_at,
-            http_port_open: tcp_port_open("127.0.0.1", HTTP_PORT, 200),
-            socks_port_open: tcp_port_open("127.0.0.1", SOCKS_PORT, 200),
-            public_ip: None,
-            latency_ms,
-            packet_loss_pct: Some(packet_loss),
-            message: format!(
-                "TCP ping {endpoint}: {} мс, порт доступен, потери {}%.",
-                latency_ms.unwrap_or(0),
-                packet_loss
-            ),
-        });
+    let mut addresses = resolve_socket_addresses(&normalized_host, port)?;
+    addresses.sort_by_key(|address| !address.is_ipv4());
+    addresses.dedup();
+    addresses.truncate(16);
+    let mut count = 0u8;
+    let mut total = 0u128;
+    let mut path = None;
+    let mut failure = String::new();
+    for _ in 0..3 {
+        let deadline = Instant::now() + Duration::from_millis(850);
+        let mut best: Option<ProbePath> = None;
+        for address in &addresses {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match direct_tcp_probe(*address, remaining.min(Duration::from_millis(350))) {
+                Ok(measured) => {
+                    if best
+                        .as_ref()
+                        .map_or(true, |old| measured.elapsed_micros < old.elapsed_micros)
+                    {
+                        best = Some(measured);
+                    }
+                }
+                Err(error) => failure = error,
+            }
+        }
+        if let Some(measured) = best {
+            count += 1;
+            total += measured.elapsed_micros;
+            path = Some(measured);
+        }
     }
-
-    // ICMP используем только как диагностику. Если ICMP отвечает, но TCP-порт закрыт,
-    // сервер не считаем рабочим для подключения, чтобы не показывать ложный зелёный ping.
-    if let Some((icmp_latency_ms, icmp_packet_loss)) = windows_icmp_ping(&normalized_host) {
-        return Ok(ConnectivityProbe {
-            success: false,
-            checked_at,
-            http_port_open: tcp_port_open("127.0.0.1", HTTP_PORT, 200),
-            socks_port_open: tcp_port_open("127.0.0.1", SOCKS_PORT, 200),
-            public_ip: None,
-            latency_ms: Some(icmp_latency_ms),
-            packet_loss_pct: Some(icmp_packet_loss.max(packet_loss)),
-            message: format!(
-                "ICMP ping {endpoint}: {icmp_latency_ms} мс, но TCP-порт {port} недоступен."
-            ),
-        });
-    }
-
+    let message = if let Some(path) = path {
+        format!("direct TCP; interface={}; source={}; destination={}; successful={count}/3; failures={}; meanMicros={}; packetLoss=unmeasured",path.interface_index,path.source_ip,path.destination_ip,3-count,total/u128::from(count))
+    } else {
+        format!("direct TCP unavailable; successful=0/3; failures=3; reason={failure}; packetLoss=unmeasured")
+    };
     Ok(ConnectivityProbe {
-        success: false,
-        checked_at,
-        http_port_open: tcp_port_open("127.0.0.1", HTTP_PORT, 200),
-        socks_port_open: tcp_port_open("127.0.0.1", SOCKS_PORT, 200),
+        success: count > 0,
+        checked_at: unix_now_string(),
+        http_port_open: false,
+        socks_port_open: false,
         public_ip: None,
-        latency_ms: None,
-        packet_loss_pct: Some(100),
-        message: format!("Ping {endpoint} не получил ответа по TCP/ICMP, потери 100%."),
+        latency_ms: (count > 0).then(|| (total / u128::from(count)).div_ceil(1000)),
+        packet_loss_pct: None,
+        message,
     })
 }
 
@@ -2325,153 +2157,117 @@ pub(crate) async fn server_ping(
     .map_err(|error| format!("Проверка пинга была прервана: {error}"))?
 }
 
-pub(crate) fn parse_xray_stat_value(raw: &str) -> Option<u64> {
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if let Some(value) = trimmed.strip_prefix("value:") {
-            if let Ok(parsed) = value.trim().parse::<u64>() {
-                return Some(parsed);
-            }
-        }
-    }
-
-    None
-}
-
-pub(crate) fn query_xray_stat(integrity: &LaunchIntegrity, stat_name: &str) -> Result<u64, String> {
-    let core_path = integrity.core.as_path();
-    let mut command = Command::new(core_path);
-    command
-        .arg("api")
-        .arg("statsquery")
-        .arg(format!("--server=127.0.0.1:{XRAY_API_PORT}"))
-        .arg("-name")
-        .arg(stat_name);
-
-    let output =
-        run_command_with_timeout(command, Duration::from_millis(1400), "xray api statsquery")?;
-    // Xray can omit a stat until the first bytes pass through it. Treat a missing
-    // value as zero instead of falling back to "unavailable", otherwise the UI
-    // never starts showing proxy traffic on fresh connections.
-    Ok(parse_xray_stat_value(&output).unwrap_or(0))
-}
-
-pub(crate) fn managed_runtime_network_mode(state: &tauri::State<AppState>) -> Option<String> {
-    state
-        .runtime
-        .lock()
-        .ok()
-        .and_then(|runtime| runtime.as_ref().map(|item| item.network_mode.clone()))
-}
-
-pub(crate) fn runtime_xray_stats_snapshot(
-    state: &tauri::State<AppState>,
-) -> Option<TrafficSnapshot> {
-    // In TUN mode the Windows adapter counters are cheaper and safer for long
-    // sessions. Avoid spawning `xray.exe api statsquery` every few seconds for
-    // an 8+ hour TUN session; repeated helper processes and StatsService queries
-    // add unnecessary pressure exactly when the user needs the core to stay calm.
-    if managed_runtime_network_mode(state).as_deref() == Some("tun") {
-        return None;
-    }
-
-    if !tcp_port_open("127.0.0.1", XRAY_API_PORT, 120) {
-        return None;
-    }
-
-    let integrity = state.runtime.lock().ok().and_then(|runtime| {
-        runtime
-            .as_ref()
-            .and_then(|item| item.child.integrity_lease())
-    })?;
-
-    let uplink = query_xray_stat(&integrity, "outbound>>>proxy>>>traffic>>>uplink").ok()?;
-    let downlink = query_xray_stat(&integrity, "outbound>>>proxy>>>traffic>>>downlink").ok()?;
-
-    Some(TrafficSnapshot {
-        received_bytes: downlink,
-        sent_bytes: uplink,
-        checked_at: unix_now_string(),
-        source: "xray-stats".into(),
-    })
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn windows_tun_traffic_snapshot() -> Option<TrafficSnapshot> {
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'SilentlyContinue'
-$stats = Get-NetAdapterStatistics -Name '{}' -ErrorAction SilentlyContinue
-if ($stats) {{
-  [PSCustomObject]@{{ receivedBytes = [UInt64]$stats.ReceivedBytes; sentBytes = [UInt64]$stats.SentBytes }} | ConvertTo-Json -Compress
-}}
-"#,
-        ps_quote(TUN_INTERFACE_NAME)
-    );
-
-    let raw = run_powershell(&script).ok()?;
-    if raw.trim().is_empty() {
-        return None;
-    }
-    let value: Value = serde_json::from_str(raw.trim()).ok()?;
-    Some(TrafficSnapshot {
-        received_bytes: value
-            .get("receivedBytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        sent_bytes: value.get("sentBytes").and_then(Value::as_u64).unwrap_or(0),
-        checked_at: unix_now_string(),
-        source: "windows-tun-adapter".into(),
-    })
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn windows_tun_traffic_snapshot() -> Option<TrafficSnapshot> {
-    None
+fn query_client_stats(integrity: &LaunchIntegrity) -> Result<(u64, u64), String> {
+    let mut command = Command::new(integrity.core.as_path());
+    command.args([
+        "api",
+        "statsquery",
+        &format!("--server=127.0.0.1:{XRAY_API_PORT}"),
+        "-pattern",
+        "inbound>>>",
+    ]);
+    let raw = run_command_with_timeout(
+        command,
+        Duration::from_millis(1400),
+        "xray readonly statsquery",
+    )?;
+    parse_client_inbound_stats(&raw)
 }
 
 #[tauri::command]
-pub(crate) async fn traffic_snapshot(app: AppHandle) -> Result<TrafficSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(move || traffic_snapshot_blocking(app))
-        .await
-        .map_err(|error| format!("Получение статистики трафика было прервано: {error}"))?
+pub(crate) async fn traffic_session_start(app: AppHandle) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AppState>()
+            .traffic
+            .lock()
+            .map_err(|_| "TRAFFIC_LOCK")?
+            .start_session()
+    })
+    .await
+    .map_err(|_| "TRAFFIC_SESSION_INTERRUPTED".to_string())?
 }
 
-pub(crate) fn traffic_snapshot_blocking(app: AppHandle) -> Result<TrafficSnapshot, String> {
+#[tauri::command]
+pub(crate) async fn traffic_snapshot(
+    app: AppHandle,
+    session_id: u64,
+) -> Result<TrafficSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || traffic_snapshot_blocking(app, session_id))
+        .await
+        .map_err(|error| format!("Traffic task interrupted: {error}"))?
+}
+
+pub(crate) fn traffic_snapshot_blocking(
+    app: AppHandle,
+    session_id: u64,
+) -> Result<TrafficSnapshot, String> {
     let state = app.state::<AppState>();
-    let network_mode = managed_runtime_network_mode(&state);
-
-    if network_mode.as_deref() == Some("tun") {
-        if let Some(snapshot) = windows_tun_traffic_snapshot() {
-            return Ok(snapshot);
+    // Serialize bounded queries without blocking runtime/operation ownership locks.
+    let mut totals = state.traffic.try_lock().map_err(|_| "TRAFFIC_BUSY")?;
+    let (runtime_id, mode, integrity) = {
+        let mut runtime = state.runtime.lock().map_err(|_| "TRAFFIC_RUNTIME_LOCK")?;
+        let item = runtime.as_mut().ok_or("TRAFFIC_NO_RUNTIME")?;
+        if !matches!(item.child.try_wait(), Ok(None)) {
+            return Err("TRAFFIC_RUNTIME_EXITED".into());
         }
-
-        return Ok(TrafficSnapshot {
+        (
+            traffic_runtime_id(item),
+            item.network_mode.clone(),
+            item.child.integrity_lease(),
+        )
+    };
+    let measured = if mode == "tun" {
+        tun_counters(TUN_INTERFACE_NAME)
+    } else {
+        integrity
+            .ok_or("TRAFFIC_NO_INTEGRITY".into())
+            .and_then(|lease| query_client_stats(&lease))
+            .map(|(received, sent)| (runtime_id.clone(), received, sent))
+    };
+    let mut runtime = state.runtime.lock().map_err(|_| "TRAFFIC_RUNTIME_LOCK")?;
+    if runtime
+        .as_ref()
+        .map_or(true, |item| traffic_runtime_id(item) != runtime_id)
+    {
+        return Err("TRAFFIC_STALE_RUNTIME".into());
+    }
+    if !matches!(
+        runtime.as_mut().expect("checked runtime").child.try_wait(),
+        Ok(None)
+    ) {
+        return Err("TRAFFIC_RUNTIME_EXITED".into());
+    }
+    let source = if mode == "tun" {
+        "windows-tun-adapter"
+    } else {
+        "xray-stats"
+    };
+    match measured {
+        Ok((key, received, sent)) => {
+            let (received, sent) =
+                totals.record(session_id, format!("{source}:{key}"), received, sent)?;
+            Ok(TrafficSnapshot {
+                baseline_changed: totals.baseline_changed,
+                received_bytes: received,
+                sent_bytes: sent,
+                checked_at: unix_now_string(),
+                source: source.into(),
+                runtime_id,
+                session_id,
+                unavailable_reason: None,
+            })
+        }
+        Err(reason) => Ok(TrafficSnapshot {
+            baseline_changed: true,
             received_bytes: 0,
             sent_bytes: 0,
             checked_at: unix_now_string(),
-            source: if cfg!(target_os = "windows") {
-                "tun-adapter-unavailable".into()
-            } else {
-                "mock".into()
-            },
-        });
+            source: "unavailable".into(),
+            runtime_id,
+            session_id,
+            unavailable_reason: Some(reason),
+        }),
     }
-
-    if let Some(snapshot) = runtime_xray_stats_snapshot(&state) {
-        return Ok(snapshot);
-    }
-
-    Ok(TrafficSnapshot {
-        received_bytes: 0,
-        sent_bytes: 0,
-        checked_at: unix_now_string(),
-        source: if cfg!(target_os = "windows") {
-            "unavailable".into()
-        } else {
-            "mock".into()
-        },
-    })
 }
 
 #[cfg(target_os = "windows")]

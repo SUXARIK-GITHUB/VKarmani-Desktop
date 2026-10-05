@@ -172,6 +172,7 @@ export interface ProfileSyncInfo {
 }
 
 export interface RuntimeStatus {
+  runtimeId?: string;
   nativeInstanceId?: string;
   bridge: RuntimeBridge;
   coreInstalled: boolean;
@@ -233,10 +234,14 @@ export interface ConnectivityProbe {
 }
 
 export interface TrafficSnapshot {
+  baselineChanged?: boolean;
   receivedBytes: number;
   sentBytes: number;
   checkedAt: string;
-  source: 'xray-stats' | 'windows-tun-adapter' | 'unavailable' | 'session-estimate' | 'mock';
+  source: 'xray-stats' | 'windows-tun-adapter' | 'unavailable';
+  runtimeId?: string;
+  sessionId?: number;
+  unavailableReason?: string;
 }
 
 export interface IntegrationMeta {
