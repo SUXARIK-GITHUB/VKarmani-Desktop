@@ -27,6 +27,7 @@ pub(crate) struct ManagedCore {
 
 #[derive(Default)]
 pub(crate) struct AppState {
+    pub(crate) restart_requested: std::sync::atomic::AtomicBool,
     pub(crate) connected: Mutex<bool>,
     pub(crate) active_server_label: Mutex<Option<String>>,
     pub(crate) profile_count: Mutex<usize>,

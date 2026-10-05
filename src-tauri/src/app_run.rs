@@ -222,7 +222,13 @@ pub fn run() {
                     }
                     "restart_app" => {
                         let _ = append_interface_event(app, "Tray: перезапуск приложения.");
-                        let _ = restart_application(app.clone());
+                        if let Err(error) = restart_application(app.clone()) {
+                            let _ = append_interface_event(
+                                app,
+                                &format!("Tray restart отменён: {error}"),
+                            );
+                            reveal_main_window(app);
+                        }
                     }
                     "restart_proxy" => {
                         let _ = append_interface_event(app, "Tray: перезапуск proxy.");

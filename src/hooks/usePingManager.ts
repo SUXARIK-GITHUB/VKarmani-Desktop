@@ -17,6 +17,7 @@ interface UsePingManagerArgs {
   setConnectivityProbe: (probe: ConnectivityProbe | null) => void;
   pushToast: (title: string, tone: ToastItem['tone']) => void;
   refreshDiagnosticsAndRuntime: () => Promise<RuntimeStatus | null>;
+  onMeasurementsCommitted?: (servers: VpnServer[], snapshot: VpnServer[]) => boolean | void;
 }
 
 interface PingOptions {
@@ -35,7 +36,8 @@ export function usePingManager({
   language,
   setConnectivityProbe,
   pushToast,
-  refreshDiagnosticsAndRuntime
+  refreshDiagnosticsAndRuntime,
+  onMeasurementsCommitted
 }: UsePingManagerArgs) {
   const [isCheckingPing, setIsCheckingPing] = useState(false);
   const [pingProgress, setPingProgress] = useState<PingProgressState>(EMPTY_PING_PROGRESS);
@@ -55,6 +57,10 @@ export function usePingManager({
   const mountedRef = useRef(true);
   const lastActiveRuntimeRef = useRef(runtimeStatus.runtimeId);
   const pendingRuntimeRefreshRef = useRef(false);
+  const pendingFullReasonRef = useRef<string | null>(null);
+  const drainFullRef = useRef<() => void>(() => {});
+  const onMeasurementsRef = useRef(onMeasurementsCommitted);
+  useEffect(() => { onMeasurementsRef.current = onMeasurementsCommitted; }, [onMeasurementsCommitted]);
 
   useEffect(() => {
     serversRef.current = servers;
@@ -86,15 +92,18 @@ export function usePingManager({
     return serversRef.current.filter((server) => server.runtimeTemplate?.profileKind === 'auto' || Boolean(getServerPingEndpoint(server)));
   }, []);
 
-  const cancelPing = useCallback(() => {
+  const cancelPing = useCallback((preserveFullRefresh = false) => {
     runIdRef.current++;
     autoRunIdRef.current++;
     controllerRef.current?.abort();
-    controllerRef.current = null;
     if (autoTimerRef.current !== null) clearTimeout(autoTimerRef.current);
-    inFlightRef.current = false;
-    if (mountedRef.current) {
+    autoTimerRef.current = null;
+    if (!preserveFullRefresh) pendingFullReasonRef.current = null;
+    // Started IPC probes retain their bounded lease until completion. Aborting
+    // rejects results and queued work, but does not admit a second worker pool.
+    if (!inFlightRef.current && mountedRef.current) {
       setIsCheckingPing(false); setCheckingPingServerIds([]); setPingProgress(EMPTY_PING_PROGRESS);
+      drainFullRef.current();
     }
   }, []);
 
@@ -105,6 +114,11 @@ export function usePingManager({
       ? connectedServerIdRef.current || runtimeStatusRef.current.lastPreparedServerId || selectedServerIdRef.current : selectedServerIdRef.current;
     const targets = getPingableServers().filter(server => !options.activeOnly || server.id === activeId);
     if (!targets.length) return;
+    if (!options.activeOnly) {
+      pendingFullReasonRef.current = null;
+      if (autoTimerRef.current !== null) clearTimeout(autoTimerRef.current);
+      autoTimerRef.current = null;
+    }
     const runId = ++runIdRef.current;
     const controller = new AbortController(); controllerRef.current = controller;
 
@@ -120,7 +134,10 @@ export function usePingManager({
         if (runIdRef.current === runId && mountedRef.current) setPingProgress({ active: true, total: targets.length, completed, success: 0, failed: 0 });
       });
       if (runIdRef.current !== runId || controller.signal.aborted || !mountedRef.current || serversRef.current !== snapshot) return;
-      setServers(current => applyPingBatch(current, snapshot, batch));
+      const measured = applyPingBatch(snapshot, snapshot, batch);
+      if (onMeasurementsRef.current?.(measured, snapshot) === false) return;
+      serversRef.current = measured;
+      setServers(measured);
       const probe = batch.results.find(result => result.id === activeId)?.probe;
       const currentId = connectionStateRef.current === 'connected'
         ? connectedServerIdRef.current || runtimeStatusRef.current.lastPreparedServerId || selectedServerIdRef.current : selectedServerIdRef.current;
@@ -131,41 +148,53 @@ export function usePingManager({
         `Пинг: ${batch.success}/${targets.length}; timeout: ${batch.timeout}; недоступны: ${batch.unreachable}; ${Math.round(batch.durationMs)} мс.`,
         `Ping: ${batch.success}/${targets.length}; timeout: ${batch.timeout}; unreachable: ${batch.unreachable}; ${Math.round(batch.durationMs)} ms.`), batch.success ? 'success' : 'info');
     } finally {
-      if (runIdRef.current === runId && mountedRef.current) {
+      if (controllerRef.current === controller) {
         inFlightRef.current = false; controllerRef.current = null;
-        setIsCheckingPing(false); setCheckingPingServerIds([]); setPingProgress(EMPTY_PING_PROGRESS);
+        if (mountedRef.current) {
+          setIsCheckingPing(false); setCheckingPingServerIds([]); setPingProgress(EMPTY_PING_PROGRESS);
+          drainFullRef.current();
+        }
       }
     }
   }, [getPingableServers, pushToast, refreshDiagnosticsAndRuntime, setConnectivityProbe, setServers]);
 
   const scheduleAutoPing = useCallback((reason = 'auto-main-refresh', delayMs = 450) => {
+    pendingFullReasonRef.current = reason;
     const runId = autoRunIdRef.current + 1;
     autoRunIdRef.current = runId;
 
     if (autoTimerRef.current !== null) clearTimeout(autoTimerRef.current);
     autoTimerRef.current = setTimeout(() => {
+      autoTimerRef.current = null;
       if (!mountedRef.current || autoRunIdRef.current !== runId || inFlightRef.current || !serversRef.current.length) {
         return;
       }
 
       void writeNativeInterfaceLog('Автоматическая проверка пинга запланирована.', reason);
-      void refreshPing({ silent: true, reason, activeOnly: true });
+      const pending = pendingFullReasonRef.current;
+      if (pending) void refreshPing({ silent: true, reason: pending });
     }, delayMs);
   }, [refreshPing]);
+  useEffect(() => {
+    drainFullRef.current = () => {
+      const reason = pendingFullReasonRef.current;
+      if (reason && mountedRef.current) scheduleAutoPing(reason, 0);
+    };
+  }, [scheduleAutoPing]);
 
   useEffect(() => {
     if (connectionState !== 'connected') return;
     const previousRuntime = lastActiveRuntimeRef.current;
     if (previousRuntime && !runtimeStatus.runtimeId) {
       pendingRuntimeRefreshRef.current = true;
-      if (inFlightRef.current) cancelPing();
+      if (inFlightRef.current) cancelPing(true);
       return;
     }
     if (runtimeStatus.runtimeId) lastActiveRuntimeRef.current = runtimeStatus.runtimeId;
     const runtimeChanged = Boolean(previousRuntime && runtimeStatus.runtimeId && previousRuntime !== runtimeStatus.runtimeId);
     if (runtimeChanged) {
       pendingRuntimeRefreshRef.current = true;
-      cancelPing();
+      cancelPing(true);
     }
     const checkActive = (force = false) => {
       const id = connectedServerIdRef.current || runtimeStatusRef.current.lastPreparedServerId || selectedServerIdRef.current;
@@ -184,7 +213,9 @@ export function usePingManager({
     return () => { window.clearTimeout(timer); window.removeEventListener('focus',resume);window.removeEventListener('pageshow',resume); };
   }, [connectionState, connectedServerId, runtimeStatus.xrayPid, runtimeStatus.runtimeId, isCheckingPing, refreshPing, cancelPing]);
 
-  useEffect(() => { if (inFlightRef.current) cancelPing(); }, [servers, connectionState, selectedServerId, connectedServerId, cancelPing]);
+  // Catalog replacements invalidate application by snapshot identity, but let
+  // the bounded old batch drain before a coalesced full refresh starts.
+  useEffect(() => { if (inFlightRef.current) cancelPing(true); }, [connectionState, selectedServerId, connectedServerId, cancelPing]);
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; cancelPing(); };

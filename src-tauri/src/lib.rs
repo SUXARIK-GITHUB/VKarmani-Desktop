@@ -82,6 +82,7 @@ mod config_graph;
 pub(crate) use config_graph::*;
 mod runtime_lifecycle;
 pub(crate) use runtime_lifecycle::*;
+mod restart_lifecycle;
 mod runtime_status;
 pub(crate) use runtime_status::*;
 mod runtime_operation;

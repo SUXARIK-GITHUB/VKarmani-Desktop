@@ -88,6 +88,8 @@ export interface VpnServer {
   sourceOrder?: number;
   latency?: number | null;
   latencyCheckedAt?: string;
+  latencyIdentity?: string;
+  latencySource?: 'physical-tcp' | 'auto-members-physical-tcp';
   latencyStatus?: 'unchecked' | 'checking' | 'ok' | 'failed';
   load: number;
   protocol: 'Xray' | 'Reality' | 'VLESS' | 'Hysteria2';

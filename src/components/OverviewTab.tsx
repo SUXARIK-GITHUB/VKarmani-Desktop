@@ -10,13 +10,13 @@ import {
   SlidersHorizontal,
   Search,
   ShieldCheck,
-  Signal,
   Star,
   Waypoints
 } from 'lucide-react';
 import { tr, type UiLanguage } from '../i18n';
 import type { ConnectionState, TunnelMode, VpnServer } from '../types/vpn';
 import { ServerFlag } from './ServerFlag';
+import { ConnectionQualityIndicator } from './ConnectionQualityIndicator';
 import { getServerPrimaryLabel, getServerSecondaryLabel } from '../utils/serverDisplay';
 
 interface OverviewTabProps {
@@ -67,18 +67,20 @@ function getProtocolLabel(server: VpnServer | null | undefined) {
 
 function formatLatency(server: VpnServer | null | undefined, language: UiLanguage, isChecking = false) {
   if (isChecking || server?.latencyStatus === 'checking') {
-    return tr(language, 'Проверяем…', 'Checking…');
+    return server?.latencyStatus === 'ok' && typeof server.latency === 'number'
+      ? `${server.latency < 1 ? '<1' : Math.round(server.latency)} ${tr(language, 'мс', 'ms')} · ${tr(language, 'Проверяем…', 'Checking…')}`
+      : tr(language, 'Проверяем…', 'Checking…');
   }
 
   if (server?.latencyStatus === 'failed') {
     return tr(language, 'Нет ответа', 'No response');
   }
 
-  if (!server || server.latency === null || server.latency === undefined || !Number.isFinite(Number(server.latency))) {
+  if (!server || server.latencyStatus !== 'ok' || typeof server.latency !== 'number' || !Number.isFinite(server.latency) || server.latency <= 0) {
     return tr(language, 'Не проверено', 'Not checked');
   }
 
-  return `${Math.max(1, Math.round(Number(server.latency)))} мс`;
+  return `${server.latency < 1 ? '<1' : Math.round(Number(server.latency))} ${tr(language, 'мс', 'ms')}`;
 }
 
 function latencyTone(server: VpnServer, isChecking = false) {
@@ -171,7 +173,7 @@ export function OverviewTab({
               {!isConnected && <span>{selectedMeta} · {selectedProtocol}</span>}
           </div>
           <div className="vk-hero-latency" title={selectedServer?.runtimeTemplate?.profileKind === 'auto' ? tr(language, 'Auto: минимальный измеренный пинг доступного участника; не текущий маршрут Xray.', 'Auto: lowest measured reachable member ping; not the current Xray route.') : undefined}>
-            <Signal size={26} />
+            <ConnectionQualityIndicator server={selectedServer} language={language} checking={Boolean(selectedServer && checkingPingServerIdSet.has(selectedServer.id))} />
             <strong>{selectedLatency}</strong>
           </div>
         </div>
@@ -220,7 +222,7 @@ export function OverviewTab({
                   </span>
                   <span className="vk-server-quality" title={server.runtimeTemplate?.profileKind === 'auto' ? tr(language, 'Auto: минимальный измеренный пинг доступного участника; не текущий маршрут Xray.', 'Auto: lowest measured reachable member ping; not the current Xray route.') : undefined}>
                     {active ? <span className="vk-check-badge"><Check size={13} /></span> : null}
-                    <Signal size={20} />
+                    <ConnectionQualityIndicator server={server} language={language} checking={serverPingChecking} />
                     <strong className={latencyTone(server, serverPingChecking)}>{formatLatency(server, language, serverPingChecking)}</strong>
                   </span>
                 </span>

@@ -1,3 +1,4 @@
+import { mergeServerMeasurements } from '../utils/serverMeasurements';
 import type {
   AccessKeyKind,
   ConnectResult,
@@ -989,6 +990,10 @@ export class RemnawaveClient {
     return this.cachedSession;
   }
 
+  updateCachedMeasurements(servers: VpnServer[]) {
+    this.cachedServers = mergeServerMeasurements(this.cachedServers, servers);
+  }
+
   hydrateCachedServers(servers: VpnServer[]) {
     const readyServers = servers.filter((server) => Boolean(server.runtimeTemplate));
     if (!readyServers.length) {
@@ -1034,7 +1039,7 @@ export class RemnawaveClient {
       const importedServers = xrayJsonResult.servers;
       const previousServers = [...this.cachedServers];
       const keepPreviousProfile = shouldKeepPreviousFullProfile(previousServers, importedServers);
-      const activeServers = keepPreviousProfile ? previousServers : importedServers;
+      const activeServers = mergeServerMeasurements(keepPreviousProfile ? previousServers : importedServers, previousServers);
       const readyCount = readyServerCount(activeServers);
 
       this.cachedSession = provisionalSession;
@@ -1106,7 +1111,7 @@ export class RemnawaveClient {
       });
       const importedServers = xrayJsonResult.servers;
       const keepPreviousProfile = shouldKeepPreviousFullProfile(previousServers, importedServers);
-      const activeServers = keepPreviousProfile ? previousServers : importedServers;
+      const activeServers = mergeServerMeasurements(keepPreviousProfile ? previousServers : importedServers, previousServers);
 
       if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
       await cacheNativeProfileSync(activeServers.length, xrayJsonResult.url.includes('/api/sub/') ? 'Публичная Xray JSON подписка' : 'Panel API');

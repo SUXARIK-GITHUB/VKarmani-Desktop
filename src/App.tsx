@@ -26,6 +26,7 @@ import { assertNativeRuntimeServerMatches, runtimeConfirmsTargetServer } from '.
 import { pickPreferredServer, rankServersForDisplay } from './utils/serverSorting';
 import { resolveConnectedProfile, buildServerRuntimeFingerprint, isVpnServerLike, resolveServerReference, migrateServerReferences } from './utils/serverIdentity';
 import { remnawaveClient } from './services/remnawave';
+import { mergeServerMeasurements } from './utils/serverMeasurements';
 import {
   appVersion,
   ensureAdminLaunch,
@@ -225,7 +226,14 @@ export default function App() {
     language,
     setConnectivityProbe,
     pushToast,
-    refreshDiagnosticsAndRuntime
+    refreshDiagnosticsAndRuntime,
+    onMeasurementsCommitted: (measured, snapshot) => {
+      if (serversRef.current !== snapshot) return false;
+      serversRef.current = measured;
+      remnawaveClient.updateCachedMeasurements(measured);
+      saveLastKnownServers(measured);
+      return true;
+    }
   });
 
   useEffect(() => {
@@ -525,8 +533,8 @@ export default function App() {
         return;
       }
 
-      if (serversResult.status === 'fulfilled') {
-        const result = serversResult.value;
+      if (serversResult.status === 'fulfilled' && serversResult.value.length) {
+        const result = mergeServerMeasurements(serversResult.value, serversRef.current);
         serversRef.current = result;
         setServers(result);
         const preferredServer = pickPreferredServer(result, initialProtocolStrategy.current);
@@ -541,7 +549,7 @@ export default function App() {
 
       const currentServersNeedSecureRuntimeCache = !serversRef.current.length || !serversRef.current.some((server: VpnServer) => server.runtimeTemplate);
       if (currentServersNeedSecureRuntimeCache && lastKnownBackupResult.status === 'fulfilled' && lastKnownBackupResult.value?.length) {
-        const backupServers = lastKnownBackupResult.value;
+        const backupServers = mergeServerMeasurements(lastKnownBackupResult.value, serversRef.current);
         remnawaveClient.hydrateCachedServers(backupServers);
         serversRef.current = backupServers;
         setServers(backupServers);
@@ -1869,6 +1877,8 @@ export default function App() {
 
       const result = await remnawaveClient.syncProfile(normalizedAccessKey, settingsRef.current.allowDemoFallback);
       if (syncGeneration !== profileSyncGenerationRef.current) return null;
+      result.servers = mergeServerMeasurements(result.servers, serversRef.current);
+      remnawaveClient.updateCachedMeasurements(result.servers);
       const connectedProfile = getConnectedRuntimeServer();
       if (connectedProfile) activeRuntimeProfileRef.current = connectedProfile;
       serversRef.current = result.servers;
@@ -1880,9 +1890,6 @@ export default function App() {
       if (refreshedSession) {
         setSession(refreshedSession);
       }
-      const refreshedDevices = await remnawaveClient.loadDevices();
-      setDevices(refreshedDevices);
-
       const preferredServer = pickPreferredServer(result.servers, settingsRef.current.protocolStrategy);
       setSelectedServerId((current: string) => {
         if (connectionStateRef.current !== 'idle') {
@@ -1898,6 +1905,15 @@ export default function App() {
         return nextId;
       });
 
+      // The catalog is committed: auxiliary device/diagnostic refresh must not
+      // prevent the canonical full batch after a successful subscription sync.
+      if (result.profile.status === 'ready') scheduleAutoPing(silent ? 'silent-profile-sync' : 'manual-profile-sync');
+      try {
+        setDevices(await remnawaveClient.loadDevices());
+      } catch (error) {
+        void writeNativeInterfaceLog('Не удалось обновить список устройств после синхронизации.', normalizeNativeError(error, 'Device refresh failed.').message);
+      }
+
       if (!isConnectionActionBusy()) {
         await refreshDiagnosticsAndRuntime();
       }
@@ -1905,8 +1921,6 @@ export default function App() {
         'Профиль Remnawave синхронизирован.',
         `${result.profile.configCount} конфигов | источник: ${result.profile.sourceLabel}`
       );
-
-      scheduleAutoPing(silent ? 'silent-profile-sync' : 'manual-profile-sync');
 
       if (!silent) {
         pushToast(result.profile.message ?? tr(language, 'Профиль синхронизирован.', 'Profile synced.'), 'success');
@@ -1977,7 +1991,7 @@ export default function App() {
       void writeNativeInterfaceLog('Авторизация по ключу доступа завершена успешно.');
 
       overviewAutoRefreshAtRef.current = Date.now();
-      let serverPool = await remnawaveClient.loadServers();
+      let serverPool = mergeServerMeasurements(await remnawaveClient.loadServers(), serversRef.current);
       if (serverPool.length) {
         serversRef.current = serverPool;
         setServers(serverPool);

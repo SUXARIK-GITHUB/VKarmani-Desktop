@@ -5,7 +5,7 @@ import auto from './fixtures/xray/auto.json';
 import legacy from './fixtures/policies/legacy-upgrade.json';
 import { parseXrayJsonSubscriptionToServers as parse } from '../src/services/remnawave/subscriptionParser';
 import { getServerPingTargets } from '../src/utils/serverPing';
-import { applyPingBatch, runPingBatch, PING_CONCURRENCY, PING_BATCH_TIMEOUT_MS } from '../src/utils/pingBatch';
+import { applyPingBatch, runPingBatch, PING_CONCURRENCY, PING_BATCH_TIMEOUT_MS, PING_ITEM_TIMEOUT_MS } from '../src/utils/pingBatch';
 import type { ConnectivityProbe, VpnServer } from '../src/types/vpn';
 import { activeSettingsSection, settingsScrollTarget } from '../src/utils/settingsNavigation';
 import { copyInformation } from '../src/utils/clipboard';
@@ -84,9 +84,13 @@ describe('Auto logical measurement in the shared queue', () => {
     const committed=applyPingBatch(targets,targets,batch);expect(committed).toHaveLength(4);expect(committed.map(p=>p.id)).toEqual(targets.map(p=>p.id));
   });
   it('cancels Auto members and queued profiles without late commit or leaked timers', async () => {
-    const controller=new AbortController();const targets=[profile(),profile(),ordinary('next'),ordinary('last')];let calls=0;
-    const pending=runPingBatch(targets,()=>{calls++;return new Promise(()=>{});},controller.signal);await Promise.resolve();controller.abort();
-    const batch=await pending;expect(calls).toBe(4);expect(batch.cancelled).toBe(4);expect(applyPingBatch(targets,targets,batch)).toEqual(targets);
+    vi.useFakeTimers({toFake:['setTimeout','clearTimeout','performance']});
+    try {
+      const controller=new AbortController();const targets=[profile(),profile(),ordinary('next'),ordinary('last')];let calls=0;
+      const pending=runPingBatch(targets,()=>{calls++;return new Promise(()=>{});},controller.signal);await Promise.resolve();controller.abort();
+      await vi.advanceTimersByTimeAsync(PING_ITEM_TIMEOUT_MS);const batch=await pending;
+      expect(calls).toBe(4);expect(batch.cancelled).toBe(4);expect(applyPingBatch(targets,targets,batch)).toEqual(targets);expect(vi.getTimerCount()).toBe(0);
+    } finally {vi.useRealTimers();}
   });
   it('bounds all-timeout multi-profile work to the existing 60-second batch deadline', async () => {
     vi.useFakeTimers({toFake:['setTimeout','clearTimeout','performance']});

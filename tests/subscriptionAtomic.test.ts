@@ -4,12 +4,23 @@ vi.mock('../src/services/runtime',async importOriginal=>({ ...await importOrigin
 import { RemnawaveClient } from '../src/services/remnawave';
 import { parseXrayJsonSubscriptionToServers as parse } from '../src/services/remnawave/subscriptionParser';
 import { resolveConnectedProfile, buildServerRuntimeFingerprint } from '../src/utils/serverIdentity';
+import { serverMeasurementIdentity } from '../src/utils/serverMeasurements';
 import { normalizeStoredSettings, saveSettings, loadSettings, loadSplitTunnelEntries } from '../src/services/storage';
 const key='https://sub.vkarmani.com/qa-synthetic-fixture';
 const config=(name:string)=>({remarks:name,outbounds:[{tag:'proxy',protocol:'vless',settings:{vnext:[{address:`${name.toLowerCase()}.example.test`,port:443,users:[{id:'00000000-0000-4000-8000-000000000001'}]}]}}]});
 beforeEach(()=>{vi.stubGlobal('window',{setTimeout,clearTimeout});mocks.fetch.mockReset();mocks.cache.mockReset();mocks.cache.mockResolvedValue(undefined);});
 afterEach(()=>vi.unstubAllGlobals());
 describe('actual subscription-client atomic refresh and generation ownership',()=>{
+  it('successful refresh/reorder preserves the measured cache; changed endpoints invalidate only themselves',async()=>{
+    const client=new RemnawaveClient();mocks.fetch.mockResolvedValue(JSON.stringify([config('A'),config('B')]));
+    const first=await client.syncProfile(key);const measured=first.servers.map((s,i)=>({...s,latency:47+i,latencyStatus:'ok' as const,latencyCheckedAt:new Date().toISOString(),latencyIdentity:serverMeasurementIdentity(s),latencySource:'physical-tcp' as const}));
+    client.updateCachedMeasurements(measured);
+    mocks.fetch.mockResolvedValue(JSON.stringify([config('B'),config('A')]));const reordered=await client.syncProfile(key);
+    expect(reordered.servers.map(s=>s.latency)).toEqual([48,47]);
+    mocks.fetch.mockResolvedValue(JSON.stringify([config('C'),config('A')]));const changed=await client.syncProfile(key);
+    expect(changed.servers.map(s=>s.latencyStatus)).toEqual(['unchecked','ok']);expect(changed.servers[1].latency).toBe(47);
+    expect(await client.loadServers()).toEqual(changed.servers);
+  });
   it('commits all logical profiles in payload order after validation and preserves stable IDs under reorder',async()=>{
     const client=new RemnawaveClient();mocks.fetch.mockResolvedValue(JSON.stringify([config('A'),config('B')]));
     const one=await client.syncProfile(key);expect(one.servers.map(s=>s.sourceOrder)).toEqual([0,1]);const ids=one.servers.map(s=>s.id);

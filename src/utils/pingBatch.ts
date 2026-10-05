@@ -1,5 +1,6 @@
 import type { ConnectivityProbe, VpnServer } from '../types/vpn';
 import { getServerPingTargets } from './serverPing';
+import { serverMeasurementIdentity } from './serverMeasurements';
 
 // Four matches the existing helper budget and the native ping admission limit.
 // A connected VPN no longer forces a serial worker: ping never mutates routing.
@@ -25,12 +26,13 @@ export async function runPingBatch(targets: VpnServer[], probe: (server: VpnServ
       const remaining = PING_BATCH_TIMEOUT_MS - (performance.now() - started);
       const outcome = await new Promise<PingResult>(resolve => {
         let settled = false;
-        const finish = (result: PingResult) => { if (settled) return; settled = true; clearTimeout(timer); signal.removeEventListener('abort', abort); resolve(result); };
-        const abort = () => finish({ id: target.id, status: 'cancelled' });
+        const finish = (result: PingResult) => { if (settled) return; settled = true; clearTimeout(timer); resolve(signal.aborted ? { id: target.id, status: 'cancelled' } : result); };
         const timer = setTimeout(() => finish({ id: target.id, status: 'timeout' }), Math.min(PING_ITEM_TIMEOUT_MS, remaining));
-        signal.addEventListener('abort', abort, { once: true });
-        if (signal.aborted) { abort(); return; }
-        Promise.resolve().then(() => probe(target)).then(value => {
+        // IPC has its own deadline and cannot be cancelled by AbortSignal.
+        // Drain started probes within the same item deadline before releasing
+        // the pool; stop queued work and discard every cancelled result.
+        if (signal.aborted) { finish({ id: target.id, status: 'cancelled' }); return; }
+        Promise.resolve().then(() => signal.aborted ? undefined : probe(target)).then(value => {
           const valid = value?.success === true && typeof value.latencyMs === 'number' && Number.isFinite(value.latencyMs) && value.latencyMs > 0;
           finish({ id: target.id, status: valid ? 'ok' : 'unreachable', probe: value });
         }, error => finish({ id: target.id, status: /timeout|timed out|превысил|не завершилась/i.test(String(error)) ? 'timeout' : 'unreachable' }));
@@ -60,6 +62,7 @@ export function applyPingBatch(current: VpnServer[], snapshot: VpnServer[], batc
   return current.map(server => {
     const result = results.get(server.id);
     if (!result || result.status === 'cancelled') return server;
-    return { ...server, latency: result.status === 'ok' ? Math.max(1, Math.round(result.probe!.latencyMs!)) : null, latencyStatus: result.status === 'ok' ? 'ok' as const : 'failed' as const, latencyCheckedAt: checkedAt };
+    return { ...server, latency: result.status === 'ok' ? result.probe!.latencyMs! : null, latencyStatus: result.status === 'ok' ? 'ok' as const : 'failed' as const, latencyCheckedAt: checkedAt,
+      latencyIdentity: serverMeasurementIdentity(server), latencySource: server.runtimeTemplate?.profileKind === 'auto' ? 'auto-members-physical-tcp' as const : 'physical-tcp' as const };
   });
 }

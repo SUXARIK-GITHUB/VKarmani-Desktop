@@ -2803,16 +2803,12 @@ pub(crate) async fn pick_executable_path() -> Result<Option<String>, String> {
 }
 #[tauri::command]
 pub(crate) fn restart_application(app: AppHandle) -> Result<(), String> {
-    cleanup_application(&app, "restart_application");
-    let current_exe = std::env::current_exe()
-        .map_err(|error| format!("Не удалось определить путь приложения: {error}"))?;
-    let mut command = Command::new(current_exe);
-    hide_child_console(&mut command);
-    command
-        .spawn()
-        .map_err(|error| format!("Не удалось перезапустить приложение: {error}"))?;
-    app.exit(0);
-    Ok(())
+    let state = app.state::<AppState>();
+    crate::restart_lifecycle::restart_after_owned_cleanup(
+        &state.restart_requested,
+        || request_disconnect_blocking(app.clone()).map(|_| ()),
+        || app.request_restart(),
+    )
 }
 
 fn read_runtime_log_blocking(app: AppHandle, lines: Option<usize>) -> Result<Vec<String>, String> {

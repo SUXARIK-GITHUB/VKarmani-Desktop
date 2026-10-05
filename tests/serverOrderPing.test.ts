@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { VpnServer, ConnectivityProbe } from '../src/types/vpn';
 import { rankServersForDisplay } from '../src/utils/serverSorting';
-import { applyPingBatch, runPingBatch, PING_CONCURRENCY, PING_BATCH_TIMEOUT_MS } from '../src/utils/pingBatch';
+import { applyPingBatch, runPingBatch, PING_CONCURRENCY, PING_BATCH_TIMEOUT_MS, PING_ITEM_TIMEOUT_MS } from '../src/utils/pingBatch';
 import { normalizeStoredSettings } from '../src/services/storage';
 import { decodeProfileCache, encodeProfileCache } from '../src/services/profileCache';
 
@@ -61,9 +61,14 @@ describe('bounded ping batch and atomic generation commit', () => {
     const replacement=[{...server('same',0),host:'new.example.test'}];expect(applyPingBatch(replacement,original,batch)).toBe(replacement);
   });
   it('cancels without starting queued entries, cleans listeners/timers and cannot commit cancelled latencies', async () => {
-    const controller=new AbortController();let called=0;const targets=Array.from({length:11},(_,i)=>server(String(i),i));
-    const pending=runPingBatch(targets,()=>{called++;return new Promise(()=>{});},controller.signal);await Promise.resolve();controller.abort();const batch=await pending;
-    expect(called).toBe(4);expect(batch.cancelled).toBe(11);expect(applyPingBatch(targets,targets,batch)).toEqual(targets);
+    vi.useFakeTimers({toFake:['setTimeout','clearTimeout','performance']});
+    try {
+      const controller=new AbortController();let called=0,settled=false;const targets=Array.from({length:11},(_,i)=>server(String(i),i));
+      const pending=runPingBatch(targets,()=>{called++;return new Promise(()=>{});},controller.signal).then(batch=>{settled=true;return batch;});
+      await Promise.resolve();controller.abort();await Promise.resolve();expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(PING_ITEM_TIMEOUT_MS);const batch=await pending;
+      expect(called).toBe(4);expect(batch.cancelled).toBe(11);expect(applyPingBatch(targets,targets,batch)).toEqual(targets);expect(vi.getTimerCount()).toBe(0);
+    } finally {vi.useRealTimers();}
   });
   it('bounds all-timeout batches and marks unstarted targets without unbounded native admission', async () => {
     vi.useFakeTimers({toFake:['setTimeout','clearTimeout','performance']});

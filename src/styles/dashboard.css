@@ -946,6 +946,12 @@
   height: 16px;
 }
 
+.vk-quality-indicator.good { color: var(--vk-green); }
+.vk-quality-indicator.warn { color: var(--vk-orange); }
+.vk-quality-indicator.error { color: var(--danger); }
+.vk-quality-indicator.muted,
+.vk-quality-indicator.checking { color: var(--muted); }
+
 .vk-check-badge {
   width: 18px;
   height: 18px;
