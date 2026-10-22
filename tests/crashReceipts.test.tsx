@@ -6,6 +6,7 @@ vi.mock('../src/services/runtime', () => ({ writeNativeInterfaceLog: mocks.log }
 vi.mock('../src/services/stateHandoff', () => ({ listenForStateHandoff: mocks.handoff }));
 import { createFrontendCrashReceipt, listenForFrontendCrashes, recordFrontendCrash } from '../src/services/crashReceipts';
 import { RootErrorBoundary } from '../src/components/RootErrorBoundary';
+import packageJson from '../package.json';
 
 beforeEach(() => { mocks.log.mockReset().mockResolvedValue(undefined); mocks.handoff.mockReset().mockResolvedValue(vi.fn()); });
 afterEach(() => vi.unstubAllGlobals());
@@ -15,7 +16,7 @@ describe('R17/R46 bounded allowlisted frontend crash evidence', () => {
     const failure = new Error('password=short-secret https://sensitive.test/private?key=abc');
     failure.stack = 'Error: plaintext\n at privateUser (https://private.test/sensitive.js:20:31)\nComponent@http://localhost:1234/App.tsx?t=123:5:9';
     const receipt = createFrontendCrashReceipt('UI_RENDER_FAILED', failure);
-    expect(receipt).toMatchObject({ appVersion: '0.13.76', code: 'UI_RENDER_FAILED', phase: 'render', stack: [{ line: 20, column: 31 }, { line: 5, column: 9 }] });
+    expect(receipt).toMatchObject({ appVersion: packageJson.version, code: 'UI_RENDER_FAILED', phase: 'render', stack: [{ line: 20, column: 31 }, { line: 5, column: 9 }] });
     expect(Number.isFinite(Date.parse(receipt.timestamp))).toBe(true);
     const text = JSON.stringify(receipt); for (const secret of ['short-secret', 'sensitive', 'private', 'plaintext', 'App.tsx', 'localhost']) expect(text).not.toContain(secret);
   });
