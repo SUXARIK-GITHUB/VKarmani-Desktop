@@ -17,7 +17,7 @@ import { tr, type UiLanguage } from '../i18n';
 import type { ConnectionState, TunnelMode, VpnServer } from '../types/vpn';
 import { ServerFlag } from './ServerFlag';
 import { ConnectionQualityIndicator } from './ConnectionQualityIndicator';
-import { getServerPrimaryLabel, getServerSecondaryLabel } from '../utils/serverDisplay';
+import { getServerPrimaryLabel, getServerSubtitle } from '../utils/serverDisplay';
 
 interface OverviewTabProps {
   connectionState: ConnectionState;
@@ -141,7 +141,7 @@ export function OverviewTab({
   const isConnected = connectionState === 'connected';
   const selectedName = selectedServer ? getServerPrimaryLabel(selectedServer) : tr(language, 'Сервер не выбран', 'No server selected');
   const selectedMeta = selectedServer
-    ? getServerSecondaryLabel(selectedServer, showDiagnostics)
+    ? getServerSubtitle(selectedServer)
     : tr(language, 'Выберите сервер из списка', 'Choose a server from the list');
   const selectedProtocol = getProtocolLabel(selectedServer);
   const filteredServerCount = servers.length;
@@ -170,7 +170,7 @@ export function OverviewTab({
           <span className="vk-flag-large"><ServerFlag server={selectedServer} size="large" /></span>
           <div className="vk-hero-server-copy">
             <strong>{selectedName}</strong>
-              {!isConnected && <span>{selectedMeta} · {selectedProtocol}</span>}
+              {(!isConnected || selectedServer?.description) && <span title={selectedMeta}>{selectedMeta || selectedProtocol}</span>}
           </div>
           <div className="vk-hero-latency" title={selectedServer?.runtimeTemplate?.profileKind === 'auto' ? tr(language, 'Auto: минимальный измеренный пинг доступного участника; не текущий маршрут Xray.', 'Auto: lowest measured reachable member ping; not the current Xray route.') : undefined}>
             <ConnectionQualityIndicator server={selectedServer} language={language} checking={Boolean(selectedServer && checkingPingServerIdSet.has(selectedServer.id))} />
@@ -187,6 +187,7 @@ export function OverviewTab({
               <Search size={18} />
               <input
                 value={searchValue}
+                aria-label={tr(language,'Поиск серверов','Search servers')}
                 onChange={(event) => onSearchChange(event.target.value)}
                 placeholder={tr(language, 'Поиск серверов', 'Search servers')}
               />
@@ -203,22 +204,15 @@ export function OverviewTab({
               <div
                 key={server.id}
                 className={`vk-server-row ${active ? 'active' : ''}`}
-                role="button"
-                tabIndex={0}
-                aria-pressed={active}
-                onClick={() => onSelectServer(server.id)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    onSelectServer(server.id);
-                  }
-                }}
               >
+                <button type="button" className="vk-server-row-select" aria-pressed={active}
+                  aria-label={tr(language,`Выбрать сервер: ${getServerPrimaryLabel(server)}`,`Select server: ${getServerPrimaryLabel(server)}`)}
+                  onClick={()=>onSelectServer(server.id)} />
                 <span className="vk-server-select-button">
                   <span className="vk-server-flag"><ServerFlag server={server} /></span>
                   <span className="vk-server-copy">
                     <strong>{getServerPrimaryLabel(server)}</strong>
-                    <small>{getProtocolLabel(server)}</small>
+                    <small title={getServerSubtitle(server)}>{getServerSubtitle(server)}</small>
                   </span>
                   <span className="vk-server-quality" title={server.runtimeTemplate?.profileKind === 'auto' ? tr(language, 'Auto: минимальный измеренный пинг доступного участника; не текущий маршрут Xray.', 'Auto: lowest measured reachable member ping; not the current Xray route.') : undefined}>
                     {active ? <span className="vk-check-badge"><Check size={13} /></span> : null}

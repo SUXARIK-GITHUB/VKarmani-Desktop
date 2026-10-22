@@ -1,4 +1,7 @@
 import packageJson from '../../package.json';
+import {structuredNativeError} from '../utils/nativeErrors';
+import {nativeMutations,NATIVE_MUTATIONS} from './nativeTransport';
+import {validateRepairPlan,type RuntimeRepairPlan} from '../utils/repairPlan';
 import { getServerPingEndpoint } from '../utils/serverPing';
 export { getServerPingEndpoint } from '../utils/serverPing';
 import { redactSensitiveText } from '../utils/redaction';
@@ -83,6 +86,7 @@ const NATIVE_COMMAND_TIMEOUTS_MS: Record<string, number> = {
   server_ping: 9000,
   traffic_snapshot: 7000,
   runtime_status: 9000,
+  runtime_observation: 9000,
   proxy_status: 9000,
   read_runtime_log: 5000,
   write_interface_log: 3500,
@@ -98,24 +102,15 @@ const NATIVE_COMMAND_TIMEOUTS_MS: Record<string, number> = {
   set_session_authorized: 18000
 };
 
-function commandTimeoutMessage(command: string, timeoutMs: number) {
-  const seconds = Math.round(timeoutMs / 1000);
-  if (command === 'request_connect') {
-    return `Подключение заняло больше ${seconds} секунд. UI разблокирован, состояние runtime будет обновлено автоматически.`;
-  }
-  if (command === 'request_disconnect') {
-    return `Отключение заняло больше ${seconds} секунд. UI разблокирован, состояние runtime будет обновлено автоматически.`;
-  }
-  if (command === 'set_system_proxy') {
-    return `Изменение системного proxy заняло больше ${seconds} секунд. Проверьте состояние proxy в диагностике.`;
-  }
-  return `Нативная команда ${command} не ответила за ${seconds} секунд.`;
+function commandTimeoutError(command:string) {
+  const language=typeof document!=='undefined'&&document.documentElement.lang==='en'?'en':'ru';
+  return structuredNativeError({code:'NATIVE_COMMAND_TIMEOUT',category:'bridge',retryable:false,operationPending:NATIVE_MUTATIONS.has(command)},'Native response unavailable',language)!;
 }
 
 function withClientTimeout<T>(operation: Promise<T>, timeoutMs: number, command: string): Promise<T> {
   let timer: number | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = window.setTimeout(() => reject(new Error(commandTimeoutMessage(command, timeoutMs))), timeoutMs);
+    timer = window.setTimeout(() => reject(commandTimeoutError(command)), timeoutMs);
   });
 
   operation.catch(() => {
@@ -132,7 +127,7 @@ function withClientTimeout<T>(operation: Promise<T>, timeoutMs: number, command:
 
 async function invokeTauri<T>(command: string, args: Record<string, unknown> = {}, timeoutMs = NATIVE_COMMAND_TIMEOUTS_MS[command] ?? 12000): Promise<T> {
   const { invoke } = await import('@tauri-apps/api/core');
-  return withClientTimeout(invoke<T>(command, args), timeoutMs, command);
+  return withClientTimeout(nativeMutations.invoke(command,()=>invoke<T>(command,args)), timeoutMs, command);
 }
 
 export async function setNativeTrayUpdateState(available: boolean, busy: boolean): Promise<boolean> {
@@ -165,17 +160,17 @@ export async function openExternalUrl(url: string): Promise<void> {
 
 
 
-function extractErrorMessage(error: unknown, depth = 0): string {
-  if (depth > 4 || error == null) {
+function extractErrorMessage(error: unknown, depth = 0,budget={remaining:128}): string {
+  if (--budget.remaining<0||depth > 4 || error == null) {
     return '';
   }
 
   if (typeof error === 'string') {
-    return error.trim();
+    return error.slice(0,4096).trim();
   }
 
   if (error instanceof Error) {
-    const direct = error.message?.trim() ?? '';
+    const direct = error.message?.slice(0,4096).trim() ?? '';
     if (direct) {
       return direct;
     }
@@ -192,36 +187,33 @@ function extractErrorMessage(error: unknown, depth = 0): string {
     ];
 
     for (const candidate of candidates) {
-      const nested = extractErrorMessage(candidate, depth + 1);
+      const nested = extractErrorMessage(candidate, depth + 1,budget);
       if (nested) {
         return nested;
       }
     }
 
     if (Array.isArray(record.errors)) {
-      for (const item of record.errors) {
-        const nested = extractErrorMessage(item, depth + 1);
+      for (const item of record.errors.slice(0,16)) {
+        const nested = extractErrorMessage(item, depth + 1,budget);
         if (nested) {
           return nested;
         }
       }
     }
 
-    try {
-      const serialized = JSON.stringify(error);
-      if (serialized && serialized !== '{}') {
-        return serialized;
-      }
-    } catch {
-      // ignore serialization errors
-    }
+    // Unknown payload objects may contain private state or throwing toJSON.
+    // Only explicit bounded message fields or structured codes cross into UI.
   }
 
   return '';
 }
 
 export function normalizeNativeError(error: unknown, fallback: string): Error {
-  const message = redactSensitiveText(extractErrorMessage(error) || fallback);
+  const structured=structuredNativeError(error,fallback,typeof document!=='undefined'&&document.documentElement.lang==='en'?'en':'ru');
+  if(structured)return structured;
+  let extracted='';try{extracted=extractErrorMessage(error);}catch{/* Arbitrary accessors cannot break the error path. */}
+  const message = redactSensitiveText(extracted.slice(0,4096) || fallback);
   return new Error(message);
 }
 
@@ -250,6 +242,15 @@ export async function getNativeRuntimeStatus(): Promise<RuntimeStatus> {
   } catch (error) {
     throw new Error(normalizeNativeError(error, 'Не удалось получить статус runtime.').message);
   }
+}
+
+export async function getNativeDiagnosticsSnapshot(): Promise<RuntimeStatus> {
+  if (!isTauriRuntime) throw Error('DIAGNOSTICS_NATIVE_REQUIRED');
+  return invokeTauri<RuntimeStatus>('diagnostics_snapshot');
+}
+export async function getNativeRuntimeObservation():Promise<RuntimeStatus>{
+  if(!isTauriRuntime)return mockRuntimeStatus('Web preview has no native connection.');
+  return invokeTauri<RuntimeStatus>('runtime_observation');
 }
 
 export async function requestNativeConnect(
@@ -429,12 +430,16 @@ export async function runNativeConnectivityProbe(): Promise<ConnectivityProbe> {
   return invokeTauri<ConnectivityProbe>('connectivity_probe');
 }
 
-export async function repairNativeRuntimeEnvironment(): Promise<RuntimeStatus> {
+export async function prepareNativeRuntimeRepair():Promise<RuntimeRepairPlan> {
+  if(!isTauriRuntime)throw Error('REPAIR_NATIVE_REQUIRED');
+  return validateRepairPlan(await invokeTauri<unknown>('prepare_runtime_repair'));
+}
+export async function repairNativeRuntimeEnvironment(planId:string): Promise<RuntimeStatus> {
   if (!isTauriRuntime) {
-    return getNativeRuntimeStatus();
+    throw Error('REPAIR_NATIVE_REQUIRED');
   }
 
-  return invokeTauri<RuntimeStatus>('repair_runtime_environment');
+  return invokeTauri<RuntimeStatus>('repair_runtime_environment',{planId});
 }
 
 export async function readNativeRuntimeLog(lines = 20): Promise<string[]> {
@@ -462,10 +467,20 @@ export async function writeNativeRoutingLog(message: string, details?: string) {
 }
 
 
-export async function fetchRemoteText(url: string, accept = 'text/plain, application/json, text/html', userAgent?: string) {
+export interface RemoteSubscriptionResponse {
+  text: string;
+  userinfo: { upload: string | null; download: string | null; total: string | null; expire: string | null };
+}
+
+export async function fetchRemoteText(url: string, accept = 'text/plain, application/json, text/html', userAgent?: string): Promise<string> {
   if (isTauriRuntime) {
     return invokeTauri<string>('fetch_remote_text', { url, accept, userAgent });
   }
+  return (await fetchRemoteSubscription(url, accept, userAgent)).text;
+}
+
+export async function fetchRemoteSubscription(url: string, accept = 'application/json', userAgent?: string): Promise<RemoteSubscriptionResponse> {
+  if (isTauriRuntime) return invokeTauri<RemoteSubscriptionResponse>('fetch_remote_subscription', { url, accept, userAgent });
 
   const safeUrl = validateWebRemoteFetchUrl(url);
   const controller = new AbortController();
@@ -492,7 +507,8 @@ export async function fetchRemoteText(url: string, accept = 'text/plain, applica
       throw new Error(`Ответ remote subscription слишком большой. Лимит: ${WEB_FETCH_BODY_LIMIT_BYTES} байт.`);
     }
 
-    return text;
+    const { parseSubscriptionUserinfo } = await import('../utils/subscriptionMetadata');
+    return { text, userinfo: parseSubscriptionUserinfo(response.headers.get('subscription-userinfo')) };
   } finally {
     window.clearTimeout(timeout);
   }

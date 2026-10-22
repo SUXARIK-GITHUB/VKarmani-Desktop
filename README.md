@@ -44,8 +44,8 @@
 - ⭐ **Избранные серверы** — избранные узлы сохраняются и поднимаются выше в списке для быстрого выбора.
 - 📶 **Проверка пинга** — можно проверить доступность серверов и увидеть задержку перед подключением.
 - 🔌 **Proxy-режим** — подключение через локальный Xray proxy с возможностью включать системный proxy Windows.
-- 🛡️ **TUN-режим** — режим туннеля через Wintun для выбранных приложений и служб.
-- 🧭 **Выбор приложений для TUN** — можно указать, какие `.exe` и службы должны идти через VPN.
+- 🛡️ **TUN-режим** — туннель через Wintun для всех приложений с DIRECT-исключениями.
+- 🧭 **Выбор приложений для TUN** — правила `.exe` и служб сохраняются, но подключение в режиме «Только выбранные» временно недоступно: ошибка определения процесса в Xray может отправить выбранный трафик напрямую.
 - 🧩 **Исключения маршрутизации** — домены, зоны и IPv4-сети можно направлять напрямую, не через VPN.
 - 🔁 **Аккуратное переключение серверов** — при смене сервера приложение проверяет выбранный узел и не должно случайно подключаться к другому.
 - 🧯 **Откат при неудачном переключении** — если новый сервер не поднялся, приложение старается вернуть прежнее рабочее подключение.
@@ -82,7 +82,7 @@ VKarmani Desktop поддерживает автообновления чере�
 - проверить наличие обновления;
 - показать, что доступна новая версия;
 - скачать актуальный установщик;
-- остановить VPN перед установкой обновления;
+- автоматически установить только при подтверждённом idle; при активной VPN запросить явное подтверждение остановки;
 - запустить установку без ручной загрузки архива.
 
 ---
@@ -94,7 +94,7 @@ VKarmani Desktop поддерживает автообновления чере�
 | 🖼️ Интерфейс | React, TypeScript, Vite | Главное окно, авторизация, серверы, настройки, диагностика, уведомления |
 | 🧠 Desktop backend | Rust, Tauri v2 | Native-команды, запуск Xray, системный proxy, TUN, маршруты, tray, updater |
 | 🌐 VPN core | Xray-core | Реальное VPN/proxy-подключение, inbound/outbound, проверка конфигов |
-| 🛡️ TUN | Wintun | Туннелирование выбранных приложений и служб через VPN |
+| 🛡️ TUN | Wintun | Режимы для всех приложений и DIRECT-исключений; «Только выбранные» временно недоступен |
 | 🔑 Хранение ключа и runtime-кэша | Windows DPAPI / secure storage | Защищённое сохранение ключа доступа и полного server runtime cache на устройстве |
 | 📦 Обновления | Tauri Updater, GitHub Releases, latest.json | Проверка, загрузка и установка новых версий |
 | 🧩 Парсер подписки | Remnawave parser | Разбор VLESS, VMess, Trojan, Shadowsocks, Hysteria2 и server metadata |
@@ -105,170 +105,41 @@ VKarmani Desktop поддерживает автообновления чере�
 
 ---
 
-## 📁 Актуальная структура проекта
+## 📁 Структура проекта
 
-```text
-VKarmani-Desktop/
-├─ .github/
-│  ├─ dependabot.yml
-│  └─ workflows/
-│     └─ release.yml
-│
-├─ public/
-│  ├─ assets/
-│  │  ├─ logo-dark.jpg
-│  │  ├─ logo-white.jpg
-│  │  ├─ logo-vkarmani.png
-│  │  └─ wallpaper.jpg
-│  └─ favicon.ico
-│
-├─ resources/
-│  └─ core/
-│     └─ windows/
-│        ├─ xray.exe
-│        ├─ geoip.dat
-│        ├─ geosite.dat
-│        ├─ wintun.dll
-│        └─ core-manifest.json
-│
-├─ scripts/
-│  ├─ fetch-xray-windows.ps1
-│  ├─ repair-xray-windows.ps1
-│  ├─ set-version.mjs
-│  ├─ verify-core-manifest.mjs
-│  ├─ verify-hysteria2-bundled-xray.ps1
-│  ├─ verify-updater-config.mjs
-│  ├─ verify-xray-windows.ps1
-│  └─ windows-runtime-smoke.ps1
-│
-├─ src/
-│  ├─ components/
-│  │  ├─ AppInfoModal.tsx
-│  │  ├─ AuthScreen.tsx
-│  │  ├─ DiagnosticsTab.tsx
-│  │  ├─ OverviewTab.tsx
-│  │  ├─ ServerFlag.tsx
-│  │  ├─ SettingsTab.tsx
-│  │  ├─ SidebarNav.tsx
-│  │  ├─ SplitTunnelModal.tsx
-│  │  ├─ StartupSkeleton.tsx
-│  │  ├─ SupportTab.tsx
-│  │  ├─ TabErrorBoundary.tsx
-│  │  ├─ ToastViewport.tsx
-│  │  └─ WindowHeader.tsx
-│  │
-│  ├─ hooks/
-│  │  ├─ useConnectionStateController.ts
-│  │  ├─ useOperationManager.ts
-│  │  ├─ usePingManager.ts
-│  │  ├─ useSyncedRef.ts
-│  │  └─ useToastManager.ts
-│  │
-│  ├─ services/
-│  │  ├─ remnawave/
-│  │  │  └─ subscriptionParser.ts
-│  │  ├─ connectionGuards.ts
-│  │  ├─ remnawave.ts
-│  │  ├─ runtime.ts
-│  │  ├─ storage.ts
-│  │  └─ updater.ts
-│  │
-│  ├─ styles/
-│  │  ├─ components/
-│  │  ├─ base.css
-│  │  ├─ dashboard.css
-│  │  └─ responsive.css
-│  │
-│  ├─ types/
-│  │  ├─ appState.ts
-│  │  └─ vpn.ts
-│  │
-│  ├─ utils/
-│  │  ├─ async.ts
-│  │  ├─ diagnosticsExport.ts
-│  │  ├─ redaction.ts
-│  │  ├─ routingExclusions.ts
-│  │  ├─ serverDisplay.ts
-│  │  ├─ serverIdentity.ts
-│  │  ├─ serverSorting.ts
-│  │  ├─ toast.ts
-│  │  └─ traffic.ts
-│  │
-│  ├─ App.tsx
-│  ├─ i18n.ts
-│  ├─ main.tsx
-│  ├─ styles.css
-│  └─ vite-env.d.ts
-│
-├─ src-tauri/
-│  ├─ capabilities/
-│  │  └─ default.json
-│  ├─ icons/
-│  │  ├─ 32x32.png
-│  │  ├─ 128x128.png
-│  │  ├─ icon.ico
-│  │  └─ icon.png
-│  ├─ nsis/
-│  │  └─ installer-hooks.nsh
-│  ├─ src/
-│  │  ├─ app_run.rs
-│  │  ├─ commands.rs
-│  │  ├─ core_paths.rs
-│  │  ├─ lib.rs
-│  │  ├─ main.rs
-│  │  ├─ platform.rs
-│  │  ├─ remote_fetch.rs
-│  │  ├─ runtime_lifecycle.rs
-│  │  ├─ runtime_status.rs
-│  │  ├─ state.rs
-│  │  ├─ tests.rs
-│  │  └─ xray_config.rs
-│  ├─ build.rs
-│  ├─ Cargo.toml
-│  ├─ Cargo.lock
-│  └─ tauri.conf.json
-│
-├─ tests/
-│  └─ remnawave.test.ts
-│
-├─ dist/
-│  ├─ assets/
-│  ├─ favicon.ico
-│  └─ index.html
-│
-├─ .env.example
-├─ .gitattributes
-├─ .gitignore
-├─ .npmrc
-├─ index.html
-├─ package.json
-├─ package-lock.json
-├─ README.md
-├─ START_VKarmani.bat
-├─ tsconfig.json
-├─ tsconfig.node.json
-└─ vite.config.ts
-```
+| Каталог | Содержимое |
+|---|---|
+| `src/` | React UI, IPC adapters, подписки, состояния и утилиты |
+| `src-tauri/src/` | Rust lifecycle, storage, сетевые операции и проверки ownership |
+| `resources/core/windows/` | Bundled Xray/Wintun/geoip/geosite и manifest |
+| `tests/` | Frontend regression, parser, security и concurrency fixtures |
+| `scripts/` | Проверки ресурсов, updater и изолированных Windows scenarios |
+| `.github/workflows/` | CI и draft-first release workflow |
 
-> `dist/` — это собранный frontend. Основная разработка ведётся в `src/` и `src-tauri/`.
+`dist/` и `src-tauri/target/` — результаты локальной сборки, не исходники.
 
 ---
 
 ## 🧪 Проверки и сборка
 
-Требования для разработки: **Node.js 22 LTS** и npm 10+.
+Текущая проверяемая сборочная среда: **Node.js 22.23.3**, npm 10+, **Rust/Cargo 1.94.0**, MSVC Build Tools и Windows SDK. Наличие WebView2 и совместимость с целевой Windows проверяются отдельно. Поле `rust-version` в manifest пока не подтверждает сборку старым toolchain.
 
 ```bash
 npm ci
+npm run lint
+npm test
 npm run build
 npm run test:parsers
 npm run verify:updater
 npm run verify:xray:manifest
-npm run smoke:windows
-npm run tauri:build
+cargo tree --locked --manifest-path src-tauri/Cargo.toml
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo check --locked --manifest-path src-tauri/Cargo.toml
+cargo test --locked --manifest-path src-tauri/Cargo.toml
+cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 ```
 
-Для Windows-проверок Xray и runtime используются PowerShell-скрипты из папки `scripts/`.
+Для Xray/resource-проверок используются PowerShell-скрипты из `scripts/`. `npm run smoke:windows` требует чистого отключённого тестового сеанса: не используйте его для acceptance параллельно рабочей VPN. `npm run tauri:build` создаёт Windows-пакеты; проверка подписи и native acceptance остаются отдельными шагами.
 
 ---
 
@@ -298,8 +169,13 @@ VKarmani Desktop не предназначен для хранения публ�
 
 ## 📌 Статус проекта
 
-Проект активно развивается.  
-Основной фокус — стабильное подключение, удобный интерфейс, корректные обновления, безопасное хранение ключа и аккуратная работа на Windows.
+Текущие исходники содержат изменения TASK-009 для проверки и дальнейшей доработки. Публикация кода в GitHub не означает выпуск новой сборки или обновление клиентов. До завершения обязательных native/platform/security проверок действует **PRODUCTION_NO_GO**. Код этой ветки и файлы установленной сборки могут различаться.
+
+Windows 10/11 x64 — целевые системы текущего backend. Поддержка Windows 7 и Linux ещё не подтверждена. Firewall Kill Switch, полная DNS leak protection и Strict Isolation не должны считаться проверенными возможностями этой сборки.
+
+Proxy использует системные HTTP/HTTPS настройки Windows; он не обеспечивает прозрачный UDP и не запрещает программам обращаться к локальному SOCKS/HTTP вручную. Выбранные service rules требуют отдельного исполняемого файла; shared `svchost.exe` не считается изолированной службой.
+
+В текущих исходниках read-only Diagnostics отделена от repair; error-уведомления сохраняются до закрытия, а история ограничена 128 записями без ключей и endpoint. Новое v2-хранилище использует DPAPI и revision/CAS; откат к старой схеме требует явного экспорта. Доступные локальные проверки не заменяют миграцию/откат и network acceptance на целевой системе.
 
 ---
 

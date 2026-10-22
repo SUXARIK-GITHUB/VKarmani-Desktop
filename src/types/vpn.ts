@@ -109,9 +109,13 @@ export interface VpnServer {
 export interface UserPlan {
   title: string;
   expiresAt: string;
-  trafficUsedGb: number;
-  trafficLimitGb: number;
-  devices: number;
+  trafficUsedGb: number | null;
+  trafficLimitGb: number | null;
+  devices: number | null;
+  uploadBytes?: string | null;
+  downloadBytes?: string | null;
+  totalBytes?: string | null;
+  expiresAtUnix?: string | null;
 }
 
 export interface RemnawaveSession {
@@ -119,7 +123,7 @@ export interface RemnawaveSession {
   userId: string;
   displayName: string;
   loginHint: string;
-  deviceLimit: number;
+  deviceLimit: number | null;
   plan: UserPlan;
   source: RemnawaveSource;
   shortUuid?: string;
@@ -146,7 +150,7 @@ export interface SessionRecord {
   startedAt: string;
   serverLabel: string;
   durationLabel: string;
-  transferredGb: number;
+  transferredGb: number | null;
   status: 'completed' | 'current' | 'interrupted';
 }
 
@@ -174,6 +178,7 @@ export interface ProfileSyncInfo {
 }
 
 export interface RuntimeStatus {
+  diagnosticFacts?: DiagnosticFacts;
   runtimeId?: string;
   nativeInstanceId?: string;
   bridge: RuntimeBridge;
@@ -213,6 +218,18 @@ export interface RuntimeStatus {
   proxyAutoDetect?: boolean;
 }
 
+export interface RepairReceipt {atUnixMs:number;code:string;restoreProxy:boolean;routeCount:number}
+export interface DiagnosticFacts {
+  ports?:DiagnosticPort[];
+  checkedAtUnixMs:number;
+  resourceIntegrity:'verified'|'mismatch'|'unavailable';
+  storageMetadata:'present'|'missing'|'unavailable';
+  logsMetadata:'present'|'missing'|'unavailable';
+  elevation:'elevated'|'standard'|'unavailable';
+  repairHistory:RepairReceipt[];
+  repairHistoryStatus:'available'|'unavailable';
+}
+export interface DiagnosticPort {port:10808|10809|10810;state:'free'|'owned'|'foreign'|'unconfirmed'|'unavailable'}
 export interface ProxyStatus {
   enabled: boolean;
   server?: string;
@@ -303,4 +320,7 @@ export interface ToastItem {
   id: string;
   title: string;
   tone: 'info' | 'success' | 'error';
+  code?: string;
+  createdAt?: string;
+  overflowCount?: number;
 }

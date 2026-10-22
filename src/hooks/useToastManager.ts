@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { createToast } from '../utils/toast';
-import { redactSensitiveText } from '../utils/redaction';
+import { createToast, mergeToastItems,redactToastTitle } from '../utils/toast';
 import type { ToastItem } from '../types/vpn';
 
 export function useToastManager(notificationsEnabled: boolean) {
@@ -10,12 +9,12 @@ export function useToastManager(notificationsEnabled: boolean) {
   useEffect(() => () => { timers.current.forEach(timer => clearTimeout(timer)); timers.current.clear(); }, []);
 
   const pushToast = useCallback((title: string, tone: ToastItem['tone'], options?: { key?: string; force?: boolean }) => {
-    if (!notificationsEnabled && !options?.force) {
+    if (!notificationsEnabled && !options?.force && tone !== 'error') {
       return;
     }
 
     const now = Date.now();
-    const safeTitle = redactSensitiveText(title);
+    const safeTitle = redactToastTitle(title);
     const lastToast = lastToastSignatureRef.current;
     if (!options?.key && lastToast && lastToast.title === safeTitle && lastToast.tone === tone && now - lastToast.at < 1600) {
       return;
@@ -26,7 +25,9 @@ export function useToastManager(notificationsEnabled: boolean) {
     if (options?.key) toast.id = `feedback:${options.key}`;
     const previousTimer = timers.current.get(toast.id);
     if (previousTimer !== undefined) clearTimeout(previousTimer);
-    setToasts((items: ToastItem[]) => [...items.filter(item => item.id !== toast.id).slice(-3), toast]);
+    timers.current.delete(toast.id);
+    setToasts((items: ToastItem[]) => mergeToastItems(items, toast));
+    if (tone === 'error') return;
 
     timers.current.set(toast.id, window.setTimeout(() => {
       setToasts((items: ToastItem[]) => items.filter((item: ToastItem) => item.id !== toast.id));
@@ -34,5 +35,9 @@ export function useToastManager(notificationsEnabled: boolean) {
     }, 2800));
   }, [notificationsEnabled]);
 
-  return { toasts, pushToast };
+  const dismissToast = useCallback((id: string) => {
+    const timer = timers.current.get(id); if (timer !== undefined) clearTimeout(timer);
+    timers.current.delete(id); setToasts(items=>items.filter(item=>item.id!==id));
+  }, []);
+  return { toasts, pushToast, dismissToast };
 }

@@ -691,14 +691,18 @@ Set-Acl -LiteralPath $path -AclObject $acl
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn harden_runtime_output_dir(_path: &Path) {}
 
-pub(crate) fn runtime_output_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn runtime_output_path(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
         .path()
         .app_local_data_dir()
         .or_else(|_| app.path().app_config_dir())
         .map_err(|error| format!("Не удалось определить каталог данных: {error}"))?;
 
-    let path = base.join("runtime");
+    Ok(base.join("runtime"))
+}
+
+pub(crate) fn runtime_output_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let path = runtime_output_path(app)?;
     fs::create_dir_all(&path)
         .map_err(|error| format!("Не удалось создать runtime каталог: {error}"))?;
     harden_runtime_output_dir(&path);
@@ -812,6 +816,13 @@ pub(crate) fn process_match_candidates(value: &str) -> Vec<String> {
     if has_path {
         return candidates;
     } // A full path never expands to all same-named exe files.
+      // Bundled Xray trims only lowercase ".exe" in both lookup and matcher.
+      // Its observed name for OUTLOOK.EXE is therefore OUTLOOK.EXE, not OUTLOOK.
+      // Retain this exact spelling as well as the existing stem candidates.
+    let original = extract_executable_value(value);
+    if original.to_ascii_lowercase().ends_with(".exe") && !original.ends_with(".exe") {
+        push_unique_process_match(&mut candidates, original);
+    }
     let file_name = normalized
         .rsplit('/')
         .next()

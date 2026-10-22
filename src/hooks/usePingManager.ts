@@ -6,6 +6,8 @@ import { applyPingBatch, runPingBatch } from '../utils/pingBatch';
 import { EMPTY_PING_PROGRESS, type PingProgressState } from '../types/appState';
 import type { AppSettings, ConnectivityProbe, ConnectionState, RuntimeStatus, ToastItem, VpnServer } from '../types/vpn';
 
+const networkTransition = (state: ConnectionState) => state === 'connecting' || state === 'disconnecting';
+
 interface UsePingManagerArgs {
   servers: VpnServer[];
   setServers: Dispatch<SetStateAction<VpnServer[]>>;
@@ -109,6 +111,10 @@ export function usePingManager({
 
   const refreshPing = useCallback(async (options: PingOptions = {}) => {
     if (inFlightRef.current) return;
+    if (networkTransition(connectionStateRef.current)) {
+      pendingFullReasonRef.current = options.reason ?? 'network-transition';
+      return;
+    }
     const snapshot = serversRef.current;
     const activeId = connectionStateRef.current === 'connected'
       ? connectedServerIdRef.current || runtimeStatusRef.current.lastPreparedServerId || selectedServerIdRef.current : selectedServerIdRef.current;
@@ -133,7 +139,8 @@ export function usePingManager({
       const batch = await runPingBatch(targets, pingNativeServer, controller.signal, completed => {
         if (runIdRef.current === runId && mountedRef.current) setPingProgress({ active: true, total: targets.length, completed, success: 0, failed: 0 });
       });
-      if (runIdRef.current !== runId || controller.signal.aborted || !mountedRef.current || serversRef.current !== snapshot) return;
+      if (runIdRef.current !== runId || controller.signal.aborted || !mountedRef.current || serversRef.current !== snapshot
+        || networkTransition(connectionStateRef.current)) return;
       const measured = applyPingBatch(snapshot, snapshot, batch);
       if (onMeasurementsRef.current?.(measured, snapshot) === false) return;
       serversRef.current = measured;
@@ -216,6 +223,9 @@ export function usePingManager({
   // Catalog replacements invalidate application by snapshot identity, but let
   // the bounded old batch drain before a coalesced full refresh starts.
   useEffect(() => { if (inFlightRef.current) cancelPing(true); }, [connectionState, selectedServerId, connectedServerId, cancelPing]);
+  useEffect(() => {
+    if (connectionState === 'idle' || connectionState === 'connected') drainFullRef.current();
+  }, [connectionState]);
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; cancelPing(); };

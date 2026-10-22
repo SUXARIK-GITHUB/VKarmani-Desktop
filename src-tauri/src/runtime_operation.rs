@@ -1,6 +1,21 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
+// A renderer may have queued a connect before the exit barrier. Recheck only
+// after acquiring the native operation lease so it cannot restart the core
+// after the handoff's confirmed disconnect. Cleanup uses the ordinary entry.
+pub(crate) fn begin_open_runtime_operation<'a>(
+    state: &'a AppState,
+    timeout: Duration,
+    context: &str,
+) -> Result<OperationLease<'a>, String> {
+    let lease = begin_runtime_operation(state, timeout, context, Duration::from_secs(45))?;
+    if state.storage_closed.load(Ordering::Acquire) {
+        return Err("STATE_CLOSING: новое runtime-действие отменено на время завершения.".into());
+    }
+    Ok(lease)
+}
+
 // Armed only after the previous runtime was confirmed stopped. Drop runs while
 // the caller still holds its operation lease, including every pre-child error.
 pub(crate) struct FailedConnectRollback<F: FnOnce()> {
@@ -161,7 +176,7 @@ pub(crate) fn begin_runtime_operation<'a>(
             Err(_) if started.elapsed() < wait => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => {
                 return Err(format!(
-                    "Runtime уже выполняет другое действие ({kind}). Повторите позже."
+                    "RUNTIME_BUSY: Runtime уже выполняет другое действие ({kind}). Повторите позже."
                 ))
             }
         }

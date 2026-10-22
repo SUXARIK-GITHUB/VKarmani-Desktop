@@ -35,7 +35,8 @@ export async function runPingBatch(targets: VpnServer[], probe: (server: VpnServ
         Promise.resolve().then(() => signal.aborted ? undefined : probe(target)).then(value => {
           const valid = value?.success === true && typeof value.latencyMs === 'number' && Number.isFinite(value.latencyMs) && value.latencyMs > 0;
           finish({ id: target.id, status: valid ? 'ok' : 'unreachable', probe: value });
-        }, error => finish({ id: target.id, status: /timeout|timed out|превысил|не завершилась/i.test(String(error)) ? 'timeout' : 'unreachable' }));
+        }, error => finish({ id: target.id, status: /^Error: PING_BUSY\b|^PING_BUSY\b/.test(String(error)) ? 'cancelled'
+          : /timeout|timed out|превысил|не завершилась/i.test(String(error)) ? 'timeout' : 'unreachable' }));
       });
       outcomes[logical].push(outcome);
       if (outcomes[logical].length === groups[logical].length) progress(++completed);
@@ -50,6 +51,7 @@ export async function runPingBatch(targets: VpnServer[], probe: (server: VpnServ
     const best = values.filter(result => result.status === 'ok').reduce<PingResult | undefined>((current, result) =>
       !current || result.probe!.latencyMs! < current.probe!.latencyMs! ? result : current, undefined);
     if (best) return { ...best, id: target.id };
+    if (values.some(result => result.status === 'cancelled')) return { id: target.id, status: 'cancelled' };
     return { id: target.id, status: values.length < groups[logical].length || values.some(result => result.status === 'timeout') ? 'timeout' : 'unreachable' };
   });
   return { results, durationMs: performance.now() - started, success: results.filter(r => r.status === 'ok').length, timeout: results.filter(r => r.status === 'timeout').length, unreachable: results.filter(r => r.status === 'unreachable').length, cancelled: results.filter(r => r.status === 'cancelled').length };

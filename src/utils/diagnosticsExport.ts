@@ -10,6 +10,15 @@ import type {
   UpdateInfo
 } from '../types/vpn';
 import { redactSensitiveText } from './redaction';
+import {publicDiagnosticFacts} from './diagnosticFacts';
+import {diagnosticChecks} from './diagnosticChecks';
+
+export function safePublicDigest(value:unknown,session:RemnawaveSession|null):string {
+  if(typeof value!=='string'||!/^[a-f0-9]{64}$/i.test(value))return '';
+  const credentials=[session?.accessKey,session?.userId,session?.shortUuid,session?.subscriptionUrl];
+  if(credentials.some(secret=>secret?.toLowerCase().includes(value.toLowerCase())))return '[redacted]';
+  return value.toLowerCase();
+}
 
 export interface SafeDiagnosticsExportInput {
   appVersion: string;
@@ -24,6 +33,7 @@ export interface SafeDiagnosticsExportInput {
   nativeLogLines: string[];
   trafficSnapshot?: TrafficSnapshot | null;
   trafficSampleCount?: number;
+  diagnosticObservation?:RuntimeStatus|null;
 }
 
 function toSafeSettings(settings: AppSettings) {
@@ -99,19 +109,20 @@ export function createSafeDiagnosticsPayload(input: SafeDiagnosticsExportInput):
     profileSync: {status:input.profileSyncInfo.status,source:input.profileSyncInfo.source,configCount:input.profileSyncInfo.configCount,readyCount:input.profileSyncInfo.readyCount,message:text(input.profileSyncInfo.message)},
     update: {status:input.updateInfo.status,currentVersion:text(input.updateInfo.currentVersion),available:input.updateInfo.available,version:text(input.updateInfo.version)},
     settings: toSafeSettings(input.settings),
+    diagnosticsReadOnly:input.diagnosticObservation?{facts:publicDiagnosticFacts(input.diagnosticObservation.diagnosticFacts),checks:diagnosticChecks(input.diagnosticObservation,input.settings.language)}:null,
     logs: [...(input.diagnostics?.logLines ?? []), ...input.nativeLogLines].slice(-160).map(text)
   };
   // Sanitize serialization too, covering enum/hash/numeric fields from untrusted IPC.
   const seen = new WeakSet<object>();
   let nodes = 0;
-  function scrub(value: unknown, depth = 0): unknown {
+  function scrub(value: unknown, depth = 0, field = ''): unknown {
     if (++nodes > 4000 || depth > 8) return '[bounded]';
-    if (typeof value === 'string') return text(value);
+    if (typeof value === 'string') return field==='configHash' ? safePublicDigest(value,input.session) : text(value);
     if (!value || typeof value !== 'object') return value;
     if (seen.has(value)) return '[cycle]';
     seen.add(value);
     if (Array.isArray(value)) return value.slice(0, 160).map(v => scrub(v, depth + 1));
-    return Object.fromEntries(Object.entries(value).filter(([key]) => !/access.?key|user.?id|password|cookie|authorization|credential|token|secret|plaintext/i.test(key)).map(([key,val]) => [key,scrub(val,depth + 1)]));
+    return Object.fromEntries(Object.entries(value).filter(([key]) => !/access.?key|user.?id|password|cookie|authorization|credential|token|secret|plaintext/i.test(key)).map(([key,val]) => [key,scrub(val,depth + 1,key)]));
   }
   return JSON.stringify(scrub(report), null, 2);
 }

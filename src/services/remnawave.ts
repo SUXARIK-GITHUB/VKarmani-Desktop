@@ -10,7 +10,6 @@ import type {
   RemnawaveSession,
   RemnawaveSource,
   RuntimeStatus,
-  SessionRecord,
   SplitTunnelEntry,
   RoutingExclusionSettings,
   TunnelMode,
@@ -23,7 +22,7 @@ import {
   appVersion,
   cacheNativeProfileSync,
   fetchRemoteJson,
-  fetchRemoteText,
+  fetchRemoteSubscription,
   getIntegrationMeta,
   getNativeProxyStatus,
   getNativeRuntimeStatus,
@@ -40,7 +39,11 @@ import {
 } from './runtime';
 import { parseXrayJsonSubscriptionToServers } from './remnawave/subscriptionParser';
 import { assertNativeRuntimeServerMatches, nativeConnectFailurePreservesRuntime } from './connectionGuards';
+import {nativeMutations} from './nativeTransport';
+import {NativeOperationError} from '../utils/nativeErrors';
 import { buildServerRuntimeFingerprint } from '../utils/serverIdentity';
+import { withSubscriptionUserinfo } from '../utils/subscriptionMetadata';
+import type { RemoteSubscriptionResponse } from './runtime';
 
 const delay = (value: number) => new Promise<void>((resolve) => window.setTimeout(resolve, value));
 const previewDelay = (value: number) => isTauriRuntime ? Promise.resolve() : delay(value);
@@ -392,16 +395,16 @@ function makeProvisionalSession(accessKey: string, key: ResolvedAccessKey): Remn
     userId: key.identifier,
     displayName: 'VKarmani',
     loginHint: '',
-    deviceLimit: 3,
+    deviceLimit: null,
     source: 'public-api',
     shortUuid: key.shortUuid,
     subscriptionUrl: key.kind === 'url' ? key.normalized : undefined,
     plan: {
       title: 'Подписка VKarmani',
       expiresAt: '—',
-      trafficUsedGb: 0,
-      trafficLimitGb: 0,
-      devices: 3
+      trafficUsedGb: null,
+      trafficLimitGb: null,
+      devices: null
     }
   };
 }
@@ -582,6 +585,7 @@ interface ParsedXrayJsonProfileResult {
   servers: VpnServer[];
   rawText: string;
   url: string;
+  userinfo: RemoteSubscriptionResponse['userinfo'];
 }
 
 const XRAY_JSON_SUBSCRIPTION_PROFILE = {
@@ -663,10 +667,11 @@ function parsedXrayJsonProfileQuality(result: ParsedXrayJsonProfileResult & { pr
 async function fetchXrayJsonSubscriptionCandidate(
   url: string
 ): Promise<ParsedXrayJsonProfileResult & { score: number; profileName: string }> {
-  const rawText = await withRequestTimeout(
-    fetchRemoteText(url, XRAY_JSON_SUBSCRIPTION_PROFILE.accept, XRAY_JSON_SUBSCRIPTION_PROFILE.userAgent),
+  const response = await withRequestTimeout(
+    fetchRemoteSubscription(url, XRAY_JSON_SUBSCRIPTION_PROFILE.accept, XRAY_JSON_SUBSCRIPTION_PROFILE.userAgent),
     url
   );
+  const rawText = response.text;
   const servers = parseXrayJsonSubscriptionToServers(rawText);
 
   if (!servers.length) {
@@ -677,7 +682,7 @@ async function fetchXrayJsonSubscriptionCandidate(
     throw new Error(`Endpoint ответил, но Xray JSON серверы в ответе не распознаны: ${url}`);
   }
 
-  const candidate = { servers, rawText, url, profileName: XRAY_JSON_SUBSCRIPTION_PROFILE.name };
+  const candidate = { servers, rawText, url, userinfo: response.userinfo, profileName: XRAY_JSON_SUBSCRIPTION_PROFILE.name };
   return { ...candidate, score: parsedXrayJsonProfileQuality(candidate) };
 }
 
@@ -737,7 +742,7 @@ async function collectBestXrayJsonProfileCandidate(urls: string[]) {
   let sawUnrecognizedPayload = false;
   let best: (ParsedXrayJsonProfileResult & { score: number; profileName?: string }) | null = null;
 
-  for (const url of urls) {
+  for (const url of new Set(urls)) {
     try {
       const item = await fetchXrayJsonSubscriptionCandidate(url);
       if (!best || item.score > best.score) {
@@ -778,7 +783,7 @@ async function fetchParsableXrayJsonProfileCandidates(
     }
 
     if (result.preferred && result.best) {
-      return { servers: result.best.servers, rawText: result.best.rawText, url: result.best.url };
+      return result.best;
     }
 
     if (!isSuspiciousSingleXrayJsonResult(result.best, options.expectedMinimumServers) || attempt === attempts) {
@@ -789,7 +794,7 @@ async function fetchParsableXrayJsonProfileCandidates(
   }
 
   if (best) {
-    return { servers: best.servers, rawText: best.rawText, url: best.url };
+    return best;
   }
 
   if (sawUnrecognizedPayload) {
@@ -836,7 +841,7 @@ function mapSessionFromPayload(
     'response.subscription.trafficLimitBytes',
     'response.trafficLimit',
     'response.user.trafficLimit'
-  ]), 500);
+  ]), NaN);
 
   const trafficUsedGb = bytesToGb(pickValue(payload, [
     'response.usedTrafficBytes',
@@ -844,14 +849,14 @@ function mapSessionFromPayload(
     'response.subscription.usedTrafficBytes',
     'response.usedTraffic',
     'response.user.usedTraffic'
-  ]), 0);
+  ]), NaN);
 
   const deviceLimit = maybeNumber(pickValue(payload, [
     'response.hwidDeviceLimit',
     'response.user.hwidDeviceLimit',
     'response.deviceLimit',
     'response.user.deviceLimit'
-  ])) ?? 3;
+  ])) ?? null;
 
   const usedDeviceCount = maybeNumber(pickValue(payload, [
     'response.hwidDevicesCount',
@@ -864,7 +869,7 @@ function mapSessionFromPayload(
     'response.user.connectedDevices'
   ])) ?? (() => {
     const devices = extractDevicesFromPayload(payload, key.identifier);
-    return devices.length ? devices.length : 0;
+    return devices.length ? devices.length : null;
   })();
 
   const subscriptionUrl = maybeString(pickValue(payload, [
@@ -929,8 +934,8 @@ function mapSessionFromPayload(
         'expiredAt',
         'expirationDate'
       ])),
-      trafficUsedGb,
-      trafficLimitGb,
+      trafficUsedGb: Number.isFinite(trafficUsedGb) ? trafficUsedGb : null,
+      trafficLimitGb: Number.isFinite(trafficLimitGb) ? trafficLimitGb : null,
       devices: usedDeviceCount
     }
   };
@@ -952,7 +957,9 @@ function proxyStatusFromRuntime(runtime: RuntimeStatus): ProxyStatus {
 export class RemnawaveClient {
   private cachedServers: VpnServer[] = [];
   private profileSyncGeneration = 0;
-  invalidateProfileSync() { this.profileSyncGeneration++; }
+  private authorizedProfile: { key: string; result: ParsedXrayJsonProfileResult } | null = null;
+  private authorizationGeneration = 0;
+  invalidateProfileSync() { this.profileSyncGeneration++; this.authorizationGeneration++; this.authorizedProfile = null; }
   private cachedSession: RemnawaveSession | null = null;
   private cachedDevices: DeviceRecord[] = [buildLocalDeviceRecord()];
   private profileSyncInfo: ProfileSyncInfo = {
@@ -1013,6 +1020,11 @@ export class RemnawaveClient {
   }
 
   async authorizeByAccessKey(accessKey: string, allowDemoFallback = allowDemoFallbackByEnv): Promise<RemnawaveSession> {
+    ++this.profileSyncGeneration;
+    const previousSessionKey=this.cachedSession?.accessKey.trim();
+    const generation = ++this.authorizationGeneration;
+    const assertCurrent = () => { if (generation !== this.authorizationGeneration) throw Error('AUTHORIZATION_CANCELLED'); };
+    this.authorizedProfile = null;
     const key = resolveAccessKey(accessKey);
     const provisionalSession = makeProvisionalSession(accessKey, key);
     const candidates = buildInfoCandidates(key);
@@ -1036,13 +1048,16 @@ export class RemnawaveClient {
       const xrayJsonResult = await fetchParsableXrayJsonProfileCandidates(xrayJsonCandidates, {
         expectedMinimumServers: this.cachedServers.length
       });
+      assertCurrent();
       const importedServers = xrayJsonResult.servers;
       const previousServers = [...this.cachedServers];
-      const keepPreviousProfile = shouldKeepPreviousFullProfile(previousServers, importedServers);
+      const keepPreviousProfile = previousSessionKey===accessKey.trim() && shouldKeepPreviousFullProfile(previousServers, importedServers);
       const activeServers = mergeServerMeasurements(keepPreviousProfile ? previousServers : importedServers, previousServers);
       const readyCount = readyServerCount(activeServers);
 
-      this.cachedSession = provisionalSession;
+      const verifiedSession = withSubscriptionUserinfo(provisionalSession, xrayJsonResult.userinfo);
+      this.cachedSession = verifiedSession;
+      this.authorizedProfile = {key:key.normalized,result:xrayJsonResult};
       this.cachedDevices = [buildLocalDeviceRecord()];
       this.cachedServers = activeServers;
       this.profileSyncInfo = {
@@ -1059,13 +1074,15 @@ export class RemnawaveClient {
           ? preservedProfileMessage(importedServers.length, previousServers.length)
           : `Ключ принят. Импортировано ${importedServers.length} серверов из Xray JSON подписки Remnawave.`
       };
-      return provisionalSession;
+      return verifiedSession;
     } catch (error) {
+      assertCurrent();
       xrayJsonFirstError = error instanceof Error ? error.message : 'Не удалось получить Xray JSON profile.';
     }
 
     try {
       const result = await fetchJsonCandidates(candidates);
+      assertCurrent();
       const source: RemnawaveSource = result.url.includes('/api/sub/') ? 'public-api' : 'panel-api';
       const session = mapSessionFromPayload(accessKey, key, result.value, source, result.url);
       this.cachedSession = session;
@@ -1075,6 +1092,7 @@ export class RemnawaveClient {
       }
       return session;
     } catch (error) {
+      assertCurrent();
       const infoError = error instanceof Error ? error.message : 'Не удалось получить профиль из Remnawave.';
 
       if (!allowDemoFallback) {
@@ -1090,6 +1108,7 @@ export class RemnawaveClient {
   async syncProfile(accessKey: string, allowDemoFallback = allowDemoFallbackByEnv) {
     const generation = ++this.profileSyncGeneration;
     const key = resolveAccessKey(accessKey);
+    if(this.cachedSession&&this.cachedSession.accessKey.trim()!==accessKey.trim())throw Error('PROFILE_SESSION_MISMATCH');
     const candidates = buildXrayJsonProfileCandidates(key, this.cachedSession);
     const previousServers = [...this.cachedServers];
     const previousProfile = this.profileSyncInfo;
@@ -1106,7 +1125,9 @@ export class RemnawaveClient {
     }
 
     try {
-      const xrayJsonResult = await fetchParsableXrayJsonProfileCandidates(candidates, {
+      const reusable = this.authorizedProfile;
+      this.authorizedProfile = null;
+      const xrayJsonResult = reusable?.key === key.normalized ? reusable.result : await fetchParsableXrayJsonProfileCandidates(candidates, {
         expectedMinimumServers: previousServers.length
       });
       const importedServers = xrayJsonResult.servers;
@@ -1114,9 +1135,11 @@ export class RemnawaveClient {
       const activeServers = mergeServerMeasurements(keepPreviousProfile ? previousServers : importedServers, previousServers);
 
       if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
+      const nextSession = this.cachedSession ? withSubscriptionUserinfo(this.cachedSession, xrayJsonResult.userinfo) : null;
       await cacheNativeProfileSync(activeServers.length, xrayJsonResult.url.includes('/api/sub/') ? 'Публичная Xray JSON подписка' : 'Panel API');
       if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
       this.cachedServers = activeServers;
+      if (nextSession) this.cachedSession = nextSession;
       const readyCount = readyServerCount(activeServers);
       this.profileSyncInfo = {
         status: 'ready',
@@ -1167,6 +1190,9 @@ export class RemnawaveClient {
   }
 
   async loadServers(): Promise<VpnServer[]> {
+    // The authorization result has now been consumed by the normal UI path.
+    // A later manual refresh must fetch fresh metadata, not reuse that handoff.
+    this.authorizedProfile=null;
     await previewDelay(120);
     return this.cachedServers;
   }
@@ -1212,7 +1238,7 @@ export class RemnawaveClient {
     const exists = server.runtimeTemplate ? server : cachedExactServer;
 
     if (!exists) {
-      throw new Error('Сервер не найден в активном профиле. Сначала обновите профиль или выберите другой узел.');
+      throw new NativeOperationError('PROFILE_SERVER_MISSING','network',false,'Server missing from profile.');
     }
 
     this.cachedServers = this.cachedServers.some(item => item.id === exists.id)
@@ -1265,17 +1291,9 @@ export class RemnawaveClient {
           runtime
         };
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error ?? '');
-        const nativeConnectStillRunning = errorMessage.includes('Подключение заняло больше')
-          || errorMessage.includes('UI разблокирован');
-        const runtimeTemporarilyBusy = errorMessage.includes('Runtime уже выполняет другое действие');
-
-        // Если frontend timeout сработал раньше, чем Rust реально закончил request_connect,
-        // нельзя тут же отправлять request_disconnect: он попадёт в тот же operation_lock
-        // и может усилить зависание/гонку при переключении сервера. Короткая занятость
-        // runtime-lock тоже не означает, что новый сервер окончательно не стартовал:
-        // App.tsx повторит старт выбранного сервера без rollback на случайный/старый узел.
-        if (nativeConnectStillRunning || runtimeTemporarilyBusy || nativeConnectFailurePreservesRuntime(errorMessage)) {
+        // A renderer deadline is not a native cancellation. Never undo a
+        // possibly running mutation, or a preflight-preserved prior runtime.
+        if (nativeMutations.pending() || nativeConnectFailurePreservesRuntime(error)) {
           throw error;
         }
 
@@ -1298,6 +1316,9 @@ export class RemnawaveClient {
 
   async disconnect(options: { useSystemProxy?: boolean } = {}): Promise<void> {
     await previewDelay(120);
+    // The native disconnect owns proxy restoration and route cleanup under its
+    // operation guard. A separate proxy RPC would race that same transaction.
+    if(isTauriRuntime){await requestNativeDisconnect();return;}
     let firstError: unknown = null;
 
     if (options.useSystemProxy) {
@@ -1350,11 +1371,6 @@ export class RemnawaveClient {
 
     this.cachedDevices = current.filter((item) => item.id !== deviceId);
     return this.cachedDevices.length ? this.cachedDevices : [buildLocalDeviceRecord()];
-  }
-
-  async loadHistory(): Promise<SessionRecord[]> {
-    await previewDelay(80);
-    return [];
   }
 
   async loadRuntimeStatus(): Promise<RuntimeStatus> {
