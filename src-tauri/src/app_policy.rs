@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(target_os = "windows")]
+mod windows_services;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,7 +39,8 @@ fn classify_services(mut services: Vec<WindowsServiceInfo>) -> Vec<WindowsServic
             .get(&service.process_id)
             .is_some_and(|count| *count > 1);
         let shared_exe = paths.get(&key).is_some_and(|count| *count > 1);
-        service.supported = own_process
+        service.supported = service.reason.is_none()
+            && own_process
             && !shared_pid
             && !shared_exe
             && !matches!(file, "svchost.exe" | "services.exe")
@@ -45,7 +48,10 @@ fn classify_services(mut services: Vec<WindowsServiceInfo>) -> Vec<WindowsServic
         service.reason = if service.supported {
             None
         } else {
-            Some("SERVICE_SHARED_OR_UNSUPPORTED".into())
+            service
+                .reason
+                .take()
+                .or_else(|| Some("SERVICE_SHARED_OR_UNSUPPORTED".into()))
         };
     }
     services
@@ -53,30 +59,7 @@ fn classify_services(mut services: Vec<WindowsServiceInfo>) -> Vec<WindowsServic
 pub(crate) fn service_inventory() -> Result<Vec<WindowsServiceInfo>, String> {
     #[cfg(target_os = "windows")]
     {
-        let raw = run_powershell(
-            r#"
-$ErrorActionPreference = 'Stop'
-$items = @(Get-CimInstance Win32_Service | Select-Object -First 2049)
-if ($items.Count -gt 2048) { throw 'Service inventory limit' }
-$result = @($items | ForEach-Object {
-  $command = [Environment]::ExpandEnvironmentVariables([string]$_.PathName)
-  $exe = ''
-  if ($command -match '^\s*"([^"\r\n]+?\.exe)"') { $exe = $Matches[1] }
-  elseif ($command -match '^\s*([^\r\n]+?\.exe)(\s|$)') { $exe = $Matches[1] }
-  @{ name=[string]$_.Name; displayName=[string]$_.DisplayName; exePath=$exe; processId=[uint32]$_.ProcessId; state=[string]$_.State; serviceType=[string]$_.ServiceType }
-})
-ConvertTo-Json -InputObject $result -Depth 3 -Compress
-"#,
-        )?;
-        if raw.len() > 2 * 1024 * 1024 {
-            return Err("SERVICE_INVENTORY_LIMIT".into());
-        }
-        let services: Vec<WindowsServiceInfo> =
-            serde_json::from_str(&raw).map_err(|_| "SERVICE_INVENTORY_INVALID".to_string())?;
-        if services.len() > 2048 {
-            return Err("SERVICE_INVENTORY_LIMIT".into());
-        }
-        Ok(classify_services(services))
+        windows_services::inventory().map(classify_services)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -226,13 +209,6 @@ pub(crate) fn build_policy_plan(
         }) {
             return Err("RULE_CONFLICT: overlapping VPN/DIRECT identities".into());
         }
-        if identities
-            .iter()
-            .any(|(other, _)| other.eq_ignore_ascii_case(&identity))
-        {
-            continue;
-        }
-        identities.push((identity.clone(), policy.into()));
         let target = if policy == "DIRECT" {
             &mut plan.direct_process_matches
         } else {
@@ -241,6 +217,15 @@ pub(crate) fn build_policy_plan(
         for candidate in process_match_candidates(&identity) {
             push_unique_process_match(target, candidate);
         }
+        // Preserve known case spellings for Xray's exact matcher before
+        // deduplicating Windows identity counts.
+        if identities
+            .iter()
+            .any(|(other, _)| other.eq_ignore_ascii_case(&identity))
+        {
+            continue;
+        }
+        identities.push((identity.clone(), policy.into()));
         if entry.kind == "app" {
             plan.resolved_apps += 1;
         } else {
@@ -307,6 +292,17 @@ mod tests {
         }
     }
     #[test]
+    fn duplicate_windows_identity_keeps_each_known_xray_case_spelling() {
+        let plan =
+            build_policy_plan(&[entry("app.exe", "VPN"), entry("App.EXE", "VPN")], &[]).unwrap();
+        assert_eq!(plan.resolved_apps, 1);
+        assert!(plan.process_matches.contains(&"app".into()));
+        assert!(plan.process_matches.contains(&"App.EXE".into()));
+        assert!(
+            build_policy_plan(&[entry("app.exe", "VPN"), entry("App.EXE", "DIRECT")], &[]).is_err()
+        );
+    }
+    #[test]
     fn full_paths_do_not_expand_to_same_name_executables() {
         let plan = build_policy_plan(
             &[
@@ -352,6 +348,17 @@ mod tests {
         selected.value = "A".into();
         let plan = build_policy_plan(&[selected], &services).unwrap();
         assert_eq!(plan.resolved_services, 1);
+    }
+    #[test]
+    fn unconfirmed_service_identity_cannot_be_reenabled_by_shape_classification() {
+        let mut unavailable = service("Unavailable", "C:/Svc/own.exe", 17, "Own Process");
+        unavailable.reason = Some("SERVICE_IDENTITY_CHANGED".into());
+        let services = classify_services(vec![unavailable]);
+        assert!(!services[0].supported);
+        assert_eq!(
+            services[0].reason.as_deref(),
+            Some("SERVICE_IDENTITY_CHANGED")
+        );
     }
     #[test]
     fn rule_bounds_unknown_target_and_disabled_entries() {
@@ -559,5 +566,18 @@ mod tests {
         let services = service_inventory().unwrap();
         assert!(!services.is_empty());
         assert!(services.len() <= 2048);
+        let rpcss = services
+            .iter()
+            .find(|service| service.name.eq_ignore_ascii_case("RpcSs"))
+            .expect("SCM enumerates the Windows RPC service");
+        assert!(
+            !rpcss.exe_path.is_empty(),
+            "RPC service executable query was not confirmed: {:?}",
+            rpcss.reason
+        );
+        assert!(
+            !rpcss.supported,
+            "Shared RPC host must never become a per-service route identity"
+        );
     }
 }

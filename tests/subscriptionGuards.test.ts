@@ -2,9 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { nativeConnectFailurePreservesRuntime, assertNativeRuntimeServerMatches, runtimeConfirmsTargetServer } from '../src/services/connectionGuards';
 
 describe('subscription and runtime failure separation', () => {
-  it.each(['CONNECT_PREFLIGHT: SERVICE_SHARED_OR_UNSUPPORTED', 'SUBSCRIPTION_UNAVAILABLE: retry', 'SUBSCRIPTION_REJECTED: revoked', 'SESSION_CHANGED: logout', 'Runtime уже выполняет другое действие'])('does not disconnect an existing runtime on native preflight rejection: %s', (message) => {
+  it.each(['CONNECT_PREFLIGHT: SERVICE_SHARED_OR_UNSUPPORTED', 'SUBSCRIPTION_UNAVAILABLE: retry', 'SUBSCRIPTION_REJECTED: revoked', 'SESSION_CHANGED: logout', 'RUNTIME_BUSY: operation already running'])('does not disconnect an existing runtime on native preflight rejection: %s', (message) => {
     expect(nativeConnectFailurePreservesRuntime(message)).toBe(true);
   });
+  it('does not classify localized free text as a machine decision',()=>{expect(nativeConnectFailurePreservesRuntime('Runtime уже выполняет другое действие')).toBe(false);expect(nativeConnectFailurePreservesRuntime({code:'RUNTIME_BUSY',message:'ignored'})).toBe(true);});
   it('keeps rollback applicable for a real startup/readiness failure', () => {
     expect(nativeConnectFailurePreservesRuntime('Xray failed to open its listener')).toBe(false);
   });

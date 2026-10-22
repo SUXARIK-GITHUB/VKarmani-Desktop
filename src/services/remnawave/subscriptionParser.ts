@@ -393,6 +393,11 @@ function isUsefulStructuredDisplayLabel(label: string | undefined, parsedFallbac
 function pickStructuredDisplayLabel(source: unknown) {
   return trimLabel(firstDefinedString(
     pickDisplayLabelString(source, [
+      'clientOverrides.displayName', 'clientOverrides.display_name',
+      'client_overrides.displayName', 'client_overrides.display_name',
+      'displayName', 'display_name', 'name', 'title', 'metadata.displayName', 'metadata.name'
+    ]),
+    pickDisplayLabelString(source, [
       'clientOverrides.serverDescription',
       'clientOverrides.server_description',
       'clientOverrides.serverName',
@@ -475,6 +480,20 @@ function pickStructuredDisplayLabel(source: unknown) {
   ) || '');
 }
 
+function pickServerDescription(source: unknown): string | undefined {
+  // Only explicit descriptive metadata; names, remarks, tags and endpoints
+  // are not descriptions. Keep this separate from the bounded display label.
+  for (const prefix of ['clientOverrides.', 'client_overrides.', '', 'metadata.']) {
+    for (const key of ['serverDescription', 'server_description', 'description']) {
+      const value = getPathValue(source, prefix + key);
+      if (typeof value !== 'string') continue;
+      const text = value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim();
+      if (text) return Array.from(text).slice(0, 2048).join('');
+    }
+  }
+  return undefined;
+}
+
 function pickStructuredTechnicalLabel(source: unknown) {
   return trimLabel(firstDefinedString(
     pickDisplayLabelString(source, [
@@ -546,7 +565,6 @@ function relabelServer(server: VpnServer, label: string): VpnServer {
     countryCode: nextCountryCode,
     flag,
     rawLabel: cleanLabel,
-    description: cleanLabel || server.description,
     runtimeTemplate: server.runtimeTemplate
       ? {
           ...server.runtimeTemplate,
@@ -817,7 +835,7 @@ function remnawaveLabelOverlayScore(label: string | undefined) {
 }
 
 function collectDisplayLabelOverlays(candidates: ServerCandidate[]) {
-  const overlays = new Map<string, { label: string; score: number }>();
+  const overlays = new Map<string, { label: string; description?: string; score: number }>();
 
   for (const candidate of candidates) {
     if (!isLikelyUserFacingCandidate(candidate.path, candidate.priority ?? 0)) {
@@ -835,7 +853,7 @@ function collectDisplayLabelOverlays(candidates: ServerCandidate[]) {
       const score = priorityBonus + remnawaveLabelOverlayScore(label);
       const existing = overlays.get(key);
       if (!existing || score > existing.score) {
-        overlays.set(key, { label, score });
+        overlays.set(key, { label, description: server.description, score });
       }
     }
   }
@@ -918,7 +936,8 @@ function applyDisplayLabelOverlays(candidates: ServerCandidate[]): ServerCandida
         && isUsefulStructuredDisplayLabel(labelOverlay.label, server)
         ? relabelServer(server, labelOverlay.label)
         : server;
-      return applyEndpointLocationOverlay(labeledServer, locationOverlay);
+      return applyEndpointLocationOverlay({ ...labeledServer,
+        description: labelOverlay?.description ?? labeledServer.description }, locationOverlay);
     })
   }));
 }
@@ -1067,7 +1086,6 @@ function buildServerFromRuntimeTemplate(
     isRecommended: index === 0,
     tags: ['Live', 'Xray JSON', protocol, ...(transportLabel ? [transportLabel] : []), 'Готов к подключению'],
     ipPool: `${host}:${port}`,
-    description: cleanLabel || `Узел из Xray JSON профиля Remnawave: ${host}`,
     source: 'subscription',
     host,
     port,
@@ -1188,6 +1206,7 @@ function parseXrayConfigObject(payload: unknown, seed: string, index: number): V
     };
     const server = buildServerFromRuntimeTemplate(runtimeWithFullConfig, label, canonicalJson(graph.config), index);
     if (!server) continue;
+    server.description = pickServerDescription(payload);
     server.id = `xray-json-${graph.identity}`;
     server.legacyIds = [stableXrayJsonId(`${seed}:config:${JSON.stringify(outbound)}`)];
     server.rawUri = undefined; // Config credentials stay in the encrypted runtime template only.
@@ -1716,6 +1735,7 @@ function parseResolvedProxyConfigArray(items: unknown[], seed: string): VpnServe
     const identity = `${seed}:structured:${pickString(item, ['metadata.uuid', 'uuid', 'id']) || JSON.stringify(item)}`;
     const server = buildServerFromRuntimeTemplate(runtime, label, identity, servers.length);
     if (server) {
+      server.description = pickServerDescription(item);
       servers.push(preserveServerLocationFromTechnicalLabel(server, technicalLabel));
     }
   }

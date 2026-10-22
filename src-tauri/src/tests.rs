@@ -101,6 +101,97 @@ mod regression_cases {
     }
 
     #[test]
+    fn provider_dns_go_field_alias_does_not_get_shadowed_by_client_defaults() {
+        let input = json!({"DNS":{"servers":["https+local://192.0.2.53/dns-query"],"queryStrategy":"UseIPv6","tag":"provider-resolver"},"outbounds":[{"tag":"pool-a","protocol":"freedom"}],"routing":{"rules":[]}});
+        let template = full_template(input.clone(), "node");
+        let (config, _, _) =
+            build_xray_config(&template, "proxy", "ipv4", None, &[], None, None).unwrap();
+        assert_eq!(config["DNS"], input["DNS"]);
+        assert!(
+            config.get("dns").is_none(),
+            "Go accepts DNS as the same field; adding dns injects competing defaults"
+        );
+        assert_eq!(template.full_config.as_ref().unwrap(), &input);
+        println!(
+            "XRAY_DNS_ALIAS:{}",
+            json!({"original":input,"adapted":config})
+        );
+    }
+    #[test]
+    fn explicit_provider_selectors_keep_go_alias_scalar_null_and_rejection_semantics() {
+        for key in ["inboundTag", "inboundtag", "INBOUNDTAG"] {
+            for selector in [
+                json!(["legacy-socks", "unrelated"]),
+                json!("legacy-socks,unrelated"),
+                Value::Null,
+                json!(17),
+            ] {
+                let mut rule = json!({"ruleTag":"explicit-provider","network":"tcp,udp","outboundTag":"pool-a"});
+                rule[key] = selector.clone();
+                let input = json!({"inbounds":[{"tag":"legacy-socks","protocol":"socks","port":16555}],"outbounds":[{"tag":"pool-a","protocol":"freedom"}],"routing":{"rules":[rule]}});
+                let template = full_template(input.clone(), "node");
+                let result = build_xray_config(&template, "proxy", "ipv4", None, &[], None, None);
+                if selector.is_number() {
+                    assert!(result.is_err());
+                    continue;
+                }
+                let (config, _, _) = result.unwrap();
+                let rule = config["routing"]["rules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r["ruleTag"] == "explicit-provider")
+                    .unwrap();
+                let tags = rule["inboundTag"].as_array().unwrap();
+                if selector.is_null() {
+                    assert!(tags.is_empty());
+                } else {
+                    assert_eq!(tags.len(), 3);
+                    assert!(tags.contains(&json!("unrelated")));
+                    assert!(tags
+                        .iter()
+                        .any(|tag| tag.as_str().unwrap().ends_with("profile-socks")));
+                    assert!(!tags
+                        .iter()
+                        .any(|tag| tag.as_str().unwrap().ends_with("profile-http")));
+                }
+                if key != "inboundTag" {
+                    assert!(rule.get(key).is_none());
+                }
+                assert_eq!(template.full_config.as_ref().unwrap(), &input);
+            }
+        }
+    }
+    #[test]
+    fn full_config_internal_dns_keeps_unscoped_provider_rules() {
+        let input = json!({"dns":{"tag":"provider-dns","servers":["1.1.1.1"]},"inbounds":[],"outbounds":[{"tag":"pool-a","protocol":"freedom"},{"tag":"dns-egress","protocol":"blackhole"}],"routing":{"rules":[{"ruleTag":"provider-dns-route","ip":["1.1.1.1"],"port":"53","network":"udp","outboundTag":"dns-egress"}]}});
+        let template = full_template(input.clone(), "node");
+        for mode in ["proxy", "tun"] {
+            let (config, _, _) = build_xray_config(
+                &template,
+                mode,
+                "ipv4",
+                (mode == "tun").then_some("192.0.2.15"),
+                &[],
+                None,
+                None,
+            )
+            .unwrap();
+            let rules = config["routing"]["rules"].as_array().unwrap();
+            let dns_rule = rules
+                .iter()
+                .find(|r| r["ruleTag"] == "provider-dns-route")
+                .unwrap();
+            assert!(
+                dns_rule.get("inboundTag").is_none(),
+                "Adding listener-only scope silently excludes Xray's own DNS tag: {dns_rule}"
+            );
+            assert_eq!(config["dns"], input["dns"]);
+            assert_eq!(template.full_config.as_ref().unwrap(), &input);
+            println!("XRAY_DNS_CONTRACT:{}", json!({"mode":mode,"rules":rules}));
+        }
+    }
+    #[test]
     fn full_config_runtime_keeps_provider_graph_and_scopes_selected_tun_through_loopback() {
         let input: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/xray/auto.json")).unwrap();
@@ -148,11 +239,9 @@ mod regression_cases {
                 .find(|rule| rule.get("balancerTag").is_some())
                 .unwrap();
             assert_eq!(provider_auto["balancerTag"], json!("general-choice"));
-            assert!(provider_auto["inboundTag"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|tag| tag.as_str().unwrap().contains("profile-")));
+            // Provider supplied no selector: retain its DNS/internal context
+            // semantics. The earlier client rules still own listener entry.
+            assert!(provider_auto.get("inboundTag").is_none());
             if mode == "tun" {
                 let selected = rules
                     .iter()
@@ -488,6 +577,34 @@ mod regression_cases {
         );
         assert_eq!(status.bypass.as_deref(), Some("<local>"));
         assert!(proxy_snapshot_points_to_runtime(&status));
+    }
+    #[test]
+    fn selected_executable_names_preserve_mixed_case_extension_for_bundled_xray_matcher() {
+        // Xray v26.4.25 trims only the case-sensitive lowercase .exe suffix,
+        // both in FindProcess and in NewProcessNameMatcher (condition.go).
+        for observed in [
+            "OUTLOOK.EXE",
+            "Office.Exe",
+            "App.eXe",
+            "chrome.exe",
+            "Юникод.EXE",
+        ] {
+            let core_name = observed.strip_suffix(".exe").unwrap_or(observed);
+            let candidates = process_match_candidates(observed);
+            assert!(
+                candidates.iter().any(|candidate| candidate
+                    .strip_suffix(".exe")
+                    .unwrap_or(candidate)
+                    == core_name),
+                "Exact upstream process-name semantics must match {observed}: {candidates:?}"
+            );
+            assert!(candidates.iter().all(|v| !v.contains(['/', '\\'])));
+        }
+        for path in ["C:/A/OUTLOOK.EXE", "D:/B/Office.Exe"] {
+            assert!(process_match_candidates(path)
+                .iter()
+                .all(|v| v.contains('/') || v.contains('\\')));
+        }
     }
     #[test]
     fn split_tunnel_path_rule_preserves_exact_path_scope() {

@@ -508,9 +508,22 @@ fn build_from_full_xray_config_template(
         .cloned()
         .unwrap_or_default();
     for mut rule in provider_rules {
-        let scope = if let Some(tags) = rule.get("inboundTag").and_then(Value::as_array) {
+        // Canonicalize an explicitly supplied Go JSON selector, including its
+        // aliases. Last serialized occurrence wins as in encoding/json.
+        let selector = rule
+            .as_object()?
+            .iter()
+            .rfind(|(name, _)| xray_json_field_matches(name, "inboundTag"))
+            .map(|(_, value)| value.clone());
+        if let Some(selector) = selector {
+            let tags = match selector {
+                Value::Array(tags) if tags.iter().all(Value::is_string) => tags,
+                Value::String(tags) => tags.split(',').map(|tag| json!(tag)).collect(),
+                Value::Null => Vec::new(),
+                _ => return None,
+            };
             let mut mapped = Vec::new();
-            for tag in tags {
+            for tag in &tags {
                 let declaration = full_config
                     .get("inbounds")
                     .and_then(Value::as_array)
@@ -528,11 +541,12 @@ fn build_from_full_xray_config_template(
                     _ => mapped.push(tag.clone()), // Preserve unknown selectors; never widen them.
                 }
             }
-            mapped
-        } else {
-            virtual_tags.iter().map(|tag| json!(tag)).collect()
-        };
-        set_client_owned_xray_field(rule.as_object_mut()?, "inboundTag", json!(scope));
+            set_client_owned_xray_field(rule.as_object_mut()?, "inboundTag", json!(mapped));
+        }
+        // No inbound selector means ALL original contexts, including Xray's
+        // generated DNS tags. Adding listener-only scope silently drops those
+        // provider DNS/observatory rules. Client API and TUN admission rules
+        // have already handled their own listeners earlier in the chain.
         adapter_rules.push(rule);
     }
     adapter_rules.push(json!({"type":"field","inboundTag":virtual_tags,"outboundTag":default_tag,"ruleTag":own("provider-default")}));
@@ -551,9 +565,14 @@ fn build_from_full_xray_config_template(
         set_client_owned_xray_field(log, key, value.clone());
     }
     set_client_owned_xray_field(log, "access", json!("none"));
-    map.entry("dns").or_insert(
-        json!({"queryStrategy":dns_query_strategy,"servers":["1.1.1.1","8.8.8.8","localhost"]}),
-    );
+    // DNS is provider-owned. Go accepts DNS/dNs as aliases, so do not inject
+    // lowercase defaults that would shadow an existing provider definition.
+    if !map.keys().any(|key| xray_json_field_matches(key, "dns")) {
+        map.insert(
+            "dns".into(),
+            json!({"queryStrategy":dns_query_strategy,"servers":["1.1.1.1","8.8.8.8","localhost"]}),
+        );
+    }
     let api = map.entry("api").or_insert(json!({})).as_object_mut()?;
     set_client_owned_xray_field(api, "tag", json!(api_tag));
     api.retain(|name, _| !xray_json_field_matches(name, "listen"));
@@ -1011,9 +1030,13 @@ pub(crate) fn find_tun_interface_index(interface_name: &str) -> Result<u32, Stri
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn wait_for_tun_interface(interface_name: &str) -> Result<u32, String> {
+pub(crate) fn wait_for_tun_interface(
+    interface_name: &str,
+    mut check_operation: impl FnMut() -> Result<(), String>,
+) -> Result<u32, String> {
     let deadline = Instant::now() + Duration::from_secs(6);
     loop {
+        check_operation()?;
         if let Ok(index) = find_tun_interface_index(interface_name) {
             return Ok(index);
         }
@@ -1035,6 +1058,62 @@ mod tun_policy_tests {
         assert!(snapshot.interface_index > 0);
         assert_ne!(snapshot.interface_alias, TUN_INTERFACE_NAME);
         assert!(snapshot.source_ip.parse::<Ipv4Addr>().is_ok());
+    }
+    #[test]
+    fn generated_process_contract_for_tagged_upstream_matcher() {
+        let template = RuntimeTemplate {
+            family: "xray".into(),
+            protocol: "vless".into(),
+            outbound: json!({"protocol":"vless","settings":{"vnext":[{"address":"vpn.example","port":443,"users":[{"id":"00000000-0000-4000-8000-000000000001"}]}]}}),
+            remarks: None,
+            full_config: None,
+            primary_outbound_tag: None,
+            profile_kind: None,
+        };
+        let mut cases: Vec<Value> = [
+            "MiXeD.EXE",
+            "Outlook.ExE",
+            "outlook.exe",
+            "C:/Apps/MiXeD.EXE",
+            "c:/apps/mixed.exe",
+        ]
+        .into_iter()
+        .map(|value| {
+            let entries = vec![SplitTunnelEntryPayload {
+                kind: "app".into(),
+                value: value.into(),
+                enabled: true,
+                policy: Some("VPN".into()),
+            }];
+            let (config, _, _) = build_xray_config(
+                &template,
+                "tun",
+                "ipv4",
+                Some("192.0.2.20"),
+                &entries,
+                None,
+                None,
+            )
+            .unwrap();
+            json!({"input":value,"rules":config["routing"]["rules"]})
+        })
+        .collect();
+        let (all, _, _) = build_xray_config(
+            &template,
+            "tun",
+            "ipv4",
+            Some("192.0.2.20"),
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        cases.push(json!({"input":"MiXeD.EXE","mode":"all","rules":all["routing"]["rules"]}));
+        // Synthetic rules only: no file/config/core/TUN initialization.
+        println!(
+            "XRAY_PROCESS_CONTRACT:{}",
+            serde_json::to_string(&cases).unwrap()
+        );
     }
     #[test]
     fn selected_vpn_unselected_direct_and_explicit_physical_binding() {
@@ -1102,5 +1181,126 @@ mod tun_policy_tests {
         assert!(bind_tun_outbounds(&mut config, "Wi-Fi")
             .unwrap_err()
             .starts_with("TUN_BINDING_CONFLICT"));
+    }
+}
+/// Provider/core preflight projection. It is never the launched configuration:
+/// actual TUN validation still occurs after confirmed owned-runtime teardown.
+pub(crate) fn config_preflight_projection(config: &Value) -> Result<Value, String> {
+    let inbounds = config
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .ok_or("CONFIG_PREFLIGHT_INBOUNDS_INVALID")?;
+    for inbound in inbounds {
+        let protocol = inbound
+            .get("protocol")
+            .and_then(Value::as_str)
+            .ok_or("CONFIG_PREFLIGHT_INBOUNDS_INVALID")?;
+        if protocol.eq_ignore_ascii_case("tun") && protocol != "tun" {
+            return Err("CONFIG_PREFLIGHT_INBOUNDS_INVALID".into());
+        }
+    }
+    let mut projection = config.clone();
+    projection["inbounds"] = json!(inbounds
+        .iter()
+        .filter(|entry| entry["protocol"] != "tun")
+        .collect::<Vec<_>>());
+    Ok(projection)
+}
+
+#[cfg(test)]
+mod preflight_projection_tests {
+    use super::*;
+    #[test]
+    fn strips_only_tun_inbounds_preserves_original_graph_and_never_becomes_runtime_config() {
+        let config = json!({"inbounds":[{"tag":"tun-in","protocol":"tun","settings":{"MTU":1400}},{"tag":"http-in","protocol":"http","port":10809}],"outbounds":[{"tag":"proxy","protocol":"freedom"}],"routing":{"rules":[{"inboundTag":["tun-in"],"outboundTag":"proxy"}]},"dns":{"servers":["localhost"]}});
+        let snapshot = config.clone();
+        let projected = config_preflight_projection(&config).unwrap();
+        assert_eq!(config, snapshot);
+        assert_eq!(projected["inbounds"].as_array().unwrap().len(), 1);
+        assert_eq!(projected["inbounds"][0]["tag"], "http-in");
+        for field in ["outbounds", "routing", "dns"] {
+            assert_eq!(projected[field], config[field]);
+        }
+        assert_eq!(config["inbounds"][0]["protocol"], "tun");
+    }
+    #[test]
+    fn malformed_or_noncanonical_inbound_protocols_fail_without_editing_original() {
+        for config in [
+            json!(null),
+            json!({}),
+            json!({"inbounds":{}}),
+            json!({"inbounds":[null]}),
+            json!({"inbounds":[{"protocol":null}]}),
+            json!({"inbounds":[{"protocol":"TUN"}]}),
+        ] {
+            let before = config.clone();
+            assert!(config_preflight_projection(&config).is_err());
+            assert_eq!(config, before);
+        }
+    }
+    #[test]
+    fn generated_large_lists_remove_every_tun_and_preserve_non_tun_order() {
+        for count in [0, 1, 2, 10, 256] {
+            let entries = (0..count)
+                .map(|n| json!({"tag":format!("in-{n}"),"protocol":if n%3==0{"tun"}else{"socks"}}))
+                .collect::<Vec<_>>();
+            let config = json!({"inbounds":entries});
+            let result = config_preflight_projection(&config).unwrap();
+            let expected = config["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|i| i["protocol"] != "tun")
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(result["inbounds"], json!(expected));
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn failed_core_preflight_cleans_only_its_owned_projection_and_keeps_original() {
+        let root = std::env::temp_dir().join(format!(
+            "vkarmani-preflight-fixture-{}",
+            crate::durable_state::random_state_id().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("xray-config-owned.json");
+        let original = b"original-owned-fixture";
+        fs::write(&path, original).unwrap();
+        let config = json!({"inbounds":[{"protocol":"tun"}],"outbounds":[{"protocol":"freedom","tag":"direct"}]});
+        assert!(
+            validate_config_projection(&root.join("missing-core.exe"), &path, &config).is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!path.with_extension("preflight.json").exists());
+        assert_eq!(
+            root.parent().unwrap().canonicalize().unwrap(),
+            std::env::temp_dir().canonicalize().unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn existing_projection_is_not_overwritten_or_removed_on_collision() {
+        let root = std::env::temp_dir().join(format!(
+            "vkarmani-preflight-fixture-{}",
+            crate::durable_state::random_state_id().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("xray-config-owned.json");
+        let prior = path.with_extension("preflight.json");
+        fs::write(&prior, b"owned-prior-file").unwrap();
+        assert!(validate_config_projection(
+            &root.join("missing-core.exe"),
+            &path,
+            &json!({"inbounds":[]})
+        )
+        .is_err());
+        assert_eq!(fs::read(&prior).unwrap(), b"owned-prior-file");
+        assert_eq!(
+            root.parent().unwrap().canonicalize().unwrap(),
+            std::env::temp_dir().canonicalize().unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

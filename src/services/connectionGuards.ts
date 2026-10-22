@@ -1,4 +1,5 @@
 import type { RuntimeStatus } from '../types/vpn';
+import {nativeErrorCode,NativeOperationError} from '../utils/nativeErrors';
 
 export function getRuntimePreparedServerId(runtime: RuntimeStatus | null | undefined) {
   return runtime?.lastPreparedServerId?.trim() ?? '';
@@ -37,16 +38,13 @@ export function assertNativeRuntimeServerMatches(
   const expectedFingerprint = targetFingerprint.trim();
 
   if (!actual || actual !== expected) {
-    throw new Error(`Native runtime запустился не на выбранном сервере: ожидали ${expected}, получили ${actual}. Подключение остановлено для защиты от ложной галки.`);
+    throw new NativeOperationError('RUNTIME_IDENTITY_UNCONFIRMED','network',false,'Native server identity was not confirmed.');
   }
 
   if (expectedFingerprint && actualFingerprint !== expectedFingerprint) {
-    throw new Error('Native runtime запустился с другим runtime-конфигом выбранного сервера. Подключение остановлено для защиты от случайного узла.');
+    throw new NativeOperationError('RUNTIME_IDENTITY_UNCONFIRMED','network',false,'Native configuration identity was not confirmed.');
   }
 }
-export function nativeConnectFailurePreservesRuntime(message: string): boolean {
-  return /(?:SUBSCRIPTION_(?:UNAVAILABLE|REJECTED)|SESSION_CHANGED|OPERATION_CANCELLED|REQUEST_IDENTITY|CONNECT_PREFLIGHT):/.test(message)
-    || message.includes('Подключение заняло больше')
-    || message.includes('UI разблокирован')
-    || message.includes('Runtime уже выполняет другое действие');
+export function nativeConnectFailurePreservesRuntime(error: unknown): boolean {
+  return ['SUBSCRIPTION_UNAVAILABLE','SUBSCRIPTION_REJECTED','SESSION_CHANGED','OPERATION_CANCELLED','REQUEST_IDENTITY','CONNECT_PREFLIGHT','RUNTIME_BUSY','NATIVE_COMMAND_TIMEOUT'].includes(nativeErrorCode(error)??'');
 }

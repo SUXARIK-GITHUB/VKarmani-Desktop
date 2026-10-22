@@ -5,6 +5,12 @@ pub(crate) fn build_runtime_status(
     state: tauri::State<AppState>,
 ) -> RuntimeStatus {
     sync_runtime_liveness(app, &state);
+    read_runtime_status(app, state)
+}
+
+// Status observation for explicit diagnostics never performs recovery, stops a
+// child, restores proxy/routes or creates/hardens the runtime directory.
+pub(crate) fn read_runtime_status(app: &AppHandle, state: tauri::State<AppState>) -> RuntimeStatus {
     let active_server_label = state
         .active_server_label
         .lock()

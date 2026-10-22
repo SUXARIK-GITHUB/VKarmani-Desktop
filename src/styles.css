@@ -6,9 +6,20 @@
 /* Server row hitbox fix: the whole highlighted row selects the server, not only the text/icons. */
 .vk-server-row {
   cursor: pointer !important;
+  position: relative;
 }
 
-.vk-server-row:focus-visible {
+.vk-server-row-select {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  padding: 0;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+.vk-server-row-select:focus-visible {
   outline: 1px solid rgba(122, 158, 255, .78);
   outline-offset: -2px;
 }
@@ -19,6 +30,8 @@
 
 .vk-favorite-star {
   pointer-events: auto;
+  position: relative;
+  z-index: 2;
 }
 
 /* Favorite star visual cleanup: no extra circle around the icon. */
@@ -37,3 +50,8 @@
 .vk-favorite-star:hover {
   transform: translateY(-1px);
 }
+.startup-recovery { padding: 32px; overflow: auto; }
+.startup-recovery .panel { padding: 24px; max-width: 850px; margin: auto; }
+.startup-recovery p { overflow-wrap: anywhere; margin-block: 14px; }
+.startup-recovery .settings-actions { flex-wrap: wrap; }
+.startup-warning { position: fixed; z-index: 2000; bottom: 14px; right: 14px; max-width: min(480px, calc(100vw - 28px)); padding: 14px; border: 1px solid #b69045; border-radius: 12px; background: #18202d; overflow-wrap: anywhere; }

@@ -27,6 +27,8 @@ pub(crate) struct ManagedCore {
 
 #[derive(Default)]
 pub(crate) struct AppState {
+    pub(crate) startup: Mutex<StartupSupervisor>,
+    pub(crate) repair_plans: Mutex<crate::repair_plan::RepairPlans>,
     pub(crate) restart_requested: std::sync::atomic::AtomicBool,
     pub(crate) connected: Mutex<bool>,
     pub(crate) active_server_label: Mutex<Option<String>>,
@@ -42,6 +44,9 @@ pub(crate) struct AppState {
     pub(crate) operation_generation: std::sync::atomic::AtomicU64,
     pub(crate) stop_requested: std::sync::atomic::AtomicBool,
     pub(crate) storage_lock: Mutex<()>,
+    pub(crate) storage_closed: std::sync::atomic::AtomicBool,
+    pub(crate) exit_approved: std::sync::atomic::AtomicBool,
+    pub(crate) state_handoff: Mutex<StateHandoff>,
     pub(crate) session_authorized: Mutex<bool>,
     pub(crate) session_authorization: Mutex<Option<NativeSessionAuthorization>>,
     pub(crate) subscription_lock: Mutex<()>,

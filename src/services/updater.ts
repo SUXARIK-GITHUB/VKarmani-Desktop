@@ -33,9 +33,11 @@ function normalizeUpdaterError(error: unknown) {
 
 export async function checkForUpdates(channel: ReleaseChannel): Promise<UpdateInfo> {
   if (isTauriRuntime) {
+    let disposable: { close: () => Promise<void> } | null = null;
     try {
       const { check } = await import('@tauri-apps/plugin-updater');
       const update = await check({ timeout: 15000 });
+      disposable = update;
 
       if (!update) {
         return {
@@ -64,7 +66,7 @@ export async function checkForUpdates(channel: ReleaseChannel): Promise<UpdateIn
         status: 'error',
         message: normalizeUpdaterError(error)
       };
-    }
+    } finally { await disposable?.close().catch(() => undefined); }
   }
 
   await wait(450);
@@ -79,12 +81,15 @@ export async function checkForUpdates(channel: ReleaseChannel): Promise<UpdateIn
 }
 
 export async function installAvailableUpdate(
-  onProgress: (percent: number) => void
+  onProgress: (percent: number) => void,
+  beforeInstall: () => Promise<void>
 ): Promise<{ ok: true } | { ok: false; message: string }> {
   if (isTauriRuntime) {
+    let disposable: { close: () => Promise<void> } | null = null;
     try {
       const { check } = await import('@tauri-apps/plugin-updater');
       const update = await check({ timeout: 15000 });
+      disposable = update;
 
       if (!update) {
         return { ok: false, message: 'Новой версии не найдено.' };
@@ -93,7 +98,7 @@ export async function installAvailableUpdate(
       let downloaded = 0;
       let total = 0;
 
-      await update.downloadAndInstall((event: unknown) => {
+      await update.download((event: unknown) => {
         const payload = event as
           | { event?: string; data?: { contentLength?: number; chunkLength?: number } }
           | undefined;
@@ -121,11 +126,14 @@ export async function installAvailableUpdate(
           onProgress(100);
         }
       });
-
+      // The native download verifies the signature before returning. Only
+      // then may the caller seal durable state and disconnect its own VPN.
+      await beforeInstall();
+      await update.install();
       return { ok: true };
     } catch (error) {
       return { ok: false, message: normalizeUpdaterError(error) };
-    }
+    } finally { await disposable?.close().catch(() => undefined); }
   }
 
   for (let percent = 8; percent <= 100; percent += 8) {
@@ -133,5 +141,6 @@ export async function installAvailableUpdate(
     onProgress(percent);
   }
 
+  await beforeInstall();
   return { ok: true };
 }

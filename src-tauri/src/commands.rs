@@ -98,36 +98,6 @@ pub(crate) fn normalize_access_key_for_native(value: &str) -> Result<String, Str
     Ok(normalized)
 }
 
-pub(crate) fn secure_access_key_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| format!("Не удалось определить каталог данных приложения: {error}"))?;
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("Не удалось создать каталог данных приложения: {error}"))?;
-    Ok(dir.join("access-key.dpapi"))
-}
-
-pub(crate) fn client_state_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| format!("Не удалось определить каталог данных приложения: {error}"))?;
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("Не удалось создать каталог данных приложения: {error}"))?;
-    Ok(dir.join("client-state-v1.json"))
-}
-
-pub(crate) fn sensitive_client_state_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| format!("Не удалось определить каталог данных приложения: {error}"))?;
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("Не удалось создать каталог данных приложения: {error}"))?;
-    Ok(dir.join("sensitive-client-state-v1.dpapi"))
-}
-
 pub(crate) fn is_allowed_client_state_key(key: &str) -> bool {
     matches!(
         key,
@@ -136,6 +106,7 @@ pub(crate) fn is_allowed_client_state_key(key: &str) -> bool {
             | "favoriteServerIds"
             | "selectedServerId"
             | "lastKnownServers"
+            | "sessionHistory"
     )
 }
 
@@ -143,364 +114,66 @@ pub(crate) fn is_allowed_sensitive_client_state_key(key: &str) -> bool {
     matches!(key, "lastKnownServers")
 }
 
-pub(crate) fn read_client_state_map(
-    app: &AppHandle,
-) -> Result<serde_json::Map<String, Value>, String> {
-    let path = client_state_path(app)?;
-    if !path.exists() {
-        return Ok(serde_json::Map::new());
-    }
-
-    let metadata = fs::metadata(&path)
-        .map_err(|error| format!("Не удалось проверить сохранённые настройки клиента: {error}"))?;
-    if metadata.len() > CLIENT_STATE_MAX_BYTES {
-        return Err(
-            "Файл сохранённых настроек клиента слишком большой и не будет загружен.".to_string(),
-        );
-    }
-
-    let raw = fs::read_to_string(&path)
-        .map_err(|error| format!("Не удалось прочитать сохранённые настройки клиента: {error}"))?;
-
-    if raw.trim().is_empty() {
-        return Ok(serde_json::Map::new());
-    }
-
-    let value: Value = match serde_json::from_str(&raw) {
-        Ok(value) => value,
-        Err(error) => {
-            let backup_name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .map(|name| format!("{name}.corrupt-{}", unix_timestamp_seconds()))
-                .unwrap_or_else(|| {
-                    format!("client-state-v1.json.corrupt-{}", unix_timestamp_seconds())
-                });
-            let backup_path = path.with_file_name(backup_name);
-            let _ = fs::copy(&path, &backup_path);
-            let _ = append_interface_event(
-                app,
-                &format!(
-                    "Сохранённые настройки клиента повреждены и не будут загружены: {error}. Backup: {}",
-                    backup_path.display()
-                ),
-            );
-            return Ok(serde_json::Map::new());
-        }
-    };
-
-    Ok(value.as_object().cloned().unwrap_or_default())
-}
-
-fn save_client_state_value_blocking(
+// Cached legacy renderers may read, but cannot mutate v2 without CAS.
+#[tauri::command]
+pub(crate) async fn load_client_state_value(
     key: String,
-    value: String,
     app: AppHandle,
-) -> Result<(), String> {
-    let storage_state = app.state::<AppState>();
-    let _storage_guard = storage_state
-        .storage_lock
-        .lock()
-        .map_err(|_| "Не удалось заблокировать хранилище состояния.".to_string())?;
-
-    let normalized_key = key.trim();
-    if !is_allowed_client_state_key(normalized_key) {
-        return Err("Недопустимый ключ клиентского состояния.".into());
+) -> Result<Option<String>, StateStorageError> {
+    if !is_allowed_client_state_key(&key) {
+        return Err(legacy_write_rejected());
     }
-
-    if value.len() as u64 > CLIENT_STATE_MAX_BYTES {
-        return Err("Настройки клиента слишком большие.".into());
-    }
-    let parsed_value: Value = serde_json::from_str(&value).map_err(|error| {
-        format!("Не удалось сохранить настройки клиента: некорректный JSON: {error}")
-    })?;
-
-    let mut map = read_client_state_map(&app).unwrap_or_default();
-    map.insert(normalized_key.to_string(), parsed_value);
-    map.insert("updatedAt".to_string(), Value::String(unix_now_string()));
-
-    let payload = serde_json::to_string_pretty(&Value::Object(map)).map_err(|error| {
-        format!("Не удалось подготовить настройки клиента к сохранению: {error}")
-    })?;
-
-    if payload.len() as u64 > CLIENT_STATE_MAX_BYTES {
-        return Err("Настройки клиента слишком большие.".into());
-    }
-    let path = client_state_path(&app)?;
-    atomic_write_text(&path, &payload, "Не удалось сохранить настройки клиента")
+    let snapshot = load_state_snapshot(app).await?;
+    Ok(snapshot
+        .payload
+        .public_state
+        .get(&key)
+        .map(Value::to_string))
 }
-
-fn load_client_state_value_blocking(key: String, app: AppHandle) -> Result<Option<String>, String> {
-    let normalized_key = key.trim();
-    if !is_allowed_client_state_key(normalized_key) {
-        return Err("Недопустимый ключ клиентского состояния.".into());
+#[tauri::command]
+pub(crate) async fn load_sensitive_client_state_value(
+    key: String,
+    app: AppHandle,
+) -> Result<Option<String>, StateStorageError> {
+    if !is_allowed_sensitive_client_state_key(&key) {
+        return Err(legacy_write_rejected());
     }
-
-    let map = read_client_state_map(&app)?;
-    Ok(map
-        .get(normalized_key)
-        .and_then(|value| serde_json::to_string(value).ok()))
+    let snapshot = load_state_snapshot(app).await?;
+    Ok(snapshot.payload.protected.get(&key).map(Value::to_string))
 }
-
-fn clear_client_state_value_blocking(key: String, app: AppHandle) -> Result<(), String> {
-    let storage_state = app.state::<AppState>();
-    let _storage_guard = storage_state
-        .storage_lock
-        .lock()
-        .map_err(|_| "Не удалось заблокировать хранилище состояния.".to_string())?;
-
-    let normalized_key = key.trim();
-    if !is_allowed_client_state_key(normalized_key) {
-        return Err("Недопустимый ключ клиентского состояния.".into());
-    }
-
-    let mut map = read_client_state_map(&app).unwrap_or_default();
-    map.remove(normalized_key);
-    map.insert("updatedAt".to_string(), Value::String(unix_now_string()));
-
-    let payload = serde_json::to_string_pretty(&Value::Object(map)).map_err(|error| {
-        format!("Не удалось подготовить настройки клиента к сохранению: {error}")
-    })?;
-
-    if payload.len() as u64 > CLIENT_STATE_MAX_BYTES {
-        return Err("Настройки клиента слишком большие.".into());
-    }
-    let path = client_state_path(&app)?;
-    atomic_write_text(&path, &payload, "Не удалось сохранить настройки клиента")
-}
-
 #[tauri::command]
 pub(crate) async fn save_client_state_value(
     key: String,
     value: String,
     app: AppHandle,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || save_client_state_value_blocking(key, value, app))
-        .await
-        .map_err(|error| format!("Сохранение настроек клиента было прервано: {error}"))?
+) -> Result<(), StateStorageError> {
+    let _ = (key, value, app);
+    Err(legacy_write_rejected())
 }
-
 #[tauri::command]
-pub(crate) async fn load_client_state_value(
+pub(crate) async fn clear_client_state_value(
     key: String,
     app: AppHandle,
-) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || load_client_state_value_blocking(key, app))
-        .await
-        .map_err(|error| format!("Загрузка настроек клиента была прервана: {error}"))?
+) -> Result<(), StateStorageError> {
+    let _ = (key, app);
+    Err(legacy_write_rejected())
 }
-
-#[tauri::command]
-pub(crate) async fn clear_client_state_value(key: String, app: AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || clear_client_state_value_blocking(key, app))
-        .await
-        .map_err(|error| format!("Очистка настроек клиента была прервана: {error}"))?
-}
-
-fn read_sensitive_client_state_map(
-    app: &AppHandle,
-) -> Result<serde_json::Map<String, Value>, String> {
-    let path = sensitive_client_state_path(app)?;
-    if !path.exists() {
-        return Ok(serde_json::Map::new());
-    }
-
-    let metadata = fs::metadata(&path)
-        .map_err(|error| format!("Не удалось проверить защищённый кэш клиента: {error}"))?;
-    if metadata.len() > ENCRYPTED_STATE_MAX_BYTES {
-        return Err(
-            "Файл защищённого кэша клиента слишком большой и не будет загружен.".to_string(),
-        );
-    }
-
-    let encrypted = fs::read_to_string(&path)
-        .map_err(|error| format!("Не удалось прочитать защищённый кэш клиента: {error}"))?;
-    if encrypted.trim().is_empty() {
-        return Ok(serde_json::Map::new());
-    }
-
-    let decrypted = decrypt_access_key(encrypted.trim()).map_err(|error| {
-        let backup_name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(|name| format!("{name}.corrupt-{}", unix_timestamp_seconds()))
-            .unwrap_or_else(|| {
-                format!(
-                    "sensitive-client-state-v1.dpapi.corrupt-{}",
-                    unix_timestamp_seconds()
-                )
-            });
-        let backup_path = path.with_file_name(backup_name);
-        let _ = fs::copy(&path, &backup_path);
-        let _ = append_interface_event(
-            app,
-            &format!(
-                "Защищённый кэш клиента повреждён и не будет загружен: {error}. Backup: {}",
-                backup_path.display()
-            ),
-        );
-        format!("Не удалось расшифровать защищённый кэш клиента: {error}")
-    })?;
-
-    if decrypted.len() as u64 > SENSITIVE_CLIENT_STATE_MAX_BYTES {
-        return Err(
-            "Расшифрованный защищённый кэш клиента слишком большой и не будет загружен."
-                .to_string(),
-        );
-    }
-
-    if decrypted.trim().is_empty() {
-        return Ok(serde_json::Map::new());
-    }
-
-    let value: Value = serde_json::from_str(&decrypted).map_err(|error| {
-        let backup_name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(|name| format!("{name}.invalid-json-{}", unix_timestamp_seconds()))
-            .unwrap_or_else(|| format!("sensitive-client-state-v1.dpapi.invalid-json-{}", unix_timestamp_seconds()));
-        let backup_path = path.with_file_name(backup_name);
-        let _ = fs::copy(&path, &backup_path);
-        let _ = append_interface_event(
-            app,
-            &format!(
-                "Защищённый кэш клиента содержит некорректный JSON и не будет загружен: {error}. Backup: {}",
-                backup_path.display()
-            ),
-        );
-        format!("Защищённый кэш клиента содержит некорректный JSON: {error}")
-    })?;
-
-    Ok(value.as_object().cloned().unwrap_or_default())
-}
-
-fn save_sensitive_client_state_value_blocking(
-    key: String,
-    value: String,
-    app: AppHandle,
-) -> Result<(), String> {
-    let storage_state = app.state::<AppState>();
-    let _storage_guard = storage_state
-        .storage_lock
-        .lock()
-        .map_err(|_| "Не удалось заблокировать хранилище состояния.".to_string())?;
-
-    let normalized_key = key.trim();
-    if !is_allowed_sensitive_client_state_key(normalized_key) {
-        return Err("Недопустимый ключ защищённого клиентского состояния.".into());
-    }
-
-    if value.len() as u64 > SENSITIVE_CLIENT_STATE_MAX_BYTES {
-        return Err(
-            "Защищённое клиентское состояние слишком большое и не будет сохранено.".to_string(),
-        );
-    }
-
-    let parsed_value: Value = serde_json::from_str(&value).map_err(|error| {
-        format!("Не удалось сохранить защищённый кэш клиента: некорректный JSON: {error}")
-    })?;
-
-    let mut map = read_sensitive_client_state_map(&app).unwrap_or_default();
-    map.insert(normalized_key.to_string(), parsed_value);
-    map.insert("updatedAt".to_string(), Value::String(unix_now_string()));
-
-    let payload = serde_json::to_string(&Value::Object(map)).map_err(|error| {
-        format!("Не удалось подготовить защищённый кэш клиента к сохранению: {error}")
-    })?;
-    if payload.len() as u64 > SENSITIVE_CLIENT_STATE_MAX_BYTES {
-        return Err("Защищённый кэш клиента слишком большой и не будет сохранён.".to_string());
-    }
-
-    let encrypted = encrypt_access_key(&payload)
-        .map_err(|error| format!("Не удалось зашифровать защищённый кэш клиента: {error}"))?;
-    let path = sensitive_client_state_path(&app)?;
-    atomic_write_text(
-        &path,
-        &encrypted,
-        "Не удалось сохранить защищённый кэш клиента",
-    )
-}
-
-fn load_sensitive_client_state_value_blocking(
-    key: String,
-    app: AppHandle,
-) -> Result<Option<String>, String> {
-    let normalized_key = key.trim();
-    if !is_allowed_sensitive_client_state_key(normalized_key) {
-        return Err("Недопустимый ключ защищённого клиентского состояния.".into());
-    }
-
-    let map = read_sensitive_client_state_map(&app)?;
-    Ok(map
-        .get(normalized_key)
-        .and_then(|value| serde_json::to_string(value).ok()))
-}
-
-fn clear_sensitive_client_state_value_blocking(key: String, app: AppHandle) -> Result<(), String> {
-    let storage_state = app.state::<AppState>();
-    let _storage_guard = storage_state
-        .storage_lock
-        .lock()
-        .map_err(|_| "Не удалось заблокировать хранилище состояния.".to_string())?;
-
-    let normalized_key = key.trim();
-    if !is_allowed_sensitive_client_state_key(normalized_key) {
-        return Err("Недопустимый ключ защищённого клиентского состояния.".into());
-    }
-
-    let mut map = read_sensitive_client_state_map(&app).unwrap_or_default();
-    map.remove(normalized_key);
-    map.insert("updatedAt".to_string(), Value::String(unix_now_string()));
-
-    let payload = serde_json::to_string(&Value::Object(map)).map_err(|error| {
-        format!("Не удалось подготовить защищённый кэш клиента к очистке: {error}")
-    })?;
-    let encrypted = encrypt_access_key(&payload).map_err(|error| {
-        format!("Не удалось зашифровать защищённый кэш клиента после очистки: {error}")
-    })?;
-    let path = sensitive_client_state_path(&app)?;
-    atomic_write_text(
-        &path,
-        &encrypted,
-        "Не удалось очистить защищённый кэш клиента",
-    )
-}
-
 #[tauri::command]
 pub(crate) async fn save_sensitive_client_state_value(
     key: String,
     value: String,
     app: AppHandle,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        save_sensitive_client_state_value_blocking(key, value, app)
-    })
-    .await
-    .map_err(|error| format!("Сохранение защищённого кэша клиента было прервано: {error}"))?
+) -> Result<(), StateStorageError> {
+    let _ = (key, value, app);
+    Err(legacy_write_rejected())
 }
-
-#[tauri::command]
-pub(crate) async fn load_sensitive_client_state_value(
-    key: String,
-    app: AppHandle,
-) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        load_sensitive_client_state_value_blocking(key, app)
-    })
-    .await
-    .map_err(|error| format!("Загрузка защищённого кэша клиента была прервана: {error}"))?
-}
-
 #[tauri::command]
 pub(crate) async fn clear_sensitive_client_state_value(
     key: String,
     app: AppHandle,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        clear_sensitive_client_state_value_blocking(key, app)
-    })
-    .await
-    .map_err(|error| format!("Очистка защищённого кэша клиента была прервана: {error}"))?
+) -> Result<(), StateStorageError> {
+    let _ = (key, app);
+    Err(legacy_write_rejected())
 }
 #[cfg(target_os = "windows")]
 pub(crate) fn encrypt_access_key(value: &str) -> Result<String, String> {
@@ -597,79 +270,30 @@ pub(crate) fn decrypt_access_key(value: &str) -> Result<String, String> {
     Err("Защищённое хранилище требует Windows DPAPI; plaintext fallback запрещён.".into())
 }
 
-fn save_access_key_secure_blocking(value: String, app: AppHandle) -> Result<(), String> {
-    let normalized = value.trim();
-    if normalized.is_empty() {
-        return clear_access_key_secure_blocking(app);
-    }
-    let storage_state = app.state::<AppState>();
-    let _storage_guard = storage_state
-        .storage_lock
-        .lock()
-        .map_err(|_| "Не удалось заблокировать хранилище состояния.".to_string())?;
-    let normalized = normalize_access_key_for_native(normalized)?;
-    let encrypted = encrypt_access_key(&normalized)?;
-    let path = secure_access_key_path(&app)?;
-    atomic_write_text(
-        &path,
-        &encrypted,
-        "Не удалось сохранить ключ доступа в защищённое хранилище",
-    )
-}
-
 pub(crate) fn load_access_key_secure_blocking(app: AppHandle) -> Result<Option<String>, String> {
-    let path = secure_access_key_path(&app)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let metadata = fs::metadata(&path)
-        .map_err(|error| format!("Не удалось проверить защищённый ключ доступа: {error}"))?;
-    if metadata.len() > 64 * 1024 {
-        return Err(
-            "Файл защищённого ключа выглядит слишком большим и не будет загружен.".to_string(),
-        );
-    }
-
-    let encrypted = fs::read_to_string(path)
-        .map_err(|error| format!("Не удалось прочитать защищённый ключ доступа: {error}"))?;
-    let value = decrypt_access_key(encrypted.trim())?;
-    Ok(Some(normalize_access_key_for_native(&value)?))
+    app_durable_store(&app)
+        .and_then(|store| store.load())
+        .map(|snapshot| snapshot.payload.access_key)
+        .map_err(|error| format!("{}: {}", error.code, error.message))
 }
-
-fn clear_access_key_secure_blocking(app: AppHandle) -> Result<(), String> {
-    let storage_state = app.state::<AppState>();
-    let _storage_guard = storage_state
-        .storage_lock
-        .lock()
-        .map_err(|_| "Не удалось заблокировать хранилище состояния.".to_string())?;
-
-    let path = secure_access_key_path(&app)?;
-    if path.exists() {
-        fs::remove_file(path)
-            .map_err(|error| format!("Не удалось удалить сохранённый ключ доступа: {error}"))?;
-    }
-    Ok(())
-}
-
 #[tauri::command]
-pub(crate) async fn save_access_key_secure(value: String, app: AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || save_access_key_secure_blocking(value, app))
-        .await
-        .map_err(|error| format!("Сохранение ключа доступа было прервано: {error}"))?
+pub(crate) async fn save_access_key_secure(
+    value: String,
+    app: AppHandle,
+) -> Result<(), StateStorageError> {
+    let _ = (value, app);
+    Err(legacy_write_rejected())
 }
-
 #[tauri::command]
-pub(crate) async fn load_access_key_secure(app: AppHandle) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || load_access_key_secure_blocking(app))
-        .await
-        .map_err(|error| format!("Загрузка ключа доступа была прервана: {error}"))?
+pub(crate) async fn clear_access_key_secure(app: AppHandle) -> Result<(), StateStorageError> {
+    let _ = app;
+    Err(legacy_write_rejected())
 }
-
 #[tauri::command]
-pub(crate) async fn clear_access_key_secure(app: AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || clear_access_key_secure_blocking(app))
-        .await
-        .map_err(|error| format!("Очистка ключа доступа была прервана: {error}"))?
+pub(crate) async fn load_access_key_secure(
+    app: AppHandle,
+) -> Result<Option<String>, StateStorageError> {
+    Ok(load_state_snapshot(app).await?.payload.access_key)
 }
 #[tauri::command]
 pub(crate) fn bootstrap_info() -> BootstrapInfo {
@@ -706,7 +330,7 @@ pub(crate) fn ensure_native_session_authorized(
         .lock()
         .map_err(|_| "Не удалось проверить состояние авторизации.".to_string())?;
     if !is_authorized {
-        return Err("Сначала войдите по ключу VKarmani, затем запускайте подключение.".into());
+        return Err("SESSION_UNAUTHORIZED: Сначала войдите по ключу VKarmani, затем запускайте подключение.".into());
     }
 
     authorize_native_subscription(app, state, false, None)
@@ -828,6 +452,49 @@ pub(crate) async fn set_session_authorized(
 }
 
 #[tauri::command]
+pub(crate) async fn runtime_observation(app: AppHandle) -> Result<RuntimeStatus, String> {
+    // Connection recovery must not use the UI refresh coalescer (which may
+    // return no snapshot), nor runtime_status's liveness/recovery side effects.
+    tauri::async_runtime::spawn_blocking(move || read_runtime_status(&app, app.state::<AppState>()))
+        .await
+        .map_err(|_| "RUNTIME_OBSERVATION_UNAVAILABLE".into())
+}
+#[tauri::command]
+pub(crate) async fn diagnostics_snapshot(
+    app: AppHandle,
+) -> Result<crate::diagnostic_facts::DiagnosticSnapshot, String> {
+    let permit = DiagnosticReadPermit::acquire()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        crate::diagnostic_facts::collect(&app, app.state::<AppState>())
+    })
+    .await
+    .map_err(|_| "DIAGNOSTICS_READ_FAILED".to_string())
+}
+
+static DIAGNOSTICS_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+struct DiagnosticReadPermit;
+impl DiagnosticReadPermit {
+    fn acquire() -> Result<Self, String> {
+        DIAGNOSTICS_IN_FLIGHT
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map(|_| Self)
+            .map_err(|_| "DIAGNOSTICS_BUSY".into())
+    }
+}
+impl Drop for DiagnosticReadPermit {
+    fn drop(&mut self) {
+        DIAGNOSTICS_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[tauri::command]
 pub(crate) async fn runtime_status(app: AppHandle) -> RuntimeStatus {
     let app_for_task = app.clone();
     match tauri::async_runtime::spawn_blocking(move || {
@@ -880,31 +547,29 @@ pub(crate) fn wait_for_xray_runtime_ready(
 
             if joined_excerpt.to_ascii_lowercase().contains("wintun.dll") {
                 return Err(format!(
-                    "Xray-core не смог запустить TUN: отсутствует или не загружается wintun.dll рядом с xray.exe. Проверьте {}.",
+                    "CORE_EXITED_EARLY: Xray-core не смог запустить TUN: отсутствует или не загружается wintun.dll рядом с xray.exe. Проверьте {}.",
                     core_working_dir.display()
                 ));
             }
 
             if !joined_excerpt.is_empty() {
                 return Err(format!(
-                    "Xray-core завершился сразу после запуска. Exit code: {:?}. Последние строки xray-runtime.log: {}",
+                    "CORE_EXITED_EARLY: Xray-core завершился сразу после запуска. Exit code: {:?}. Последние строки xray-runtime.log: {}",
                     code,
                     joined_excerpt
                 ));
             }
 
             return Err(format!(
-                "Xray-core завершился сразу после запуска. Exit code: {:?}. Проверьте xray-runtime.log.",
+                "CORE_EXITED_EARLY: Xray-core завершился сразу после запуска. Exit code: {:?}. Проверьте xray-runtime.log.",
                 code
             ));
         }
 
-        let http_ready = tcp_port_open("127.0.0.1", HTTP_PORT, 80);
-        let socks_ready = tcp_port_open("127.0.0.1", SOCKS_PORT, 80);
-        let api_ready = tcp_port_open("127.0.0.1", XRAY_API_PORT, 80);
-        let ports_state = format!("http={http_ready} socks={socks_ready} api={api_ready}");
+        let owned_ready = owned_runtime_ports_ready(child)?;
+        let ports_state = format!("ownedListeners={owned_ready}");
 
-        if http_ready && socks_ready && api_ready {
+        if owned_ready {
             let _ =
                 append_runtime_event(app, &format!("Xray локальные порты готовы: {ports_state}."));
             return Ok(());
@@ -918,7 +583,7 @@ pub(crate) fn wait_for_xray_runtime_ready(
                 format!("Последние строки xray-runtime.log: {log_excerpt}")
             };
             return Err(format!(
-                "Xray запущен, но локальные порты не стали готовы за {} мс ({ports_state}). {details}",
+                "CORE_PORT_TIMEOUT: Xray запущен, но локальные порты не стали готовы за {} мс ({ports_state}). {details}",
                 timeout.as_millis()
             ));
         }
@@ -945,17 +610,18 @@ pub(crate) async fn request_connect(
     split_tunnel_entries: Option<Vec<SplitTunnelEntryPayload>>,
     routing_exclusions: Option<RoutingExclusionSettingsPayload>,
     app: AppHandle,
-) -> Result<RuntimeStatus, String> {
+) -> Result<RuntimeStatus, NativeFailure> {
     let (runtime_template, verified_fingerprint) = verified_template_identity(
         &runtime_template,
         &canonical_template_json,
         server_fingerprint.as_deref(),
-    )?;
+    )
+    .map_err(|e| NativeFailure::from_error(&e, RuntimeCommand::Connect))?;
     let requested_generation = app
         .state::<AppState>()
         .operation_generation
         .load(std::sync::atomic::Ordering::Acquire);
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         request_connect_blocking(ConnectRequest {
             server_id,
             server_label,
@@ -972,7 +638,8 @@ pub(crate) async fn request_connect(
         })
     })
     .await
-    .map_err(|error| format!("Подключение Xray было прервано: {error}"))?
+    .map_err(|_| NativeFailure::task_failed())?;
+    result.map_err(|e| NativeFailure::from_error(&e, RuntimeCommand::Connect))
 }
 
 pub(crate) fn validate_xray_config_with_core(
@@ -1007,6 +674,37 @@ pub(crate) fn validate_xray_config_with_core(
     run_command_with_timeout(command, Duration::from_secs(8), "xray config test")
         .map(|_| ())
         .map_err(|error| format!("Xray-core не принял runtime-конфиг. Подключение остановлено до запуска процесса: {error}"))
+}
+
+pub(crate) fn validate_config_projection(
+    core: &Path,
+    config_path: &Path,
+    config: &Value,
+) -> Result<(), String> {
+    let projection = config_preflight_projection(config)?;
+    let bytes = serde_json::to_vec(&projection).map_err(|_| "CONFIG_PREFLIGHT_SERIALIZE")?;
+    let path = config_path.with_extension("preflight.json");
+    let parents = lock_runtime_parent_paths(&path)?;
+    write_new_runtime_config(&path, &bytes)?;
+    struct Prepared {
+        path: PathBuf,
+        hash: String,
+        _parents: Vec<File>,
+    }
+    impl Drop for Prepared {
+        fn drop(&mut self) {
+            // Never remove a replaced/unknown file as a successful cleanup.
+            if read_verified_runtime_config(&self.path, &self.hash).is_ok() {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+    let prepared = Prepared {
+        path,
+        hash: sha256_hex_bytes(&bytes),
+        _parents: parents,
+    };
+    validate_xray_config_with_core(core, &prepared.path, &prepared.hash)
 }
 
 fn remove_startup_runtime_config(app: &AppHandle, config_path: &Path, reason: &str) {
@@ -1048,6 +746,19 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         app,
         requested_generation,
     } = request;
+    // Reject malformed supplied modes before authorization/storage reads,
+    // operation admission or core discovery. Missing legacy fields keep defaults.
+    let normalized_network_mode = NetworkMode::parse(network_mode.as_deref())?
+        .as_str()
+        .to_string();
+    NetworkMode::parse(Some(&normalized_network_mode))?
+        .require_process_enforcement(tun_routing_mode.as_deref())?;
+    let normalized_ip_stack = NetworkIpStack::parse(ip_stack.as_deref())?
+        .as_str()
+        .to_string();
+    if normalized_network_mode == "tun" && normalized_ip_stack == "ipv6" {
+        return Err("TUN_IPV6_UNSUPPORTED: IPv6 режим сейчас доступен только для Proxy. TUN оставлен IPv4-only, чтобы не получить IPv6 loop/leak при переключении маршрутов Windows. Выберите IPv4 или используйте Proxy режим.".into());
+    }
     let state = app.state::<AppState>();
     if state
         .stop_requested
@@ -1061,7 +772,8 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         return Err("Сейчас поддерживается только Xray runtime family.".into());
     }
     validate_runtime_template(&runtime_template)?;
-    let mut _operation_guard = acquire_operation_lock(&state, Duration::from_secs(8), "connect")?;
+    let mut _operation_guard =
+        begin_open_runtime_operation(&state, Duration::from_secs(8), "connect")?;
     if state
         .operation_generation
         .load(std::sync::atomic::Ordering::Acquire)
@@ -1072,29 +784,6 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
 
     let core_path = resolve_core_path(&app).ok_or_else(|| core_not_found_message(&app))?;
     ensure_core_launchable(&core_path)?;
-
-    let normalized_network_mode = match network_mode
-        .unwrap_or_else(|| "proxy".to_string())
-        .to_lowercase()
-        .as_str()
-    {
-        "tun" => "tun".to_string(),
-        _ => "proxy".to_string(),
-    };
-
-    let normalized_ip_stack = match ip_stack
-        .unwrap_or_else(|| "ipv4".to_string())
-        .trim()
-        .to_lowercase()
-        .as_str()
-    {
-        "ipv6" | "6" => "ipv6".to_string(),
-        _ => "ipv4".to_string(),
-    };
-
-    if normalized_network_mode == "tun" && normalized_ip_stack == "ipv6" {
-        return Err("IPv6 режим сейчас доступен только для Proxy. TUN оставлен IPv4-only, чтобы не получить IPv6 loop/leak при переключении маршрутов Windows. Выберите IPv4 или используйте Proxy режим.".into());
-    }
 
     let reconnect_requested = reconnect.unwrap_or(false);
 
@@ -1121,7 +810,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
 
     #[cfg(target_os = "windows")]
     if normalized_network_mode == "tun" && !is_process_elevated()? {
-        return Err("TUN режим требует запуска VKarmani с правами администратора, иначе Windows не даст создать маршруты. Откройте настройки клиента и включите запуск от администратора или перезапустите приложение вручную от имени администратора.".into());
+        return Err("TUN_ELEVATION_REQUIRED: TUN режим требует запуска VKarmani с правами администратора, иначе Windows не даст создать маршруты. Откройте настройки клиента и включите запуск от администратора или перезапустите приложение вручную от имени администратора.".into());
     }
 
     let request_hash = sha256_hex_bytes(
@@ -1228,6 +917,13 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         .map_err(|error| format!("Не удалось сериализовать config: {error}"))?;
     let config_hash = sha256_hex_bytes(config_text.as_bytes());
     _operation_guard.check()?;
+    // Reject invalid provider transports/config while the prior runtime is
+    // still alive. Never construct a second TUN during this preflight.
+    validate_config_projection(&core_path, &config_path, &config)?;
+    _operation_guard.check()?;
+    if let Some(expected) = physical_route.as_ref() {
+        require_physical_binding(expected, current_physical_binding())?;
+    }
     _operation_guard.stage("stopping")?;
     stop_managed_or_starting_runtime(
         &app,
@@ -1463,13 +1159,19 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
 
     if normalized_network_mode == "tun" {
         _operation_guard.stage("configuring-routes")?;
+        if let Some(expected) = physical_route.as_ref() {
+            require_physical_binding(expected, current_physical_binding())?;
+        }
         configure_tun_routes(&app, TUN_INTERFACE_NAME, &outbound_ips).map_err(|error| {
             clear_starting_runtime(&state, child_pid);
             let _ = cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &outbound_ips);
             let _ = restore_saved_proxy_state(&app, &state, "tun_routes_failed");
             let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
             remove_startup_runtime_config(&app, &config_path, "tun_routes_failed");
-            format!("Не удалось подготовить Windows-маршруты для TUN режима: {error}")
+            crate::native_error::contextual_runtime_error(
+                &error,
+                "Не удалось подготовить Windows-маршруты для TUN режима",
+            )
         })?;
         let _ = append_runtime_event(
             &app,
@@ -1499,6 +1201,13 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         ));
     }
 
+    if let Some(expected) = physical_route.as_ref() {
+        require_physical_binding(expected, current_physical_binding())?;
+        confirm_tun_routes_ready(&app)?;
+    }
+    if !owned_runtime_ports_ready(&mut child)? {
+        return Err("CORE_PORT_TIMEOUT: runtime listeners lost before publication".into());
+    }
     _operation_guard.stage("publishing")?;
 
     if let Ok(mut guard) = state.active_server_label.lock() {
@@ -1555,17 +1264,16 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     refresh_tray_menu(&app);
 
     _operation_guard.commit();
-    let status = build_runtime_status(&app, app.state::<AppState>());
     drop(_operation_guard);
-    Ok(status)
+    Ok(build_runtime_status(&app, app.state::<AppState>()))
 }
 
 #[tauri::command]
 pub(crate) async fn rollback_failed_connect(
     expected_config_path: String,
     app: AppHandle,
-) -> Result<RuntimeStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+) -> Result<RuntimeStatus, NativeFailure> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let mut operation =
             acquire_operation_lock(&state, Duration::from_secs(6), "failed-connect-rollback")?;
@@ -1584,23 +1292,26 @@ pub(crate) async fn rollback_failed_connect(
         stop_managed_or_starting_runtime(&app, &state, true, "failed-connect-rollback")?;
         restore_saved_proxy_state(&app, &state, "failed-connect-rollback")?;
         operation.commit();
+        drop(operation);
         Ok(build_runtime_status(&app, app.state::<AppState>()))
     })
     .await
-    .map_err(|_| "Откат подключения был прерван".to_string())?
+    .map_err(|_| NativeFailure::task_failed())?;
+    result.map_err(|e: String| NativeFailure::from_error(&e, RuntimeCommand::Rollback))
 }
 
 #[tauri::command]
-pub(crate) async fn request_disconnect(app: AppHandle) -> Result<RuntimeStatus, String> {
+pub(crate) async fn request_disconnect(app: AppHandle) -> Result<RuntimeStatus, NativeFailure> {
     app.state::<AppState>()
         .stop_requested
         .store(true, std::sync::atomic::Ordering::Release);
     app.state::<AppState>()
         .operation_generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    tauri::async_runtime::spawn_blocking(move || request_disconnect_blocking(app))
+    let result = tauri::async_runtime::spawn_blocking(move || request_disconnect_blocking(app))
         .await
-        .map_err(|error| format!("Отключение Xray было прервано: {error}"))?
+        .map_err(|_| NativeFailure::task_failed())?;
+    result.map_err(|e: String| NativeFailure::from_error(&e, RuntimeCommand::Disconnect))
 }
 
 pub(crate) fn request_disconnect_blocking(app: AppHandle) -> Result<RuntimeStatus, String> {
@@ -1800,103 +1511,31 @@ pub(crate) async fn open_external_url(url: String) -> Result<(), String> {
         .map_err(|error| format!("Открытие внешней ссылки было прервано: {error}"))?
 }
 
-fn ensure_admin_launch_blocking(app: AppHandle) -> Result<bool, String> {
-    #[cfg(all(not(debug_assertions), target_os = "windows"))]
-    {
-        if is_process_elevated()? {
-            return Ok(false);
-        }
-
-        let executable = std::env::current_exe()
-            .map_err(|error| format!("Не удалось определить путь к приложению: {error}"))?;
-
-        let args = std::env::args()
-            .skip(1)
-            .map(|item| ps_quote(&item))
-            .collect::<Vec<_>>();
-        let args_block = if args.is_empty() {
-            String::new()
-        } else {
-            format!(" -ArgumentList @('{}')", args.join("','"))
-        };
-
-        let script = format!(
-            "Start-Process -FilePath '{}'{} -Verb RunAs",
-            ps_quote(&executable.to_string_lossy()),
-            args_block
-        );
-
-        run_powershell(&script)?;
-        cleanup_application(&app, "admin_relaunch");
-        app.exit(0);
-        Ok(true)
-    }
-
-    #[cfg(not(all(not(debug_assertions), target_os = "windows")))]
-    {
-        let _ = app;
-        Ok(false)
-    }
+pub(crate) fn ensure_admin_launch_blocking(app: AppHandle) -> Result<bool, StateStorageError> {
+    crate::elevation::relaunch(&app).map_err(|failure| StateStorageError::new(
+        failure.code, "Повышение прав не подтверждено. Настройки не сбрасывались; автоматический повтор не выполняется.", true))
 }
 
 #[tauri::command]
 pub(crate) async fn ensure_admin_launch(app: AppHandle) -> Result<bool, String> {
-    tauri::async_runtime::spawn_blocking(move || ensure_admin_launch_blocking(app))
-        .await
-        .map_err(|error| format!("Проверка запуска от администратора была прервана: {error}"))?
-}
-
-fn set_launch_on_startup_blocking(enabled: bool, app: AppHandle) -> Result<bool, String> {
-    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    #[cfg(all(not(debug_assertions), target_os = "windows"))]
     {
-        let executable = std::env::current_exe()
-            .map_err(|error| format!("Не удалось определить путь к приложению: {error}"))?;
-        let executable = format!("\"{}\"", executable.to_string_lossy());
-        let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-
-        if enabled {
-            let mut command = Command::new(system_program("reg")?);
-            command.args([
-                "add",
-                run_key,
-                "/v",
-                STARTUP_REGISTRY_VALUE,
-                "/t",
-                "REG_SZ",
-                "/d",
-                &executable,
-                "/f",
-            ]);
-            run_command_with_timeout(command, Duration::from_secs(4), "enable startup")?;
-        } else {
-            let mut command = Command::new(system_program("reg")?);
-            command.args(["delete", run_key, "/v", STARTUP_REGISTRY_VALUE, "/f"]);
-            let _ = run_command_with_timeout(command, Duration::from_secs(4), "disable startup");
+        if !is_process_elevated()? {
+            begin_state_handoff(&app, HandoffAction::Elevate).map_err(|error| error.message)?;
         }
-
-        let _ = append_interface_event(
-            &app,
-            if enabled {
-                "Автозапуск приложения включён для текущего пользователя."
-            } else {
-                "Автозапуск приложения отключён для текущего пользователя."
-            },
-        );
-        Ok(enabled)
     }
-
-    #[cfg(any(not(target_os = "windows"), debug_assertions))]
-    {
-        let _ = (enabled, app);
-        Ok(false)
-    }
+    let _ = app;
+    Ok(false)
 }
 
 #[tauri::command]
-pub(crate) async fn set_launch_on_startup(enabled: bool, app: AppHandle) -> Result<bool, String> {
-    tauri::async_runtime::spawn_blocking(move || set_launch_on_startup_blocking(enabled, app))
+pub(crate) async fn set_launch_on_startup(
+    enabled: bool,
+    app: AppHandle,
+) -> Result<bool, crate::autostart::AutostartError> {
+    tauri::async_runtime::spawn_blocking(move || crate::autostart::configure(enabled, app))
         .await
-        .map_err(|error| format!("Изменение автозапуска было прервано: {error}"))?
+        .map_err(|_| crate::autostart::task_failed())?
 }
 #[tauri::command]
 pub(crate) async fn proxy_status() -> Result<ProxyStatus, String> {
@@ -1910,12 +1549,13 @@ pub(crate) async fn set_system_proxy(
     enabled: bool,
     expected_config_path: Option<String>,
     app: AppHandle,
-) -> Result<ProxyStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+) -> Result<ProxyStatus, NativeFailure> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         set_system_proxy_blocking(enabled, expected_config_path, app)
     })
     .await
-    .map_err(|error| format!("Изменение Windows proxy было прервано: {error}"))?
+    .map_err(|_| NativeFailure::task_failed())?;
+    result.map_err(|e: String| NativeFailure::from_error(&e, RuntimeCommand::Proxy))
 }
 
 pub(crate) fn set_system_proxy_blocking(
@@ -1925,7 +1565,7 @@ pub(crate) fn set_system_proxy_blocking(
 ) -> Result<ProxyStatus, String> {
     let state = app.state::<AppState>();
     let mut _operation_guard =
-        acquire_operation_lock(&state, Duration::from_secs(6), "runtime-operation")?;
+        begin_open_runtime_operation(&state, Duration::from_secs(6), "runtime-operation")?;
     if let Some(expected) = expected_config_path.as_deref() {
         let runtime = state
             .runtime
@@ -1984,35 +1624,15 @@ pub(crate) fn set_system_proxy_blocking(
 }
 
 #[tauri::command]
-pub(crate) async fn repair_runtime_environment(app: AppHandle) -> Result<RuntimeStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || repair_runtime_environment_blocking(app))
-        .await
-        .map_err(|error| format!("Восстановление runtime окружения было прервано: {error}"))?
-}
-
-pub(crate) fn repair_runtime_environment_blocking(app: AppHandle) -> Result<RuntimeStatus, String> {
-    let state = app.state::<AppState>();
-    let mut _operation_guard =
-        acquire_operation_lock(&state, Duration::from_secs(6), "runtime-operation")?;
-
-    let is_connected = state.connected.lock().map(|value| *value).unwrap_or(false);
-    if is_connected {
-        return Err(
-            "Сначала отключите VPN, затем запускайте восстановление runtime окружения.".into(),
-        );
-    }
-
-    restore_saved_proxy_state(&app, &state, "manual_runtime_repair")?;
-    cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &[])?;
-    let _ = cleanup_runtime_config_files(&app);
-    let _ = append_runtime_event(
-        &app,
-        "Выполнено ручное восстановление runtime окружения: proxy/routes/runtime-config cleanup.",
-    );
-    refresh_tray_menu(&app);
-    _operation_guard.commit();
-    drop(_operation_guard);
-    Ok(build_runtime_status(&app, state))
+pub(crate) async fn repair_runtime_environment(
+    app: AppHandle,
+    plan_id: String,
+) -> Result<RuntimeStatus, crate::repair_plan::RepairError> {
+    let result =
+        tauri::async_runtime::spawn_blocking(move || crate::repair_plan::execute(app, plan_id))
+            .await
+            .map_err(|_| crate::repair_plan::public_error("REPAIR_EXECUTION_UNCONFIRMED"))?;
+    result.map_err(|e| crate::repair_plan::public_error(&e))
 }
 
 #[tauri::command]
@@ -2397,21 +2017,24 @@ pub(crate) fn parse_powershell_process_list(raw: &str) -> Vec<RunningAppInfo> {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn dedupe_and_limit_running_apps(
+pub(crate) fn prepare_running_app_inventory(
     apps: Vec<RunningAppInfo>,
     limit: usize,
-) -> Vec<RunningAppInfo> {
+) -> Result<Vec<RunningAppInfo>, String> {
     let mut seen = std::collections::HashSet::<String>::new();
     let mut unique = apps
         .into_iter()
         .filter(|app| !app.name.trim().is_empty())
         .filter(|app| {
-            let key = app
+            let identity = app
                 .path
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
-                .map(|value| value.to_lowercase())
-                .unwrap_or_else(|| format!("{}:{}", app.name.to_lowercase(), app.pid));
+                .map(|value| value.trim().replace('\\', "/").to_lowercase())
+                .unwrap_or_else(|| app.name.to_lowercase());
+            // Keep process instances for the renderer's canonical executable
+            // grouping/counts; inaccessible paths cannot become broad exe rules.
+            let key = format!("{}:{identity}", app.pid);
             seen.insert(key)
         })
         .collect::<Vec<_>>();
@@ -2445,12 +2068,24 @@ pub(crate) fn dedupe_and_limit_running_apps(
             .then_with(|| left.pid.cmp(&right.pid))
     });
 
-    unique.truncate(limit);
-    unique
+    if unique.len() > limit {
+        return Err("APP_INVENTORY_LIMIT: application list exceeds the bounded inventory; no partial list returned".into());
+    }
+    Ok(unique)
 }
 
 #[cfg(target_os = "windows")]
 pub(crate) fn list_running_apps_blocking() -> Result<Vec<RunningAppInfo>, String> {
+    match crate::process_inventory::native_running_apps() {
+        Ok(apps) => return Ok(apps),
+        Err(error) if error.starts_with("APP_INVENTORY_LIMIT") => return Err(error),
+        Err(_) => {}
+    }
+    list_running_apps_fallback()
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn list_running_apps_fallback() -> Result<Vec<RunningAppInfo>, String> {
     let powershell_script = r#"
 $ErrorActionPreference = 'SilentlyContinue'
 $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -2507,7 +2142,7 @@ $items | Sort-Object @{Expression={ if ([string]::IsNullOrWhiteSpace($_.title)) 
     ) {
         let apps = parse_powershell_process_list(&raw);
         if !apps.is_empty() {
-            return Ok(dedupe_and_limit_running_apps(apps, 200));
+            return prepare_running_app_inventory(apps, 4096);
         }
     }
 
@@ -2536,7 +2171,7 @@ $items | Sort-Object @{Expression={ if ([string]::IsNullOrWhiteSpace($_.title)) 
         }
     };
 
-    Ok(dedupe_and_limit_running_apps(apps, 200))
+    prepare_running_app_inventory(apps, 4096)
 }
 
 #[cfg(target_os = "windows")]
@@ -2803,12 +2438,9 @@ pub(crate) async fn pick_executable_path() -> Result<Option<String>, String> {
 }
 #[tauri::command]
 pub(crate) fn restart_application(app: AppHandle) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    crate::restart_lifecycle::restart_after_owned_cleanup(
-        &state.restart_requested,
-        || request_disconnect_blocking(app.clone()).map(|_| ()),
-        || app.request_restart(),
-    )
+    begin_state_handoff(&app, HandoffAction::Restart)
+        .map(|_| ())
+        .map_err(|error| error.message)
 }
 
 fn read_runtime_log_blocking(app: AppHandle, lines: Option<usize>) -> Result<Vec<String>, String> {
@@ -2829,6 +2461,17 @@ pub(crate) async fn read_runtime_log(
 mod ping_budget_tests {
     use super::*;
     #[test]
+    fn diagnostics_admission_stays_owned_until_native_reader_finishes() {
+        let permit = DiagnosticReadPermit::acquire().unwrap();
+        assert!(
+            std::thread::spawn(|| DiagnosticReadPermit::acquire().is_err())
+                .join()
+                .unwrap()
+        );
+        drop(permit);
+        assert!(DiagnosticReadPermit::acquire().is_ok());
+    }
+    #[test]
     fn renderer_cancellation_cannot_accumulate_unbounded_native_ping_tasks() {
         let permits = (0..4)
             .map(|_| PingPermit::acquire().unwrap())
@@ -2838,5 +2481,38 @@ mod ping_budget_tests {
         let permit = PingPermit::acquire().unwrap();
         drop(permit);
         assert_eq!(PING_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod application_inventory_tests {
+    use super::*;
+
+    fn process(pid: u32, path: Option<&str>) -> RunningAppInfo {
+        RunningAppInfo {
+            pid,
+            name: "app.exe".into(),
+            path: path.map(str::to_string),
+            title: None,
+        }
+    }
+
+    #[test]
+    fn inventory_retains_process_instances_and_rejects_silent_truncation() {
+        let apps = || {
+            vec![
+                process(1, Some("C:\\App.exe")),
+                process(1, Some("c:/app.exe")),
+                process(2, Some("C:/App.exe")),
+                process(3, None),
+                process(4, None),
+            ]
+        };
+        let prepared = prepare_running_app_inventory(apps(), 4).unwrap();
+        assert_eq!(prepared.len(), 4);
+        assert!(prepared.iter().any(|app| app.pid == 2));
+        assert!(prepare_running_app_inventory(apps(), 3)
+            .unwrap_err()
+            .starts_with("APP_INVENTORY_LIMIT"));
     }
 }

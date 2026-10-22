@@ -437,11 +437,51 @@ mod tests {
         let journal = enable_transaction(&mut backend, None).unwrap();
         assert_eq!(backend.current.flags, 3);
         assert!(backend.current.pac.is_empty());
+        assert_eq!(backend.current.bypass, PROXY_BYPASS);
         enable_transaction(&mut backend, Some(journal.clone())).unwrap();
         assert_eq!(backend.writes, 1);
         restore_transaction(&mut backend, &journal).unwrap();
         assert_eq!(backend.current, original);
         assert!(backend.journal.is_none());
+    }
+    #[test]
+    fn lan_bypass_uses_bounded_wininet_patterns_without_cidr_or_public_172_wildcard() {
+        let patterns = PROXY_BYPASS.split(';').collect::<Vec<_>>();
+        for expected in [
+            "<local>",
+            "localhost",
+            "127.*",
+            "10.*",
+            "192.168.*",
+            "169.254.*",
+        ] {
+            assert!(patterns.contains(&expected));
+        }
+        for second in 0..=255 {
+            assert_eq!(
+                patterns.contains(&format!("172.{second}.*").as_str()),
+                (16..=31).contains(&second)
+            );
+        }
+        assert!(!patterns.contains(&"172.*"));
+        assert!(!PROXY_BYPASS.contains('/'));
+        assert_eq!(
+            patterns.len(),
+            patterns
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        );
+        let direct = private_bypass_cidrs();
+        for cidr in [
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+        ] {
+            assert!(direct.contains(&cidr));
+        }
     }
     #[test]
     fn setup_disk_and_partial_write_failures_preserve_or_restore_original() {

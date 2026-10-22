@@ -107,6 +107,7 @@ jobs:
       - name: Run all frontend tests and build
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
+          npm run lint
           npm test
           npm run build
 
@@ -149,15 +150,12 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: VKarmani Desktop ${{ github.ref_name }}
           releaseBody: |
-            - Трафик и график используют фактические измерения; при отсутствии данных отображается «—».
-            - Потеря пакетов больше не подменяется результатом HTTP-проверки.
-            - Улучшены привязка пинга к физическому интерфейсу и обновление пинга активного сервера.
-            - Усилено восстановление TUN при смене сети; повторы и перезапуски ограничены.
-            - Логи сохраняют ограниченный объём последних записей с редактированием секретов.
-            - Исправлены лишнее пространство внизу Settings и вторичная информация карточки подключённого сервера.
-            - Proxy — системный HTTP/HTTPS-прокси; generic UDP в нём не гарантируется. Для полного трафика приложений, включая UDP, предусмотрен TUN.
-            - Native-проверки TUN/Proxy, Discord/media, сна и длительной работы в этом выпуске не выполнялись; эти риски приняты пользователем.
-          releaseDraft: false
+            Candidate artifacts for verification. This draft is not a production release.
+            Populate verified release notes and confirm all required acceptance gates,
+            published-file signatures and installed-client update safety before promotion.
+          # A successful build alone must never change releases/latest/latest.json.
+          # Promotion is a separate reviewed operation after the full production GO.
+          releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
@@ -186,6 +184,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm audit --audit-level=high
+          npm run lint
           npm test
           npm run build
           npm run verify:updater

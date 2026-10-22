@@ -17,7 +17,7 @@ interface SidebarNavProps {
 export function SidebarNav({ activeTab, onChange, onExit, onShowInfo, language, showDiagnostics }: SidebarNavProps) {
   const items: Array<{ id: AppTab; label: string; icon: typeof Home }> = [
     { id: 'overview', label: tr(language, 'Главная', 'Home'), icon: Home },
-    ...(showDiagnostics ? [{ id: 'diagnostics' as AppTab, label: tr(language, 'Статистика', 'Statistics'), icon: BarChart3 }] : []),
+      ...(showDiagnostics ? [{ id: 'diagnostics' as AppTab, label: tr(language, 'Диагностика', 'Diagnostics'), icon: BarChart3 }] : []),
     { id: 'settings', label: tr(language, 'Настройки', 'Settings'), icon: Settings },
     { id: 'support', label: tr(language, 'Поддержка', 'Support'), icon: Headphones }
   ];

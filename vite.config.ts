@@ -16,7 +16,6 @@ export default defineConfig({
     strictPort: true
   },
   build: {
-    // Keeps local Windows/dev builds deterministic and avoids rare esbuild minifier stalls.
-    minify: false
+    minify: 'esbuild'
   }
 });
