@@ -3,13 +3,18 @@ import {renderToStaticMarkup} from 'react-dom/server';
 import {describe,expect,it,vi} from 'vitest';
 import {StartupRecoveryPanel} from '../src/components/StartupGate';
 import {createStartupClient,safeStartupStatus,startupErrorCode,validateStartupStatus,type StartupStatus} from '../src/services/startup';
+import packageJson from '../package.json';
 
-const normal:StartupStatus={schemaVersion:1,mode:'normal',code:'STARTUP_NORMAL',appVersion:'0.13.76',failures:0,attemptId:'a'.repeat(48),retryAllowed:false,readyAfterMs:30000};
+const normal:StartupStatus={schemaVersion:1,mode:'normal',code:'STARTUP_NORMAL',appVersion:packageJson.version,failures:0,attemptId:'a'.repeat(48),retryAllowed:false,readyAfterMs:30000};
 describe('R17/R18 startup admission and preservation boundary',()=>{
   it('accepts only exact versioned native DTOs with consistent admission fields',()=>{
     expect(validateStartupStatus(normal)).toEqual(normal);
     expect(validateStartupStatus(safeStartupStatus())).toEqual(safeStartupStatus());
     expect(validateStartupStatus({...normal,mode:'safe',code:'STARTUP_CRASH_LOOP',failures:3,retryAllowed:true})).toMatchObject({mode:'safe',failures:3});
+  });
+  it('rejects a well-formed release version which differs from the current manifest',()=>{
+    const [major,minor,patch]=packageJson.version.split('.');
+    expect(()=>validateStartupStatus({...normal,appVersion:`${major}.${minor}.${Number(patch)+1}`})).toThrow('STARTUP_STATUS_UNAVAILABLE');
   });
   it.each([{schemaVersion:2},{mode:'other'},{code:'<script>'},{appVersion:'old'},{failures:4},{failures:-1},{failures:1.5},{attemptId:'bad'},{attemptId:null},{retryAllowed:true},{readyAfterMs:30001},{readyAfterMs:-1},{privatePayload:'not-exportable'}])('rejects malformed/future/oversized status %j',mutation=>{
     expect(()=>validateStartupStatus({...normal,...mutation})).toThrow('STARTUP_STATUS_UNAVAILABLE');
