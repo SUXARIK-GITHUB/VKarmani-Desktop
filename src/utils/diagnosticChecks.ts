@@ -1,4 +1,4 @@
-import type {RuntimeStatus} from '../types/vpn';
+import type {ConnectivityProbe,RuntimeStatus} from '../types/vpn';
 import {tr,type UiLanguage} from '../i18n';
 import {publicDiagnosticFacts} from './diagnosticFacts';
 export const diagnosticCategories=['runtime','ports','tun','wfp','routes','dns','proxy','subscription','resources','storage','logs','permissions','repair'] as const;
@@ -12,7 +12,7 @@ export interface DiagnosticCheck {
   checkedAt:string;
   action:'none'|'review-owned-state'|'native-acceptance';
 }
-export function diagnosticChecks(runtime:RuntimeStatus,language:UiLanguage,at=new Date().toISOString()):DiagnosticCheck[]{
+export function diagnosticChecks(runtime:RuntimeStatus,language:UiLanguage,at=new Date().toISOString(),probe?:ConnectivityProbe|null):DiagnosticCheck[]{
   const label=(ru:string,en:string)=>tr(language,ru,en);
   const row=(id:string,status:DiagnosticCheck['status'],summary:string,evidence:string,action:DiagnosticCheck['action']='none'):DiagnosticCheck=>({id,category:categories[id]??'runtime',status,summary,evidence,checkedAt:at,action});
   if(runtime.bridge!=='tauri')return [row('NATIVE_BRIDGE','NOT_RUN',label('Нужна нативная сборка','Native build required'),'bridge=unavailable','native-acceptance')];
@@ -25,9 +25,16 @@ export function diagnosticChecks(runtime:RuntimeStatus,language:UiLanguage,at=ne
   const facts=publicDiagnosticFacts(runtime.diagnosticFacts);
   const ports=facts?.ports;
   const portStatus:DiagnosticCheck['status']=!ports?'NOT_RUN':ports.some(p=>p.state==='foreign')?'FAIL':ports.some(p=>p.state==='unavailable'||p.state==='unconfirmed')?'WARN':runtime.operation?'WARN':ports.every(p=>p.state===(active?'owned':'free'))?'PASS':'WARN';
+  const listener=(port:number):DiagnosticCheck['status']=>{const state=ports?.find(p=>p.port===port)?.state;return !state?'NOT_RUN':state==='foreign'?'FAIL':state==='owned'&&active&&!runtime.operation?'PASS':state==='free'&&!active?'NOT_RUN':'WARN';};
+  const probeKind=['server-direct','xray-http'].includes(probe?.kind??'')?probe!.kind:'unavailable';
   return [
     row('NATIVE_BRIDGE','PASS',label('Получен read-only snapshot','Read-only snapshot received'),'bridge=tauri'),
     row('RUNTIME_PROCESS',active?'PASS':runtime.tunnelActive?'WARN':'NOT_RUN',label('Состояние owned процесса; это не тест egress','Owned process state; not an egress test'),`active=${runtime.tunnelActive===true}; pidPresent=${pid}`),
+    {...row('HTTP_LISTENER',listener(10809),label('HTTP listener и его владелец','HTTP listener and its owner'),`source=GetExtendedTcpTable; 10809=${ports?.find(p=>p.port===10809)?.state??'not-tested'}`),category:'ports'},
+    {...row('SOCKS_LISTENER',listener(10808),label('SOCKS listener и его владелец','SOCKS listener and its owner'),`source=GetExtendedTcpTable; 10808=${ports?.find(p=>p.port===10808)?.state??'not-tested'}`),category:'ports'},
+    {...row('WININET_PROXY',typeof runtime.systemProxyEnabled==='boolean'?'PASS':'NOT_RUN',label('Наблюдение WinINet; не перехват всего TCP/UDP','WinINet observation; not full TCP/UDP capture'),`enabled=${typeof runtime.systemProxyEnabled==='boolean'?runtime.systemProxyEnabled:'unknown'}; scope=current-user`),category:'proxy'},
+    {...row('TUN_INTERFACE',facts?.tunInterface==='ready'?'PASS':runtime.networkMode==='tun'&&active?'WARN':'NOT_RUN',label('TUN identity, состояние и IP-адреса; не тест трафика','TUN identity, state and IP addresses; not a traffic test'),`source=read-only-interface-query; state=${facts?.tunInterface??'not-tested'}`),category:'tun'},
+    {...row('VPN_EGRESS','NOT_RUN',label('Выход через выбранный VPN не подтверждается прямым ping или HTTP proxy','Selected VPN egress is not proved by direct ping or an HTTP proxy'),`lastProbeKind=${probeKind}; TUN/UDP/selected-server-egress=not-tested`,'native-acceptance'),category:'tun'},
     row('RUNTIME_OPERATION',runtime.operation?'WARN':'PASS',label('Нативная операция','Native operation'),runtime.operation?'operation=in-progress':'operation=none'),
     row('CORE_PRESENCE',runtime.coreInstalled===true?'PASS':'WARN',label('Наличие core; подпись и содержимое отдельно','Core presence; signature and contents checked separately'),`corePresent=${runtime.coreInstalled===true}`),
     row('PROXY_OWNERSHIP',proxy==='changed'||proxy==='corrupt'?'FAIL':['owned','none'].includes(proxy)?'PASS':'WARN',label('Владение proxy по journal и текущему состоянию','Proxy ownership from journal and current state'),`ownership=${proxy}`,'review-owned-state'),

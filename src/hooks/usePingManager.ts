@@ -36,7 +36,6 @@ export function usePingManager({
   connectedServerId,
   runtimeStatus,
   language,
-  setConnectivityProbe,
   pushToast,
   refreshDiagnosticsAndRuntime,
   onMeasurementsCommitted
@@ -145,10 +144,8 @@ export function usePingManager({
       if (onMeasurementsRef.current?.(measured, snapshot) === false) return;
       serversRef.current = measured;
       setServers(measured);
-      const probe = batch.results.find(result => result.id === activeId)?.probe;
-      const currentId = connectionStateRef.current === 'connected'
-        ? connectedServerIdRef.current || runtimeStatusRef.current.lastPreparedServerId || selectedServerIdRef.current : selectedServerIdRef.current;
-      if (probe && activeId === currentId) setConnectivityProbe(probe);
+      // Server TCP RTT does not observe local listeners or VPN/TUN egress.
+      // Publish only server measurements; keep the independent connectivity result.
       void writeNativeRoutingLog('Ping batch complete.', `total=${targets.length}; success=${batch.success}; timeout=${batch.timeout}; unreachable=${batch.unreachable}; cancelled=${batch.cancelled}; durationMs=${Math.round(batch.durationMs)}`);
       void refreshDiagnosticsAndRuntime();
       if (!options.silent) pushToast(tr(languageRef.current,
@@ -163,7 +160,7 @@ export function usePingManager({
         }
       }
     }
-  }, [getPingableServers, pushToast, refreshDiagnosticsAndRuntime, setConnectivityProbe, setServers]);
+  }, [getPingableServers, pushToast, refreshDiagnosticsAndRuntime, setServers]);
 
   const scheduleAutoPing = useCallback((reason = 'auto-main-refresh', delayMs = 450) => {
     pendingFullReasonRef.current = reason;

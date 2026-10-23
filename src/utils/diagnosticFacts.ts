@@ -22,7 +22,7 @@ export function publicDiagnosticFacts(value:unknown):DiagnosticFacts|null{
       }
       if(parsed.length===3)ports=parsed.sort((a,b)=>a.port-b.port);
     }
-    return {checkedAtUnixMs:Number(v.checkedAtUnixMs),ports,resourceIntegrity:pick('resourceIntegrity',['verified','mismatch']) as DiagnosticFacts['resourceIntegrity'],
+    return {checkedAtUnixMs:Number(v.checkedAtUnixMs),ports,tunInterface:pick('tunInterface',['ready','not-applicable']) as DiagnosticFacts['tunInterface'],resourceIntegrity:pick('resourceIntegrity',['verified','mismatch']) as DiagnosticFacts['resourceIntegrity'],
       storageMetadata:pick('storageMetadata',['present','missing']) as DiagnosticFacts['storageMetadata'],logsMetadata:pick('logsMetadata',['present','missing']) as DiagnosticFacts['logsMetadata'],
       elevation:pick('elevation',['elevated','standard']) as DiagnosticFacts['elevation'],repairHistory:receipts,
       repairHistoryStatus:pick('repairHistoryStatus',['available']) as DiagnosticFacts['repairHistoryStatus']};

@@ -1,5 +1,8 @@
 import {tr,type UiLanguage} from '../i18n';
 const messages:Record<string,[string,string]>={
+  TUN_ADDRESS_NOT_READY:['Xray не подтвердил IP-адреса TUN-адаптера. Подключение не подтверждено; проверьте права администратора, журнал Xray и состояние собственных маршрутов.','Xray did not confirm the TUN adapter IP addresses. Connection is unconfirmed; check elevation, the Xray log and owned-route state.'],
+  PROBE_RUNTIME_UNAVAILABLE:['Нет стабильного собственного Xray для проверки. Проверьте состояние подключения и владельца локальных портов.','No stable owned Xray is available for this check. Review the connection state and local port ownership.'],
+  PROBE_RUNTIME_CHANGED:['Runtime изменился во время проверки; устаревший результат отброшен. Повторите проверку после завершения переключения.','The runtime changed during the check; the stale result was discarded. Retry after switching completes.'],
   RUNTIME_CLEANUP_INCOMPLETE:['Очистка сетевого состояния не подтверждена. Новое подключение не запущено; требуется проверка состояния.','Network cleanup is unconfirmed. No replacement connection was started; state verification is required.'],
   ROUTE_JOURNAL_UNAVAILABLE:['Журнал владения маршрутами недоступен или его путь небезопасен. Операция остановлена без удаления чужих маршрутов.','The route ownership journal is unavailable or its path is unsafe. The operation stopped without deleting foreign routes.'],
   TUN_PROCESS_ENFORCEMENT_UNAVAILABLE:['TUN для выбранных приложений недоступен: при ошибке определения процесса Xray может отправить их трафик напрямую. Подключение не запускалось.','Selected-app TUN is unavailable: an Xray process lookup failure can send selected traffic directly. Connection was not started.'],

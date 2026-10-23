@@ -153,6 +153,7 @@ pub(crate) struct NativeAppInfo {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConnectivityProbe {
+    pub(crate) kind: &'static str,
     pub(crate) success: bool,
     pub(crate) checked_at: String,
     pub(crate) http_port_open: bool,

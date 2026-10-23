@@ -228,7 +228,59 @@ mod windows {
             return Err("TUN_INTERFACE_NOT_READY: adapter identity changed".into());
         }
         require_interface_up(row.OperStatus)?;
+        // Wintun presence/OperStatus alone says nothing about Windows source
+        // address selection. Xray must finish assigning both sink addresses
+        // before our journal installs IPv4/IPv6 split routes.
+        for prefix in [TUN_GATEWAY_IPV4, TUN_GATEWAY_IPV6] {
+            let ip = prefix.split('/').next().ok_or("TUN_ADDRESS_NOT_READY")?;
+            let mut unicast: MIB_UNICASTIPADDRESS_ROW = unsafe { std::mem::zeroed() };
+            unsafe { InitializeUnicastIpAddressEntry(&mut unicast) };
+            unicast.InterfaceLuid = luid;
+            unicast.InterfaceIndex = index;
+            unicast.Address = address(ip)?;
+            let result = unsafe { GetUnicastIpAddressEntry(&mut unicast) };
+            require_tun_address_ready(
+                result,
+                unicast.InterfaceIndex,
+                unsafe { unicast.InterfaceLuid.Value },
+                unicast.DadState,
+                index,
+                unsafe { luid.Value },
+            )?;
+        }
         Ok(index)
+    }
+    fn require_tun_address_ready(
+        status: u32,
+        index: u32,
+        luid: u64,
+        dad: i32,
+        expected_index: u32,
+        expected_luid: u64,
+    ) -> Result<(), String> {
+        if status != 0
+            || index != expected_index
+            || luid != expected_luid
+            || dad != IpDadStatePreferred
+        {
+            return Err("TUN_ADDRESS_NOT_READY: Xray adapter IP addresses are absent, tentative, duplicate or belong to another interface".into());
+        }
+        Ok(())
+    }
+    #[test]
+    fn hotfix078_address_readiness_rejects_missing_tentative_duplicate_and_reused_index() {
+        assert!(require_tun_address_ready(0, 17, 99, IpDadStatePreferred, 17, 99).is_ok());
+        for (status, index, luid, dad) in [
+            (1168, 17, 99, IpDadStatePreferred),
+            (0, 17, 99, IpDadStateTentative),
+            (0, 17, 99, IpDadStateDuplicate),
+            (0, 17, 100, IpDadStatePreferred),
+            (0, 18, 99, IpDadStatePreferred),
+        ] {
+            assert!(require_tun_address_ready(status, index, luid, dad, 17, 99)
+                .unwrap_err()
+                .starts_with("TUN_ADDRESS_NOT_READY"));
+        }
     }
     fn original_interface(route: &OwnedRoute) -> Result<bool, String> {
         let mut row: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };

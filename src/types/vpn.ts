@@ -220,6 +220,7 @@ export interface RuntimeStatus {
 
 export interface RepairReceipt {atUnixMs:number;code:string;restoreProxy:boolean;routeCount:number}
 export interface DiagnosticFacts {
+  tunInterface?:'ready'|'unavailable'|'not-applicable';
   ports?:DiagnosticPort[];
   checkedAtUnixMs:number;
   resourceIntegrity:'verified'|'mismatch'|'unavailable';
@@ -242,6 +243,7 @@ export interface ProxyStatus {
 }
 
 export interface ConnectivityProbe {
+  kind?: 'server-direct' | 'xray-http' | 'unavailable';
   success: boolean;
   checkedAt: string;
   httpPortOpen: boolean;
