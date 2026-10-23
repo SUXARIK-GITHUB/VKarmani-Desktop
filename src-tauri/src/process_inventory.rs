@@ -21,7 +21,7 @@ use windows_sys::Win32::{
 struct QueryHandle(HANDLE);
 impl QueryHandle {
     fn new(handle: HANDLE) -> Option<Self> {
-        (!handle.is_null() && handle != INVALID_HANDLE_VALUE).then_some(Self(handle))
+        (!handle.is_null() && handle != INVALID_HANDLE_VALUE).then(|| Self(handle))
     }
 }
 impl Drop for QueryHandle {
@@ -155,8 +155,11 @@ mod tests {
     use super::*;
     #[test]
     fn invalid_query_handles_and_unavailable_owner_are_not_admitted() {
+        unsafe { windows_sys::Win32::Foundation::SetLastError(5) };
         assert!(QueryHandle::new(null_mut()).is_none());
+        assert_eq!(unsafe { GetLastError() }, 5);
         assert!(QueryHandle::new(INVALID_HANDLE_VALUE).is_none());
+        assert_eq!(unsafe { GetLastError() }, 5);
         assert!(owner_sid(null_mut()).is_none());
     }
     #[test]
