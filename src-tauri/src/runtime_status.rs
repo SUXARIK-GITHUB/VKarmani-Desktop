@@ -49,6 +49,7 @@ pub(crate) fn read_runtime_status(app: &AppHandle, state: tauri::State<AppState>
                 runtime.config_hash.clone(),
                 runtime.self_restart_count,
                 traffic_runtime_id(runtime),
+                runtime.tun_routing_mode.clone(),
             ))
         })
     });
@@ -97,11 +98,15 @@ pub(crate) fn read_runtime_status(app: &AppHandle, state: tauri::State<AppState>
 
     let message = if connected && current_network_mode.as_deref() == Some("tun") {
         format!(
-            "Xray TUN режим активен{}. VKarmani направляет выбранные процессы через VPN, остальной трафик выходит напрямую.",
+            "Xray TUN runtime активен{}. Политика: {}. Доступность VPN и DNS проверяется отдельно.",
             current_tun_name
                 .as_deref()
                 .map(|name| format!(" через интерфейс {name}"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            runtime_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.12.as_deref())
+                .unwrap_or("не подтверждена")
         )
     } else if connected {
         "Xray sidecar запущен. Можно переводить системный HTTP/HTTPS трафик в локальный proxy-режим.".to_string()
@@ -163,6 +168,9 @@ pub(crate) fn read_runtime_status(app: &AppHandle, state: tauri::State<AppState>
             .as_ref()
             .and_then(|snapshot| snapshot.bypass.clone()),
         network_mode: current_network_mode,
+        tun_routing_mode: runtime_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.12.clone()),
         tun_interface_name: current_tun_name,
         xray_pid: runtime_snapshot
             .as_ref()

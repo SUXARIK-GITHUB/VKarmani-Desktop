@@ -499,7 +499,13 @@ pub(crate) fn format_xray_spawn_error(error: &std::io::Error, core_path: &Path) 
     };
 
     format!(
-        "Не удалось запустить Xray-core: {error}. Путь: {}. {hint}",
+        "{}: Не удалось запустить Xray-core: {error}. Путь: {}. {hint}",
+        match code {
+            Some(5) => "CORE_SPAWN_ACCESS_DENIED",
+            Some(193) => "CORE_SPAWN_INVALID_IMAGE",
+            Some(1392) => "CORE_SPAWN_CORRUPT_FILE",
+            _ => "CORE_SPAWN_FAILED",
+        },
         core_path.display()
     )
 }

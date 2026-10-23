@@ -466,7 +466,11 @@ mod windows {
         }
         Ok(())
     }
-    pub(super) fn configure(app: &AppHandle, interface_name: &str) -> Result<(), String> {
+    pub(super) fn configure(
+        app: &AppHandle,
+        interface_name: &str,
+        mut observe_failure: impl FnMut(&str),
+    ) -> Result<(), String> {
         cleanup(app)?;
         let index = wait_for_tun_interface(interface_name, || {
             check_current_operation(&app.state::<AppState>())
@@ -496,6 +500,7 @@ mod windows {
         if let Err(error) = install_routes(&mut backend, &mut journal, &routes, || {
             check_current_operation(&app.state::<AppState>())
         }) {
+            observe_failure(&error); // Before the first rollback mutation.
             return Err(match cleanup_routes(&mut backend, &mut journal) {
                 Ok(()) => error,
                 Err(cleanup) => format!("{error}; rollback: {cleanup}"),
@@ -676,13 +681,21 @@ pub(crate) fn configure_tun_routes(
     interface_name: &str,
     _server_ips: &[String],
 ) -> Result<(), String> {
+    configure_tun_routes_observed(app, interface_name, _server_ips, |_| {})
+}
+pub(crate) fn configure_tun_routes_observed(
+    app: &AppHandle,
+    interface_name: &str,
+    _server_ips: &[String],
+    observe_failure: impl FnMut(&str),
+) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        windows::configure(app, interface_name)
+        windows::configure(app, interface_name, observe_failure)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, interface_name);
+        let _ = (app, interface_name, observe_failure);
         Err("Windows TUN only".into())
     }
 }

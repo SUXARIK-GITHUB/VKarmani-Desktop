@@ -1,5 +1,11 @@
 import {tr,type UiLanguage} from '../i18n';
 const messages:Record<string,[string,string]>={
+  CORE_FRAGMENT_SCHEMA_UNSUPPORTED:['Профиль содержит несколько или конфликтующие диапазоны fragmentation, которые Xray 26.4.25 не поддерживает. Профиль не упрощался; обратитесь к провайдеру.','The profile contains multiple or conflicting fragmentation ranges unsupported by Xray 26.4.25. The profile was not simplified; contact the provider.'],
+  CORE_CONFIG_REJECTED:['Xray отклонил конфигурацию до запуска runtime.','Xray rejected the configuration before runtime launch.'],
+  CORE_SPAWN_ACCESS_DENIED:['Windows запретил запуск Xray (код 5). Проверьте защиту Windows и права доступа.','Windows denied Xray launch (code 5). Check Windows security and access permissions.'],
+  CORE_SPAWN_INVALID_IMAGE:['Windows отклонил формат Xray (код 193). Проверьте целостность установленного core.','Windows rejected the Xray image (code 193). Check installed core integrity.'],
+  CORE_SPAWN_CORRUPT_FILE:['Windows сообщил о повреждении файла Xray (код 1392).','Windows reported a corrupted Xray file (code 1392).'],
+  CORE_SPAWN_FAILED:['Не удалось запустить Xray.','Xray could not be started.'],
   TUN_ADDRESS_NOT_READY:['Xray не подтвердил IP-адреса TUN-адаптера. Подключение не подтверждено; проверьте права администратора, журнал Xray и состояние собственных маршрутов.','Xray did not confirm the TUN adapter IP addresses. Connection is unconfirmed; check elevation, the Xray log and owned-route state.'],
   PROBE_RUNTIME_UNAVAILABLE:['Нет стабильного собственного Xray для проверки. Проверьте состояние подключения и владельца локальных портов.','No stable owned Xray is available for this check. Review the connection state and local port ownership.'],
   PROBE_RUNTIME_CHANGED:['Runtime изменился во время проверки; устаревший результат отброшен. Повторите проверку после завершения переключения.','The runtime changed during the check; the stale result was discarded. Retry after switching completes.'],
@@ -68,8 +74,18 @@ const messages:Record<string,[string,string]>={
   AUTOSTART_TASK_FAILED:['Изменение автозапуска не завершено.','Changing startup did not complete.'],
 };
 export class NativeOperationError extends Error {
-  constructor(readonly code:string,readonly category:string,readonly retryable:boolean,message:string,readonly operationPending=false){super(`${code}: ${message}`);this.name='NativeOperationError';}
+  constructor(readonly code:string,readonly category:string,readonly retryable:boolean,message:string,readonly operationPending=false,readonly stage?:string,readonly causeCode?:string,readonly win32Code?:number){super(`${code}: ${message}`);this.name='NativeOperationError';}
 }
+const stages=['preflight','port-release','config-validation','spawn','listeners','routes','publish'];
+const causes:Record<string,[string,string]>={CORE_FRAGMENT_LENGTH_INVALID:['Недопустимая длина fragmentation.','Invalid fragmentation length.'],CORE_VALIDATION_TIMEOUT:['Проверка конфигурации превысила срок.','Configuration validation timed out.'],CORE_CONFIG_INVALID:['Конфигурация несовместима с установленным Xray.','The configuration is incompatible with the installed Xray.']};
+export function publicFailureDetails(record:Record<string,unknown>){
+  const stage=typeof record.stage==='string'&&stages.includes(record.stage)?record.stage:undefined;
+  const cause=record.code==='CORE_CONFIG_REJECTED'&&typeof record.cause==='string'&&Object.prototype.hasOwnProperty.call(causes,record.cause)?record.cause:undefined;
+  const expected:Record<string,number>={CORE_SPAWN_ACCESS_DENIED:5,CORE_SPAWN_INVALID_IMAGE:193,CORE_SPAWN_CORRUPT_FILE:1392};
+  const win32Code=typeof record.code==='string'&&Object.prototype.hasOwnProperty.call(expected,record.code)&&record.win32Code===expected[record.code]?expected[record.code]:undefined;
+  return {stage,cause,win32Code};
+}
+export function isPublicNativeCode(value:unknown):value is string{return typeof value==='string'&&Object.prototype.hasOwnProperty.call(messages,value);}
 export function nativeErrorCode(value:unknown):string|undefined {
   try{
     if(value&&typeof value==='object'&&typeof (value as {code?:unknown}).code==='string'){
@@ -91,7 +107,9 @@ export function structuredNativeError(value:unknown,fallback:string,language:UiL
     if(typeof record.code!=='string'||!/^(STATE|AUTOSTART|STARTUP|ELEVATION|RUNTIME|NETWORK|RULE|REPAIR|NATIVE|OPERATION|CORE|TUN|SESSION|SUBSCRIPTION|PROFILE|PROCESS|PROXY|ROUTE|CONFIG|REQUEST|CONNECT)_[A-Z0-9_]{1,54}$/.test(record.code))return null;
     const pair=messages[record.code];
     const category=['storage','startup','network','lifecycle','bridge','permission'].includes(String(record.category))?String(record.category):'native';
-    return new NativeOperationError(record.code,category,record.retryable===true||record.recoverable===true,pair?tr(language,...pair):fallback,record.operationPending===true);
+    const {stage,cause,win32Code}=publicFailureDetails(record);
+    const detail=[stage,cause?`${cause}: ${tr(language,...causes[cause])}`:undefined].filter(Boolean).join(' · ');
+    return new NativeOperationError(record.code,category,record.retryable===true||record.recoverable===true,`${pair?tr(language,...pair):fallback}${detail?` [${detail}]`:''}`,record.operationPending===true,stage,cause,win32Code);
   }catch{return null;}
 }
 export type AutostartStatus='unknown'|'pending'|'enabled'|'disabled'|'not-managed'|'unconfirmed';
