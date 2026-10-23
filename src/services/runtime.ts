@@ -393,7 +393,7 @@ export async function pingNativeServer(server: VpnServer): Promise<ConnectivityP
   const { host, port } = endpoint;
 
   if (!isTauriRuntime) {
-    return { success:false, checkedAt:new Date().toISOString(), httpPortOpen:false, socksPortOpen:false,
+    return { kind:'unavailable',success:false, checkedAt:new Date().toISOString(), httpPortOpen:false, socksPortOpen:false,
       message:'Endpoint measurement requires the native runtime; preview contains no synthetic latency.' };
   }
 
@@ -419,6 +419,7 @@ export async function getNativeTrafficSnapshot(sessionId: number): Promise<Traff
 export async function runNativeConnectivityProbe(): Promise<ConnectivityProbe> {
   if (!isTauriRuntime) {
     return {
+      kind:'unavailable',
       success: false,
       checkedAt: new Date().toLocaleString('ru-RU'),
       httpPortOpen: false,

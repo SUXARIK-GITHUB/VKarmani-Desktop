@@ -39,7 +39,7 @@ describe('R12/R43 confirmed autostart and structured native failures',()=>{
 
 
 describe('TUN observation errors remain structured and private',()=>{
-  it.each(['RUNTIME_CLEANUP_INCOMPLETE','NETWORK_BINDING_CHANGED','NETWORK_BINDING_UNCONFIRMED','ROUTE_INTERFACE_CHANGED','ROUTE_INTERFACE_UNAVAILABLE','ROUTE_JOURNAL_UNAVAILABLE','TUN_INTERFACE_NOT_READY','TUN_ROUTES_UNCONFIRMED','TUN_PROCESS_ENFORCEMENT_UNAVAILABLE'])('localizes %s without paths or system details',code=>{
+  it.each(['RUNTIME_CLEANUP_INCOMPLETE','NETWORK_BINDING_CHANGED','NETWORK_BINDING_UNCONFIRMED','ROUTE_INTERFACE_CHANGED','ROUTE_INTERFACE_UNAVAILABLE','ROUTE_JOURNAL_UNAVAILABLE','TUN_INTERFACE_NOT_READY','TUN_ADDRESS_NOT_READY','TUN_ROUTES_UNCONFIRMED','TUN_PROCESS_ENFORCEMENT_UNAVAILABLE'])('localizes %s without paths or system details',code=>{
     for(const language of ['ru','en'] as const){
       const error=structuredNativeError({code,category:'network',retryable:false,message:'PRIVATE-PATH',details:'PID123'},'fallback',language)!;
       expect(error.code).toBe(code);expect(error.message).not.toContain('fallback');expect(error.message).not.toContain('PRIVATE');expect(error.message).not.toContain('PID123');expect(error.retryable).toBe(false);

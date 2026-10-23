@@ -21,6 +21,7 @@ pub(crate) struct DiagnosticFacts {
     pub(crate) repair_history: Vec<crate::repair_history::Receipt>,
     repair_history_status: &'static str,
     ports: Vec<PortObservation>,
+    tun_interface: &'static str,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -151,6 +152,22 @@ pub(crate) fn collect(app: &AppHandle, state: tauri::State<'_, AppState>) -> Dia
         repair_history,
         repair_history_status,
         ports: observed_ports,
+        tun_interface: if runtime.tunnel_active && runtime.network_mode.as_deref() == Some("tun") {
+            #[cfg(windows)]
+            {
+                if find_tun_interface_index(TUN_INTERFACE_NAME).is_ok() {
+                    "ready"
+                } else {
+                    "unavailable"
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                "unavailable"
+            }
+        } else {
+            "not-applicable"
+        },
     };
     DiagnosticSnapshot {
         runtime,

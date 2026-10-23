@@ -27,6 +27,13 @@ fn token(value: Option<&str>, fallback: &str, code: &str) -> Result<String, Stri
     }
 }
 impl NetworkMode {
+    #[cfg(any(windows, test))]
+    pub(crate) fn require_elevation(self, elevated: bool) -> Result<(), String> {
+        if self == Self::Tun && !elevated {
+            return Err("TUN_ELEVATION_REQUIRED: TUN requires administrator privileges; no runtime teardown or route installation was started".into());
+        }
+        Ok(())
+    }
     pub(crate) fn require_process_enforcement(
         self,
         policy_mode: Option<&str>,
@@ -75,6 +82,30 @@ impl NetworkIpStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hotfix078_full_tun_requires_elevation_but_never_changes_selected_admission() {
+        assert!(NetworkMode::Proxy.require_elevation(false).is_ok());
+        NetworkMode::Tun
+            .require_process_enforcement(Some("all"))
+            .unwrap();
+        assert!(NetworkMode::Tun
+            .require_elevation(false)
+            .unwrap_err()
+            .starts_with("TUN_ELEVATION_REQUIRED"));
+        NetworkMode::Tun.require_elevation(true).unwrap();
+        for elevated in [false, true] {
+            assert_eq!(
+                NetworkMode::Tun
+                    .require_process_enforcement(Some("selected"))
+                    .unwrap_err(),
+                "TUN_PROCESS_ENFORCEMENT_UNAVAILABLE"
+            );
+            assert_eq!(
+                NetworkMode::Tun.require_elevation(elevated).is_ok(),
+                elevated
+            );
+        }
+    }
     #[test]
     fn selected_tun_fails_before_runtime_admission_without_os_enforcement() {
         for policy in [None, Some("selected")] {

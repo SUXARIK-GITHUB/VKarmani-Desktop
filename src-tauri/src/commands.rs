@@ -809,8 +809,8 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     }
 
     #[cfg(target_os = "windows")]
-    if normalized_network_mode == "tun" && !is_process_elevated()? {
-        return Err("TUN_ELEVATION_REQUIRED: TUN режим требует запуска VKarmani с правами администратора, иначе Windows не даст создать маршруты. Откройте настройки клиента и включите запуск от администратора или перезапустите приложение вручную от имени администратора.".into());
+    if normalized_network_mode == "tun" {
+        NetworkMode::Tun.require_elevation(is_process_elevated()?)?;
     }
 
     let request_hash = sha256_hex_bytes(
@@ -1175,7 +1175,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         })?;
         let _ = append_runtime_event(
             &app,
-            "Owned IPv4/IPv6 split routes applied; unselected traffic DIRECT.",
+            &format!("Owned IPv4/IPv6 split routes applied; default policy={}; explicit DIRECT exclusions retained.", if split_tunnel_plan.default_vpn { "VPN" } else { "DIRECT" }),
         );
         std::thread::sleep(Duration::from_millis(250));
         let _ = append_runtime_event(
@@ -1636,19 +1636,44 @@ pub(crate) async fn repair_runtime_environment(
 }
 
 #[tauri::command]
-pub(crate) async fn connectivity_probe() -> Result<ConnectivityProbe, String> {
-    tauri::async_runtime::spawn_blocking(connectivity_probe_blocking)
+pub(crate) async fn connectivity_probe(app: AppHandle) -> Result<ConnectivityProbe, String> {
+    tauri::async_runtime::spawn_blocking(move || connectivity_probe_blocking(app))
         .await
         .map_err(|error| format!("Проверка маршрута была прервана: {error}"))?
 }
 
-pub(crate) fn connectivity_probe_blocking() -> Result<ConnectivityProbe, String> {
+fn probe_runtime_identity(app: &AppHandle) -> Result<(u32, u64), String> {
+    let snapshot = read_runtime_status(app, app.state::<AppState>());
+    match (
+        snapshot.tunnel_active,
+        snapshot.xray_pid,
+        snapshot.operation,
+    ) {
+        (true, Some(pid), None) => Ok((pid, snapshot.runtime_revision)),
+        _ => Err(
+            "PROBE_RUNTIME_UNAVAILABLE: no stable owned runtime; no VPN egress was tested".into(),
+        ),
+    }
+}
+
+pub(crate) fn connectivity_probe_blocking(app: AppHandle) -> Result<ConnectivityProbe, String> {
+    let identity = probe_runtime_identity(&app)?;
+    #[cfg(windows)]
+    if !crate::diagnostic_facts::runtime_ports_ready(identity.0)? {
+        return Err(
+            "CORE_PORT_TIMEOUT: owned listeners are not ready; no VPN egress was tested".into(),
+        );
+    }
     let checked_at = unix_now_string();
     let http_port_open = tcp_port_open("127.0.0.1", HTTP_PORT, 1200);
     let socks_port_open = tcp_port_open("127.0.0.1", SOCKS_PORT, 1200);
 
     if !http_port_open {
+        if probe_runtime_identity(&app)? != identity {
+            return Err("PROBE_RUNTIME_CHANGED: runtime changed during listener observation; result discarded".into());
+        }
         return Ok(ConnectivityProbe {
+            kind: "xray-http",
             success: false,
             checked_at,
             http_port_open,
@@ -1668,17 +1693,28 @@ pub(crate) fn connectivity_probe_blocking() -> Result<ConnectivityProbe, String>
     )?;
 
     let started = Instant::now();
-    let public_ip = fetch_public_ip(&client)?;
+    let public_ip = fetch_public_ip(&client).ok();
+    if probe_runtime_identity(&app)? != identity {
+        return Err(
+            "PROBE_RUNTIME_CHANGED: runtime changed during the HTTP probe; result discarded".into(),
+        );
+    }
+    #[cfg(windows)]
+    if !crate::diagnostic_facts::runtime_ports_ready(identity.0)? {
+        return Err("PROBE_RUNTIME_CHANGED: owned listeners changed during the HTTP probe; result discarded".into());
+    }
+    let success = public_ip.is_some();
 
     Ok(ConnectivityProbe {
-        success: true,
+        kind: "xray-http",
+        success,
         checked_at,
         http_port_open,
         socks_port_open,
-        public_ip: Some(public_ip),
-        latency_ms: Some(started.elapsed().as_millis()),
+        public_ip,
+        latency_ms: success.then(|| started.elapsed().as_millis()),
         packet_loss_pct: None,
-        message: "Маршрут через локальный Xray runtime отвечает.".into(),
+        message: if success { "HTTP egress through the owned local Xray responded; this is not a TUN, UDP or DNS leak test." } else { "Owned HTTP/SOCKS listener observations are separate: HTTPS egress through Xray failed. Check the selected server; TUN/UDP/DNS were not tested." }.into(),
     })
 }
 
@@ -1731,6 +1767,7 @@ pub(crate) fn server_ping_blocking(
         format!("direct TCP unavailable; successful=0/3; failures=3; reason={failure}; packetLoss=unmeasured")
     };
     Ok(ConnectivityProbe {
+        kind: "server-direct",
         success: count > 0,
         checked_at: unix_now_string(),
         http_port_open: false,

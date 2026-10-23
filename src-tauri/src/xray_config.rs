@@ -1,5 +1,10 @@
 use super::*;
 
+// Host addresses on the disposable Xray adapter, not physical gateway routes.
+// /32 and /128 avoid claiming a LAN subnet. Split routes remain journal-owned.
+pub(crate) const TUN_GATEWAY_IPV4: &str = "172.19.0.1/32";
+pub(crate) const TUN_GATEWAY_IPV6: &str = "fdfe:dcba:9876::1/128";
+
 pub(crate) fn tune_outbound_for_performance(outbound: &mut Value) {
     let Some(outbound_map) = outbound.as_object_mut() else {
         return;
@@ -738,6 +743,9 @@ pub(crate) fn build_xray_config_with_plan(
             "settings": {
                 "name": TUN_INTERFACE_NAME,
                 "MTU": 1400,
+                "gateway": [TUN_GATEWAY_IPV4, TUN_GATEWAY_IPV6],
+                "dns": ["1.1.1.1", "8.8.8.8"],
+                "autoSystemRoutingTable": [],
                 "userLevel": 0
             },
             "sniffing": {
@@ -747,12 +755,18 @@ pub(crate) fn build_xray_config_with_plan(
             }
         }));
 
-        routing_rules.push(json!({
+        // Every production TUN outbound is bound to the verified physical
+        // interface before launch. A self-process matcher is not loop protection:
+        // lookup failure logs on each captured flow, while the full-mode default
+        // is VPN anyway. Keep the legacy selected graph narrow (admission refuses it).
+        if !plan.default_vpn {
+            routing_rules.push(json!({
             "inboundTag": ["tun-in"],
             "process": ["self/", "xray/"],
             "outboundTag": "direct",
             "ruleTag": "tun-core-self-direct"
-        }));
+            }));
+        }
 
         routing_rules.push(json!({
             "inboundTag": ["tun-in"],
@@ -1037,11 +1051,12 @@ pub(crate) fn wait_for_tun_interface(
     let deadline = Instant::now() + Duration::from_secs(6);
     loop {
         check_operation()?;
-        if let Ok(index) = find_tun_interface_index(interface_name) {
-            return Ok(index);
-        }
+        let error = match find_tun_interface_index(interface_name) {
+            Ok(index) => return Ok(index),
+            Err(error) => error,
+        };
         if Instant::now() >= deadline {
-            return Err("TUN interface deadline exceeded".into());
+            return Err(format!("{error}; TUN interface deadline exceeded"));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1050,6 +1065,127 @@ pub(crate) fn wait_for_tun_interface(
 #[cfg(test)]
 mod tun_policy_tests {
     use super::*;
+    #[test]
+    fn hotfix078_full_tun_initializes_addresses_without_a_second_route_owner_or_process_lookup() {
+        let template = RuntimeTemplate {
+            family: "xray".into(),
+            protocol: "vless".into(),
+            outbound: json!({"protocol":"vless","settings":{"vnext":[{"address":"192.0.2.1","port":443,"users":[{"id":"00000000-0000-4000-8000-000000000001","encryption":"none"}]}]}}),
+            remarks: None,
+            full_config: None,
+            primary_outbound_tag: None,
+            profile_kind: None,
+        };
+        let plan = SplitTunnelRulePlan {
+            default_vpn: true,
+            process_matches: vec![],
+            direct_process_matches: vec![],
+            resolved_apps: 0,
+            resolved_services: 0,
+            skipped_notes: vec![],
+        };
+        let (mut config, _, _) = build_xray_config_with_plan(
+            &template,
+            "tun",
+            "ipv4",
+            Some("192.0.2.20"),
+            Some(plan),
+            None,
+            None,
+        )
+        .unwrap();
+        bind_tun_outbounds(&mut config, "Ethernet").unwrap();
+        let settings = &config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["protocol"] == "tun")
+            .unwrap()["settings"];
+        assert_eq!(
+            settings["gateway"],
+            json!(["172.19.0.1/32", "fdfe:dcba:9876::1/128"])
+        );
+        assert_eq!(settings["dns"], json!(["1.1.1.1", "8.8.8.8"]));
+        assert_eq!(
+            settings["autoSystemRoutingTable"],
+            json!([]),
+            "VKarmani's exact journal is the only owner of split routes"
+        );
+        assert!(
+            config["routing"]["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r.get("process").is_none()),
+            "Ordinary full TUN must not invoke process lookup, even for a core self rule"
+        );
+        assert_eq!(
+            config["routing"]["rules"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["outboundTag"],
+            "proxy"
+        );
+        println!(
+            "XRAY_HOTFIX078_CONFIG:{}",
+            serde_json::to_string(&config).unwrap()
+        );
+        let dns = json!({"servers":["9.9.9.9"],"tag":"provider-dns"});
+        let mut provider_outbound = template.outbound.clone();
+        provider_outbound["tag"] = json!("provider-proxy");
+        provider_outbound["streamSettings"] =
+            json!({"network":"tcp","sockopt":{"tcpFastOpen":true}});
+        let full_template = RuntimeTemplate {
+            full_config: Some(
+                json!({"outbounds":[provider_outbound.clone()],"DNS":dns.clone(),"routing":{"rules":[]}}),
+            ),
+            profile_kind: Some("node".into()),
+            primary_outbound_tag: Some("provider-proxy".into()),
+            ..template
+        };
+        let full_plan = SplitTunnelRulePlan {
+            default_vpn: true,
+            process_matches: vec![],
+            direct_process_matches: vec![],
+            resolved_apps: 0,
+            resolved_services: 0,
+            skipped_notes: vec![],
+        };
+        let (full, _, _) = build_xray_config_with_plan(
+            &full_template,
+            "tun",
+            "ipv4",
+            Some("192.0.2.20"),
+            Some(full_plan),
+            None,
+            None,
+        )
+        .unwrap();
+        let tun = full["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["protocol"] == "tun")
+            .unwrap();
+        assert_eq!(tun["settings"]["gateway"], settings["gateway"]);
+        assert_eq!(tun["settings"]["autoSystemRoutingTable"], json!([]));
+        assert_eq!(full["DNS"], dns);
+        assert!(full.get("dns").is_none());
+        assert_eq!(
+            full["outbounds"][0]["streamSettings"],
+            provider_outbound["streamSettings"]
+        );
+        let (proxy, _, _) =
+            build_xray_config_with_plan(&full_template, "proxy", "ipv4", None, None, None, None)
+                .unwrap();
+        assert!(proxy["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v["protocol"] != "tun"));
+        assert_eq!(proxy["outbounds"][0], provider_outbound);
+    }
     #[cfg(target_os = "windows")]
     #[test]
     fn original_default_route_snapshot_is_read_only() {

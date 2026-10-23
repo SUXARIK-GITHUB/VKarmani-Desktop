@@ -1493,13 +1493,14 @@ export default function App() {
 
   async function handleRunConnectivityProbe() {
     await runActionOnce('probe', async () => {
+      setConnectivityProbe(null);
       try {
         const probe = await remnawaveClient.runConnectivityProbe();
         setConnectivityProbe(probe);
         void refreshDiagnosticsAndRuntime();
         pushToast(
           probe.success
-            ? tr(language, 'Проверка маршрута завершена успешно.', 'Route probe completed successfully.')
+              ? tr(language, 'HTTP egress через собственный Xray отвечает. TUN, UDP и DNS leak не проверены.', 'HTTP egress through the owned Xray responded. TUN, UDP and DNS leaks were not tested.')
             : probe.message || tr(language, 'Проверка маршрута завершилась с предупреждением.', 'Route probe completed with a warning.'),
           probe.success ? 'success' : 'info'
         );
@@ -2482,6 +2483,7 @@ export default function App() {
                   runtimeStatus={runtimeStatus}
                   proxyStatus={proxyStatus}
                   connectivityProbe={connectivityProbe}
+                  connectionError={errorText}
                   profileSyncInfo={profileSyncInfo}
                   session={session}
                   integrationMeta={integrationMeta}

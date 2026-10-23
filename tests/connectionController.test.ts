@@ -32,7 +32,7 @@ describe('one connection owner and authoritative recovery',()=>{
 
 
 describe('TUN physical/route/owner failures keep the shared controller contract',()=>{
-  it.each(['RUNTIME_CLEANUP_INCOMPLETE','NETWORK_BINDING_CHANGED','NETWORK_BINDING_UNCONFIRMED','CORE_PORT_CONFLICT','ROUTE_INTERFACE_CHANGED','ROUTE_JOURNAL_UNAVAILABLE','TUN_INTERFACE_NOT_READY','TUN_ROUTES_UNCONFIRMED','TUN_PROCESS_ENFORCEMENT_UNAVAILABLE'])('preserves active old runtime and performs one rollback only after authoritative idle: %s',async code=>{
+  it.each(['RUNTIME_CLEANUP_INCOMPLETE','NETWORK_BINDING_CHANGED','NETWORK_BINDING_UNCONFIRMED','CORE_PORT_CONFLICT','ROUTE_INTERFACE_CHANGED','ROUTE_JOURNAL_UNAVAILABLE','TUN_INTERFACE_NOT_READY','TUN_ADDRESS_NOT_READY','TUN_ROUTES_UNCONFIRMED','TUN_PROCESS_ENFORCEMENT_UNAVAILABLE'])('preserves active old runtime and performs one rollback only after authoritative idle: %s',async code=>{
     for(const active of [true,false]){
       const {controller,ports,request}=setup();
       ports.connect=vi.fn().mockRejectedValueOnce({code,category:'network',retryable:false}).mockResolvedValueOnce(response());

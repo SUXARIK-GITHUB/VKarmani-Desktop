@@ -8,7 +8,9 @@ use windows_sys::Win32::{
 struct ServiceHandle(SC_HANDLE);
 impl ServiceHandle {
     fn from_raw(value: SC_HANDLE) -> Option<Self> {
-        (!value.is_null()).then_some(Self(value))
+        // then_some eagerly constructs and drops Self(null) on a failed open,
+        // passing an invalid RPC context to CloseServiceHandle.
+        (!value.is_null()).then(|| Self(value))
     }
 }
 impl Drop for ServiceHandle {
@@ -341,5 +343,22 @@ mod tests {
         changed = first;
         changed.dwCurrentState = SERVICE_STOPPED;
         assert!(!stable_identity(&first, &changed));
+    }
+    #[test]
+    fn rejected_service_handles_never_reach_scm_under_concurrent_queries() {
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..128 {
+                        assert!(ServiceHandle::from_raw(null_mut()).is_none());
+                        let manager = ServiceHandle::from_raw(unsafe {
+                            OpenSCManagerW(null(), null(), SC_MANAGER_CONNECT)
+                        })
+                        .expect("read-only local SCM connection");
+                        drop(manager);
+                    }
+                });
+            }
+        });
     }
 }
