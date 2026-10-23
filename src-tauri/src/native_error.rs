@@ -8,12 +8,54 @@ pub(crate) enum RuntimeCommand {
     Proxy,
     Rollback,
 }
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NativeFailure {
-    code: &'static str,
+    pub(crate) code: &'static str,
     category: &'static str,
     retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    win32_code: Option<u32>,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum ConnectStage {
+    Preflight,
+    PortRelease,
+    ConfigValidation,
+    Spawn,
+    Listeners,
+    Routes,
+    Publish,
+}
+impl ConnectStage {
+    pub(crate) fn wrap(self, error: &str) -> String {
+        let prefix = match self {
+            Self::Preflight => "CONNECT_STAGE_PREFLIGHT",
+            Self::PortRelease => "CONNECT_STAGE_PORT_RELEASE",
+            Self::ConfigValidation => "CONNECT_STAGE_CONFIG",
+            Self::Spawn => "CONNECT_STAGE_SPAWN",
+            Self::Listeners => "CONNECT_STAGE_LISTENERS",
+            Self::Routes => "CONNECT_STAGE_ROUTES",
+            Self::Publish => "CONNECT_STAGE_PUBLISH",
+        };
+        format!("{prefix}: {error}")
+    }
+}
+pub(crate) fn config_validation_error(error: &str) -> String {
+    // Only known core diagnostics become a fixed cause. Never copy a provider
+    // tag, path, credential or arbitrary nested token into the IPC payload.
+    let cause = if error.contains("LengthMin can't be 0") {
+        "CORE_FRAGMENT_LENGTH_INVALID"
+    } else if error.starts_with("COMMAND_TIMEOUT:") {
+        "CORE_VALIDATION_TIMEOUT"
+    } else {
+        "CORE_CONFIG_INVALID"
+    };
+    format!("CORE_CONFIG_REJECTED: {cause}: {error}")
 }
 pub(crate) fn contextual_runtime_error(error: &str, context: &str) -> String {
     // Keep the leading machine code through internal context wrappers. Only
@@ -26,9 +68,22 @@ impl NativeFailure {
             code: "RUNTIME_COMMAND_TASK_FAILED",
             category: "lifecycle",
             retryable: false,
+            stage: None,
+            cause: None,
+            win32_code: None,
         }
     }
     pub(crate) fn from_error(message: &str, command: RuntimeCommand) -> Self {
+        let (stage, message) = match message.split_once(": ") {
+            Some(("CONNECT_STAGE_PREFLIGHT", message)) => (Some("preflight"), message),
+            Some(("CONNECT_STAGE_PORT_RELEASE", message)) => (Some("port-release"), message),
+            Some(("CONNECT_STAGE_CONFIG", message)) => (Some("config-validation"), message),
+            Some(("CONNECT_STAGE_SPAWN", message)) => (Some("spawn"), message),
+            Some(("CONNECT_STAGE_LISTENERS", message)) => (Some("listeners"), message),
+            Some(("CONNECT_STAGE_ROUTES", message)) => (Some("routes"), message),
+            Some(("CONNECT_STAGE_PUBLISH", message)) => (Some("publish"), message),
+            _ => (None, message),
+        };
         let token = message
             .split([':', ' ', '\r', '\n'])
             .next()
@@ -61,6 +116,12 @@ impl NativeFailure {
             "CORE_PORT_TIMEOUT" => "CORE_PORT_TIMEOUT",
             "CORE_EXITED_EARLY" => "CORE_EXITED_EARLY",
             "CORE_NOT_FOUND" => "CORE_NOT_FOUND",
+            "CORE_CONFIG_REJECTED" => "CORE_CONFIG_REJECTED",
+            "CORE_FRAGMENT_SCHEMA_UNSUPPORTED" => "CORE_FRAGMENT_SCHEMA_UNSUPPORTED",
+            "CORE_SPAWN_ACCESS_DENIED" => "CORE_SPAWN_ACCESS_DENIED",
+            "CORE_SPAWN_INVALID_IMAGE" => "CORE_SPAWN_INVALID_IMAGE",
+            "CORE_SPAWN_CORRUPT_FILE" => "CORE_SPAWN_CORRUPT_FILE",
+            "CORE_SPAWN_FAILED" => "CORE_SPAWN_FAILED",
             "TUN_ELEVATION_REQUIRED" => "TUN_ELEVATION_REQUIRED",
             "TUN_IPV6_UNSUPPORTED" => "TUN_IPV6_UNSUPPORTED",
             "TUN_PROCESS_ENFORCEMENT_UNAVAILABLE" => "TUN_PROCESS_ENFORCEMENT_UNAVAILABLE",
@@ -78,18 +139,66 @@ impl NativeFailure {
         };
         Self {
             code,
-            category: if matches!(code, "TUN_ELEVATION_REQUIRED") {
+            category: if matches!(code, "TUN_ELEVATION_REQUIRED" | "CORE_SPAWN_ACCESS_DENIED") {
                 "permission"
             } else {
                 "network"
             },
             retryable: matches!(code, "RUNTIME_BUSY" | "CORE_PORT_TIMEOUT"),
+            stage,
+            cause: if code == "CORE_CONFIG_REJECTED" {
+                match message.split(": ").nth(1) {
+                    Some("CORE_FRAGMENT_LENGTH_INVALID") => Some("CORE_FRAGMENT_LENGTH_INVALID"),
+                    Some("CORE_VALIDATION_TIMEOUT") => Some("CORE_VALIDATION_TIMEOUT"),
+                    _ => Some("CORE_CONFIG_INVALID"),
+                }
+            } else {
+                None
+            },
+            win32_code: match code {
+                "CORE_SPAWN_ACCESS_DENIED" => Some(5),
+                "CORE_SPAWN_INVALID_IMAGE" => Some(193),
+                "CORE_SPAWN_CORRUPT_FILE" => Some(1392),
+                _ => None,
+            },
         }
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn staged_core_failure_keeps_only_fixed_nested_cause_and_known_win32_code() {
+        let error = ConnectStage::Preflight.wrap(&config_validation_error(
+            "private config/tag: LengthMin can't be 0",
+        ));
+        let value =
+            serde_json::to_value(NativeFailure::from_error(&error, RuntimeCommand::Connect))
+                .unwrap();
+        assert_eq!(value["code"], "CORE_CONFIG_REJECTED");
+        assert_eq!(value["stage"], "preflight");
+        assert_eq!(value["cause"], "CORE_FRAGMENT_LENGTH_INVALID");
+        assert!(!value.to_string().contains("private"));
+        let value = serde_json::to_value(NativeFailure::from_error(
+            &ConnectStage::Spawn.wrap("CORE_SPAWN_ACCESS_DENIED: private path"),
+            RuntimeCommand::Connect,
+        ))
+        .unwrap();
+        assert_eq!(value["win32Code"], 5);
+        assert_eq!(value["category"], "permission");
+        for input in [
+            "private CORE_SPAWN_ACCESS_DENIED: 5",
+            "CORE_CONFIG_REJECTED: private-token: CORE_FRAGMENT_LENGTH_INVALID",
+            "CORE_CONFIG_REJECTED: CORE_FRAGMENT_LENGTH_INVALID-private-token",
+        ] {
+            let value =
+                serde_json::to_value(NativeFailure::from_error(input, RuntimeCommand::Connect))
+                    .unwrap();
+            assert_ne!(value["cause"], "CORE_FRAGMENT_LENGTH_INVALID");
+            assert!(value.get("win32Code").is_none());
+            assert!(!value.to_string().contains("private"));
+        }
+    }
     #[test]
     fn incomplete_cleanup_stays_explicit_and_never_exports_internal_detail() {
         for command in [

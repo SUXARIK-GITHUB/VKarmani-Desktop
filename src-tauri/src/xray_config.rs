@@ -381,6 +381,136 @@ fn set_client_owned_xray_field(map: &mut serde_json::Map<String, Value>, key: &s
     map.insert(key.into(), value);
 }
 
+// Xray26.4.25 FragmentMask uses singular Int32Range length/delay. Some
+// subscription generators emit singleton lengths/delays arrays instead. Map
+// only that lossless case; never drop a mask or choose one of several ranges.
+fn adapt_fragment_masks_for_pinned_core(config: &mut Value) -> Result<(), String> {
+    let Some(outbounds) = config.get_mut("outbounds").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for outbound in outbounds {
+        let Some(masks) = outbound
+            .pointer_mut("/streamSettings/finalmask/tcp")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for mask in masks {
+            if mask.get("type").and_then(Value::as_str) != Some("fragment") {
+                continue;
+            }
+            let Some(settings) = mask.get_mut("settings").and_then(Value::as_object_mut) else {
+                continue; // The actual core validator rejects malformed settings.
+            };
+            for (plural, singular) in [("lengths", "length"), ("delays", "delay")] {
+                let aliases = settings
+                    .keys()
+                    .filter(|name| xray_json_field_matches(name, plural))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if aliases.is_empty() {
+                    continue;
+                }
+                if aliases.len() != 1
+                    || settings
+                        .keys()
+                        .any(|name| xray_json_field_matches(name, singular))
+                {
+                    return Err("CORE_FRAGMENT_SCHEMA_UNSUPPORTED".into());
+                }
+                let value = settings[&aliases[0]]
+                    .as_array()
+                    .filter(|values| values.len() == 1)
+                    .and_then(|values| values[0].as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or("CORE_FRAGMENT_SCHEMA_UNSUPPORTED")?
+                    .to_string();
+                settings.remove(&aliases[0]);
+                settings.insert(singular.into(), json!(value));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod fragment_compatibility_tests {
+    use super::*;
+    fn template(settings: Value) -> RuntimeTemplate {
+        let outbound = json!({"tag":"node","protocol":"vless","settings":{"vnext":[{"address":"example.com","port":443,"users":[{"id":"123e4567-e89b-12d3-a456-426614174000","encryption":"none"}]}]},"streamSettings":{"network":"raw","finalmask":{"tcp":[{"type":"fragment","settings":settings}]}}});
+        RuntimeTemplate {
+            family: "xray".into(),
+            protocol: "vless".into(),
+            remarks: None,
+            full_config: Some(
+                json!({"outbounds":[outbound.clone()],"dns":{"servers":["localhost"]},"routing":{"rules":[]}}),
+            ),
+            primary_outbound_tag: Some("node".into()),
+            profile_kind: Some("node".into()),
+            outbound,
+        }
+    }
+    #[test]
+    fn singleton_fragment_ranges_are_lossless_in_both_modes_without_editing_provider() {
+        for full in [false, true] {
+            let mut template = template(
+                json!({"packets":"tlshello","lengths":["50-100"],"delays":["1-3"],"maxSplit":"3"}),
+            );
+            if !full {
+                template.full_config = None;
+            }
+            let original = (template.outbound.clone(), template.full_config.clone());
+            for mode in ["proxy", "tun"] {
+                let (config, _, _) =
+                    build_xray_config(&template, mode, "ipv4", None, &[], None, None).unwrap();
+                let settings =
+                    &config["outbounds"][0]["streamSettings"]["finalmask"]["tcp"][0]["settings"];
+                assert_eq!(
+                    settings,
+                    &json!({"packets":"tlshello","length":"50-100","delay":"1-3","maxSplit":"3"})
+                );
+                assert_eq!(
+                    (&template.outbound, &template.full_config),
+                    (&original.0, &original.1)
+                );
+                if full {
+                    assert_eq!(config["dns"], template.full_config.as_ref().unwrap()["dns"]);
+                }
+            }
+        }
+    }
+    #[test]
+    fn ambiguous_or_multiple_ranges_never_drop_fragmentation_or_fallback() {
+        for settings in [
+            json!({"lengths":[]}),
+            json!({"lengths":["50-100","200-300"]}),
+            json!({"lengths":"50-100"}),
+            json!({"lengths":[null]}),
+            json!({"lengths":[""]}),
+            json!({"lengths":["50-100"],"Length":"5-10"}),
+            json!({"lengths":["50-100"],"Lengths":["100-200"]}),
+            json!({"length":"50-100","delays":["1-3","4-5"]}),
+        ] {
+            let template = template(settings);
+            for mode in ["proxy", "tun"] {
+                assert_eq!(
+                    build_xray_config(&template, mode, "ipv4", None, &[], None, None)
+                        .err()
+                        .unwrap(),
+                    "CORE_FRAGMENT_SCHEMA_UNSUPPORTED"
+                );
+            }
+        }
+    }
+    #[test]
+    fn pinned_singular_masks_and_unrelated_masks_are_unchanged() {
+        let mut config = json!({"outbounds":[{"streamSettings":{"finalmask":{"tcp":[{"type":"fragment","settings":{"length":"5-10","delay":"1-2","packets":"tlshello","maxSplit":"3"}},{"type":"header-custom","settings":{"lengths":[1,2]}}]}}}]});
+        let original = config.clone();
+        adapt_fragment_masks_for_pinned_core(&mut config).unwrap();
+        assert_eq!(config, original);
+    }
+}
+
 struct FullConfigAdapterSettings<'a> {
     log_object: Value,
     domain_strategy: &'a str,
@@ -853,7 +983,7 @@ pub(crate) fn build_xray_config_with_plan(
             "settings": {}
         });
 
-        if let Some(full_runtime_config) = build_from_full_xray_config_template(
+        if let Some(mut full_runtime_config) = build_from_full_xray_config_template(
             template,
             full_config,
             inbounds.clone(),
@@ -867,55 +997,54 @@ pub(crate) fn build_xray_config_with_plan(
                 send_through_ip,
             },
         ) {
+            adapt_fragment_masks_for_pinned_core(&mut full_runtime_config)?;
             return Ok((full_runtime_config, plan, routing_exclusion_plan));
         }
         return Err("Не удалось применить client adapter к полному Xray config; неполный fallback запрещён.".into());
     }
 
-    Ok((
-        json!({
-            "log": log_object,
-            "dns": {
-                "queryStrategy": dns_query_strategy,
-                "servers": ["1.1.1.1", "8.8.8.8", "localhost"]
-            },
-            "api": {
-                "tag": "api",
-                "services": ["StatsService"]
-            },
-            "policy": {
-                "levels": {
-                    "0": {
-                        "statsUserUplink": true,
-                        "statsUserDownlink": true
-                    }
-                },
-                "system": {
-                    "statsInboundUplink": true,
-                    "statsInboundDownlink": true,
-                    "statsOutboundUplink": true,
-                    "statsOutboundDownlink": true
+    let mut config = json!({
+        "log": log_object,
+        "dns": {
+            "queryStrategy": dns_query_strategy,
+            "servers": ["1.1.1.1", "8.8.8.8", "localhost"]
+        },
+        "api": {
+            "tag": "api",
+            "services": ["StatsService"]
+        },
+        "policy": {
+            "levels": {
+                "0": {
+                    "statsUserUplink": true,
+                    "statsUserDownlink": true
                 }
             },
-            "stats": {},
-            "inbounds": inbounds,
-            "routing": {
-                "domainStrategy": domain_strategy,
-                "rules": routing_rules
-            },
-            "outbounds": [
-                outbound,
-                direct_outbound,
-                {
-                    "tag": "block",
-                    "protocol": "blackhole",
-                    "settings": {}
-                }
-            ]
-        }),
-        plan,
-        routing_exclusion_plan,
-    ))
+            "system": {
+                "statsInboundUplink": true,
+                "statsInboundDownlink": true,
+                "statsOutboundUplink": true,
+                "statsOutboundDownlink": true
+            }
+        },
+        "stats": {},
+        "inbounds": inbounds,
+        "routing": {
+            "domainStrategy": domain_strategy,
+            "rules": routing_rules
+        },
+        "outbounds": [
+            outbound,
+            direct_outbound,
+            {
+                "tag": "block",
+                "protocol": "blackhole",
+                "settings": {}
+            }
+        ]
+    });
+    adapt_fragment_masks_for_pinned_core(&mut config)?;
+    Ok((config, plan, routing_exclusion_plan))
 }
 
 pub(crate) fn value_as_valid_port(value: &Value) -> Option<u16> {

@@ -202,6 +202,7 @@ export interface RuntimeStatus {
   proxyServer?: string;
   proxyBypass?: string;
   networkMode?: TunnelMode;
+  tunRoutingMode?: TunRoutingMode;
   tunInterfaceName?: string;
   xrayPid?: number;
   runtimeConfigHash?: string;
@@ -220,6 +221,7 @@ export interface RuntimeStatus {
 
 export interface RepairReceipt {atUnixMs:number;code:string;restoreProxy:boolean;routeCount:number}
 export interface DiagnosticFacts {
+  lastConnectFailure?:ConnectFailureObservation;
   tunInterface?:'ready'|'unavailable'|'not-applicable';
   ports?:DiagnosticPort[];
   checkedAtUnixMs:number;
@@ -229,6 +231,13 @@ export interface DiagnosticFacts {
   elevation:'elevated'|'standard'|'unavailable';
   repairHistory:RepairReceipt[];
   repairHistoryStatus:'available'|'unavailable';
+}
+export interface ConnectFailureObservation {
+  checkedAtUnixMs:number;operationId:number|null;mode:'proxy'|'tun';
+  failure:{code:string;category:string;retryable:boolean;stage?:string;cause?:string;win32Code?:number};
+  process:'running'|'exited'|'not-started'|'unavailable';exitCode:number|null;
+  ports:DiagnosticPort[];systemProxy:'enabled'|'disabled'|'unavailable';
+  proxyOwnership:string;routeOwnership:string;ownedRouteCount:number;
 }
 export interface DiagnosticPort {port:10808|10809|10810;state:'free'|'owned'|'foreign'|'unconfirmed'|'unavailable'}
 export interface ProxyStatus {

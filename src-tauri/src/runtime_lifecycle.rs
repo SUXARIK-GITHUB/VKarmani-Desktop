@@ -82,6 +82,11 @@ impl std::ops::DerefMut for PendingXray {
 impl Drop for PendingXray {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
+            crate::diagnostic_facts::record_pending_failure_if_missing(
+                &self.app,
+                &self.network_mode,
+                Some(child),
+            );
             let pid = child.id();
             let _ = terminate_child_with_timeout(child, Duration::from_secs(3));
             child.release_integrity();

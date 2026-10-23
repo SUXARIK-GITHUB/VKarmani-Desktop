@@ -673,7 +673,7 @@ pub(crate) fn validate_xray_config_with_core(
 
     run_command_with_timeout(command, Duration::from_secs(8), "xray config test")
         .map(|_| ())
-        .map_err(|error| format!("Xray-core не принял runtime-конфиг. Подключение остановлено до запуска процесса: {error}"))
+        .map_err(|error| crate::native_error::config_validation_error(&error))
 }
 
 pub(crate) fn validate_config_projection(
@@ -905,7 +905,15 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         routing_exclusions.as_ref(),
         Some(runtime_trace_path.as_path()),
     )
-    .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
+    .map_err(|error| {
+        crate::diagnostic_facts::record_connect_failure(
+            &app,
+            crate::native_error::ConnectStage::Preflight,
+            &normalized_network_mode,
+            &error,
+            None,
+        )
+    })?;
 
     #[cfg(target_os = "windows")]
     if let Some(route) = physical_route.as_ref() {
@@ -919,7 +927,15 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     _operation_guard.check()?;
     // Reject invalid provider transports/config while the prior runtime is
     // still alive. Never construct a second TUN during this preflight.
-    validate_config_projection(&core_path, &config_path, &config)?;
+    validate_config_projection(&core_path, &config_path, &config).map_err(|error| {
+        crate::diagnostic_facts::record_connect_failure(
+            &app,
+            crate::native_error::ConnectStage::Preflight,
+            &normalized_network_mode,
+            &error,
+            None,
+        )
+    })?;
     _operation_guard.check()?;
     if let Some(expected) = physical_route.as_ref() {
         require_physical_binding(expected, current_physical_binding())?;
@@ -933,6 +949,11 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     )?;
     let config_written = std::cell::Cell::new(false);
     let mut failed_connect = FailedConnectRollback::new(|| {
+        crate::diagnostic_facts::record_pending_failure_if_missing(
+            &app,
+            &normalized_network_mode,
+            None,
+        );
         let _ = restore_saved_proxy_state(&app, &state, "connect_failed_after_stop");
         if config_written.get() {
             remove_startup_runtime_config(&app, &config_path, "connect_failed_after_stop");
@@ -954,13 +975,27 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
             &format!("Локальные порты не освободились с первой попытки, выполняю повторную очистку Xray перед стартом нового сервера: {first_release_error}"),
         );
         wait_for_runtime_ports_release(Duration::from_secs(4)).map_err(|second_release_error| {
-            format!("{first_release_error}; повторная очистка Xray не освободила порты: {second_release_error}")
+            crate::diagnostic_facts::record_connect_failure(
+                &app,
+                crate::native_error::ConnectStage::PortRelease,
+                &normalized_network_mode,
+                &format!("CORE_PORT_CONFLICT: {first_release_error}; {second_release_error}"),
+                None,
+            )
         })?;
     }
     if reconnect_requested {
         let _ = append_runtime_event(&app, "Старый Xray остановлен, локальные порты освобождены, запускаем выбранный сервер без наложения процессов.");
     }
-    ensure_runtime_ports_available()?;
+    ensure_runtime_ports_available().map_err(|error| {
+        crate::diagnostic_facts::record_connect_failure(
+            &app,
+            crate::native_error::ConnectStage::PortRelease,
+            &normalized_network_mode,
+            &error,
+            None,
+        )
+    })?;
 
     validate_or_create_log(&runtime_trace_path).map_err(|error| format!("CONNECT_LOG: {error}"))?;
     _operation_guard.stage("validating")?;
@@ -968,12 +1003,18 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         .map_err(|error| format!("Не удалось записать config: {error}"))?;
     config_written.set(true);
 
-    validate_xray_config_with_core(&core_path, &config_path, &config_hash).inspect_err(
-        |error| {
-            let _ = append_runtime_event(&app, error);
-            remove_startup_runtime_config(&app, &config_path, "config_validation_failed");
-        },
-    )?;
+    validate_xray_config_with_core(&core_path, &config_path, &config_hash).map_err(|error| {
+        let error = crate::diagnostic_facts::record_connect_failure(
+            &app,
+            crate::native_error::ConnectStage::ConfigValidation,
+            &normalized_network_mode,
+            &error,
+            None,
+        );
+        let _ = append_runtime_event(&app, &error);
+        remove_startup_runtime_config(&app, &config_path, "config_validation_failed");
+        error
+    })?;
     if let Err(error) = _operation_guard.check() {
         remove_startup_runtime_config(&app, &config_path, "operation_cancelled");
         return Err(error);
@@ -1115,6 +1156,13 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     let child = match spawn_xray_runtime_child(&core_path, &config_path, &log_path, &config_hash) {
         Ok(child) => child,
         Err(error) => {
+            let error = crate::diagnostic_facts::record_connect_failure(
+                &app,
+                crate::native_error::ConnectStage::Spawn,
+                &normalized_network_mode,
+                &error,
+                None,
+            );
             remove_startup_runtime_config(&app, &config_path, "xray_spawn_failed");
             return Err(error);
         }
@@ -1143,6 +1191,13 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         core_working_dir,
         &normalized_network_mode,
     ) {
+        let error = crate::diagnostic_facts::record_connect_failure(
+            &app,
+            crate::native_error::ConnectStage::Listeners,
+            &normalized_network_mode,
+            &error,
+            Some(&mut child),
+        );
         let _ = append_runtime_event(
             &app,
             &format!(
@@ -1162,7 +1217,26 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         if let Some(expected) = physical_route.as_ref() {
             require_physical_binding(expected, current_physical_binding())?;
         }
-        configure_tun_routes(&app, TUN_INTERFACE_NAME, &outbound_ips).map_err(|error| {
+        let mut observed_error = None;
+        configure_tun_routes_observed(&app, TUN_INTERFACE_NAME, &outbound_ips, |error| {
+            observed_error = Some(crate::diagnostic_facts::record_connect_failure(
+                &app,
+                crate::native_error::ConnectStage::Routes,
+                &normalized_network_mode,
+                error,
+                Some(&mut child),
+            ));
+        })
+        .map_err(|error| {
+            let error = observed_error.unwrap_or_else(|| {
+                crate::diagnostic_facts::record_connect_failure(
+                    &app,
+                    crate::native_error::ConnectStage::Routes,
+                    &normalized_network_mode,
+                    &error,
+                    Some(&mut child),
+                )
+            });
             clear_starting_runtime(&state, child_pid);
             let _ = cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &outbound_ips);
             let _ = restore_saved_proxy_state(&app, &state, "tun_routes_failed");
@@ -1187,6 +1261,13 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     if let Some(status) = child.try_wait().map_err(|error| {
         format!("Не удалось проверить Xray перед завершением подключения: {error}")
     })? {
+        let failure = crate::diagnostic_facts::record_connect_failure(
+            &app,
+            crate::native_error::ConnectStage::Publish,
+            &normalized_network_mode,
+            "CORE_EXITED_EARLY",
+            Some(&mut child),
+        );
         clear_starting_runtime(&state, child_pid);
         let code = status.code();
         if let Ok(mut exit_guard) = state.last_exit_code.lock() {
@@ -1195,18 +1276,38 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         let _ = cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &outbound_ips);
         let _ = restore_saved_proxy_state(&app, &state, "connect_final_check_failed");
         remove_startup_runtime_config(&app, &config_path, "xray_stopped_before_ready_final_check");
-        return Err(format!(
-            "Xray остановился до завершения подключения. Exit code: {:?}. Подключение не было помечено активным.",
-            code
-        ));
+        return Err(failure);
     }
 
     if let Some(expected) = physical_route.as_ref() {
-        require_physical_binding(expected, current_physical_binding())?;
-        confirm_tun_routes_ready(&app)?;
+        require_physical_binding(expected, current_physical_binding())
+            .and_then(|_| confirm_tun_routes_ready(&app))
+            .map_err(|error| {
+                crate::diagnostic_facts::record_connect_failure(
+                    &app,
+                    crate::native_error::ConnectStage::Publish,
+                    &normalized_network_mode,
+                    &error,
+                    Some(&mut child),
+                )
+            })?;
     }
-    if !owned_runtime_ports_ready(&mut child)? {
-        return Err("CORE_PORT_TIMEOUT: runtime listeners lost before publication".into());
+    if !owned_runtime_ports_ready(&mut child).map_err(|error| {
+        crate::diagnostic_facts::record_connect_failure(
+            &app,
+            crate::native_error::ConnectStage::Publish,
+            &normalized_network_mode,
+            &error,
+            Some(&mut child),
+        )
+    })? {
+        return Err(crate::diagnostic_facts::record_connect_failure(
+            &app,
+            crate::native_error::ConnectStage::Publish,
+            &normalized_network_mode,
+            "CORE_PORT_TIMEOUT: runtime listeners lost before publication",
+            Some(&mut child),
+        ));
     }
     _operation_guard.stage("publishing")?;
 
@@ -1237,6 +1338,11 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
             started_at: unix_now_string(),
             telemetry_epoch: next_telemetry_epoch(),
             network_mode: normalized_network_mode.clone(),
+            tun_routing_mode: if normalized_network_mode == "tun" {
+                Some(policy_mode.to_owned())
+            } else {
+                None
+            },
             tun_interface_name: if normalized_network_mode == "tun" {
                 Some(TUN_INTERFACE_NAME.to_string())
             } else {
@@ -1577,18 +1683,21 @@ pub(crate) fn set_system_proxy_blocking(
         )?;
     }
 
-    let is_connected = state
-        .runtime
-        .lock()
-        .map(|mut runtime| {
-            runtime
-                .as_mut()
-                .is_some_and(|runtime| matches!(runtime.child.try_wait(), Ok(None)))
-        })
-        .unwrap_or(false);
-    if enabled && !is_connected {
-        return Err("Сначала запустите runtime, затем включайте системный proxy.".into());
+    if enabled {
+        let mut slot = state
+            .runtime
+            .lock()
+            .map_err(|_| "PROBE_RUNTIME_UNAVAILABLE")?;
+        let runtime = slot.as_mut().ok_or("PROBE_RUNTIME_UNAVAILABLE")?;
+        // A live process alone does not prove the owned HTTP/SOCKS/API
+        // listeners survived since connect. Reject before writing WinINet.
+        if !owned_runtime_ports_ready(&mut runtime.child)? {
+            return Err(
+                "CORE_PORT_TIMEOUT: cannot enable proxy before owned listener readiness".into(),
+            );
+        }
     }
+    _operation_guard.check()?;
 
     let status = if enabled {
         enable_owned_windows_proxy(&app)?

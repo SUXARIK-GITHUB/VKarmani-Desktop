@@ -12,6 +12,7 @@ import type {
 import { redactSensitiveText } from './redaction';
 import {publicDiagnosticFacts} from './diagnosticFacts';
 import {diagnosticChecks} from './diagnosticChecks';
+import {isPublicNativeCode,publicFailureDetails} from './nativeErrors';
 
 export function safePublicDigest(value:unknown,session:RemnawaveSession|null):string {
   if(typeof value!=='string'||!/^[a-f0-9]{64}$/i.test(value))return '';
@@ -117,7 +118,10 @@ export function createSafeDiagnosticsPayload(input: SafeDiagnosticsExportInput):
   let nodes = 0;
   function scrub(value: unknown, depth = 0, field = ''): unknown {
     if (++nodes > 4000 || depth > 8) return '[bounded]';
-    if (typeof value === 'string') return field==='configHash' ? safePublicDigest(value,input.session) : text(value);
+    if (typeof value === 'string') {
+      if(field==='code'&&isPublicNativeCode(value)||field==='cause'&&publicFailureDetails({code:'CORE_CONFIG_REJECTED',cause:value}).cause===value)return value;
+      return field==='configHash' ? safePublicDigest(value,input.session) : text(value);
+    }
     if (!value || typeof value !== 'object') return value;
     if (seen.has(value)) return '[cycle]';
     seen.add(value);
