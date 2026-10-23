@@ -493,7 +493,7 @@ pub(crate) fn format_xray_spawn_error(error: &std::io::Error, core_path: &Path) 
     let code = error.raw_os_error();
     let hint = match code {
         Some(193) => "Windows вернул os error 193: установленный xray.exe не запускается как Windows x64-приложение. Обычно это значит, что в installer/updater попал неправильный или повреждённый файл xray.exe. Полностью удалите старую установку VKarmani, установите актуальную версию и убедитесь, что GitHub Actions прошёл шаг Verify bundled Xray binary on Windows.",
-        Some(1392) => "Windows вернул os error 1392: файл xray.exe повреждён на диске или был частично перезаписан во время обновления. Закройте VKarmani, удалите папку core рядом с приложением и установите актуальную версию заново.",
+        Some(1392) => "Windows вернул os error 1392: файл или файловая система недоступны либо повреждены. Сохраните диагностику и проверьте диск. Восстановите комплект ресурсов проверенным установщиком; не удаляйте core, AppData или резервные копии вручную.",
         Some(5) => "Windows вернул os error 5: доступ запрещён. Проверьте антивирус/SmartScreen и права доступа к папке установки.",
         _ => "Проверьте, что рядом с приложением лежит настоящий Xray-core для Windows x64, а не Linux/ARM/LFS-pointer/повреждённый файл.",
     };
@@ -549,19 +549,42 @@ pub(crate) fn validate_core_path(path: &Path) -> Result<(), String> {
     verify_core_manifest_artifact(path, "xray.exe")
 }
 
-pub(crate) fn is_usable_core_path(path: &Path) -> bool {
-    validate_core_path(path).is_ok()
+pub(crate) fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
+    let resource_dir = app.path().resource_dir().ok();
+    let app_local = app.path().app_local_data_dir().ok();
+    let current_dir = std::env::current_dir().ok();
+    let executable = std::env::current_exe().ok();
+    let debug_override = if cfg!(debug_assertions) {
+        std::env::var_os("VKARMANI_XRAY_PATH").map(PathBuf::from)
+    } else {
+        None
+    };
+    core_paths_from(
+        resource_dir.as_deref(),
+        app_local.as_deref(),
+        current_dir.as_deref(),
+        executable.as_deref(),
+        debug_override.as_deref(),
+        cfg!(debug_assertions),
+    )
 }
 
-pub(crate) fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
+fn core_paths_from(
+    resource_dir: Option<&Path>,
+    app_local: Option<&Path>,
+    current_dir: Option<&Path>,
+    executable: Option<&Path>,
+    debug_override: Option<&Path>,
+    development: bool,
+) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-
-    #[cfg(debug_assertions)]
-    if let Ok(env_path) = std::env::var("VKARMANI_XRAY_PATH") {
-        push_unique_path(&mut paths, PathBuf::from(env_path));
+    if development {
+        if let Some(env_path) = debug_override {
+            push_unique_path(&mut paths, env_path.to_path_buf());
+        }
     }
 
-    if let Ok(resource_dir) = app.path().resource_dir() {
+    if let Some(resource_dir) = resource_dir {
         // New fixed bundle mapping: tauri.conf.json maps resources directly to $RESOURCE/core/windows.
         push_unique_path(
             &mut paths,
@@ -591,11 +614,11 @@ pub(crate) fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
         );
     }
 
-    if let Ok(app_local) = app.path().app_local_data_dir() {
+    if let Some(app_local) = app_local.filter(|_| development) {
         push_unique_path(&mut paths, app_local.join("core").join("xray.exe"));
     }
 
-    if let Ok(current_dir) = std::env::current_dir() {
+    if let Some(current_dir) = current_dir.filter(|_| development) {
         push_unique_path(
             &mut paths,
             current_dir
@@ -610,7 +633,7 @@ pub(crate) fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
         );
     }
 
-    if let Ok(executable) = std::env::current_exe() {
+    if let Some(executable) = executable {
         if let Some(parent) = executable.parent() {
             push_unique_path(
                 &mut paths,
@@ -631,9 +654,20 @@ pub(crate) fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
 }
 
 pub(crate) fn resolve_core_path(app: &AppHandle) -> Option<PathBuf> {
-    candidate_core_paths(app)
-        .into_iter()
-        .find(|path| is_usable_core_path(path))
+    first_usable_core_path(candidate_core_paths(app))
+}
+
+fn first_usable_core_path(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    for path in paths {
+        // Only a genuinely absent layout may fall back to another trusted
+        // installer/portable layout. A present broken bundle must stay visible.
+        match path.parent().map(fs::symlink_metadata) {
+            Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Some(Ok(_)) => return validate_core_bundle(&path).ok().map(|()| path),
+            _ => return None,
+        }
+    }
+    None
 }
 
 pub(crate) fn core_not_found_message(app: &AppHandle) -> String {
@@ -641,7 +675,7 @@ pub(crate) fn core_not_found_message(app: &AppHandle) -> String {
         .into_iter()
         .map(|path| {
             let state = if path.exists() {
-                match validate_core_path(&path) {
+                match validate_core_bundle(&path) {
                     Ok(()) => "ok".to_string(),
                     Err(error) => error,
                 }
@@ -668,50 +702,24 @@ pub(crate) fn resolve_core_sidecar_path(core_path: &Path, file_name: &str) -> Op
     core_path.parent().map(|dir| dir.join(file_name))
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) fn harden_runtime_output_dir(path: &Path) {
-    let path_string = path.to_string_lossy().to_string();
-    let path_text = ps_quote(&path_string);
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'SilentlyContinue'
-$path = '{}'
-$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$acl = Get-Acl -LiteralPath $path
-$acl.SetAccessRuleProtection($true, $false)
-$rights = [System.Security.AccessControl.FileSystemRights]::FullControl
-$inheritance = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-$propagation = [System.Security.AccessControl.PropagationFlags]::None
-$allow = [System.Security.AccessControl.AccessControlType]::Allow
-foreach ($identity in @($user, 'SYSTEM', 'BUILTIN\Administrators')) {{
-  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, $propagation, $allow)
-  $acl.SetAccessRule($rule)
-}}
-Set-Acl -LiteralPath $path -AclObject $acl
-"#,
-        path_text
-    );
-    let _ = run_powershell(&script);
+pub(crate) fn harden_runtime_output_dir(path: &Path) -> Result<(), String> {
+    crate::runtime_integrity::secure_runtime_directory(path)
 }
 
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn harden_runtime_output_dir(_path: &Path) {}
-
 pub(crate) fn runtime_output_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let base = app
-        .path()
-        .app_local_data_dir()
-        .or_else(|_| app.path().app_config_dir())
-        .map_err(|error| format!("Не удалось определить каталог данных: {error}"))?;
+    runtime_output_from_root(app.path().app_local_data_dir().ok().as_deref())
+}
 
-    Ok(base.join("runtime"))
+fn runtime_output_from_root(local: Option<&Path>) -> Result<PathBuf, String> {
+    // Never split runtime/journals from durable LocalAppData state.
+    local.map(|root| root.join("runtime")).ok_or_else(|| {
+        "RUNTIME_ROOT_UNAVAILABLE: Не удалось определить каталог данных.".to_string()
+    })
 }
 
 pub(crate) fn runtime_output_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let path = runtime_output_path(app)?;
-    fs::create_dir_all(&path)
-        .map_err(|error| format!("Не удалось создать runtime каталог: {error}"))?;
-    harden_runtime_output_dir(&path);
+    harden_runtime_output_dir(&path)?;
     Ok(path)
 }
 
@@ -868,4 +876,78 @@ pub(crate) fn private_bypass_cidrs() -> Vec<&'static str> {
         "fc00::/7",
         "fe80::/10",
     ]
+}
+
+#[cfg(test)]
+mod path_contract_tests {
+    use super::*;
+
+    #[test]
+    fn path_contract_release_bundle_candidates_ignore_cwd_and_user_state() {
+        let installation = Path::new("D:/Приложения & Tools/VKarmani");
+        let exe = installation.join("VKarmani.exe");
+        let expected = core_paths_from(Some(installation), None, None, Some(&exe), None, false);
+        let actual = core_paths_from(
+            Some(installation),
+            Some(Path::new(
+                "C:/Users/fixture/AppData/Local/com.vkarmani.desktop",
+            )),
+            Some(Path::new("E:/unrelated-working-directory")),
+            Some(&exe),
+            Some(Path::new("E:/untrusted/xray.exe")),
+            false,
+        );
+        assert_eq!(actual, expected);
+        assert!(!actual.is_empty());
+    }
+
+    #[test]
+    fn path_contract_incomplete_primary_bundle_does_not_select_another_core() {
+        let dir =
+            std::env::temp_dir().join(format!("vkarmani-partial-bundle-{}", unix_now_string()));
+        fs::create_dir(&dir).unwrap();
+        let trusted =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../resources/core/windows/xray.exe");
+        let partial = dir.join("xray.exe");
+        fs::copy(&trusted, &partial).unwrap();
+        let selected = first_usable_core_path([partial.clone(), trusted]);
+        fs::remove_file(&partial).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        assert!(
+            selected.is_none(),
+            "present incomplete bundle must fail before launch"
+        );
+    }
+
+    #[test]
+    fn path_contract_absent_layout_allows_trusted_installer_layout() {
+        let trusted =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../resources/core/windows/xray.exe");
+        assert_eq!(
+            first_usable_core_path([
+                trusted.parent().unwrap().join("absent-fixture/xray.exe"),
+                trusted.clone()
+            ]),
+            Some(trusted)
+        );
+    }
+
+    #[test]
+    fn path_contract_runtime_root_never_falls_back_to_roaming() {
+        assert!(runtime_output_from_root(None).is_err());
+        assert_eq!(
+            runtime_output_from_root(Some(Path::new("C:/fixture/Local"))).unwrap(),
+            Path::new("C:/fixture/Local/runtime")
+        );
+    }
+
+    #[test]
+    fn path_contract_corrupt_file_guidance_preserves_core_and_user_data() {
+        let message = format_xray_spawn_error(
+            &std::io::Error::from_raw_os_error(1392),
+            Path::new("D:/fixture/core/xray.exe"),
+        );
+        assert!(!message.contains("удалите папку core"));
+        assert!(message.contains("1392"));
+    }
 }

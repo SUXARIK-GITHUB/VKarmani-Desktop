@@ -27,7 +27,6 @@ pub(crate) fn read_runtime_status(app: &AppHandle, state: tauri::State<AppState>
         .ok()
         .and_then(|value| value.clone());
     let last_exit_code = state.last_exit_code.lock().ok().and_then(|value| *value);
-    let core_path = resolve_core_path(app).map(|path| path.to_string_lossy().to_string());
     let proxy_snapshot = current_proxy_snapshot().ok();
     let (route_ownership, owned_routes) = owned_route_summary(app);
 
@@ -53,6 +52,13 @@ pub(crate) fn read_runtime_status(app: &AppHandle, state: tauri::State<AppState>
             ))
         })
     });
+
+    // The active runtime retains verified bundle handles for its entire
+    // lifetime. Status polling must not rehash the bundle on every tick.
+    let core_path = runtime_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.0.clone())
+        .or_else(|| resolve_core_path(app).map(|path| path.to_string_lossy().to_string()));
 
     let connected = runtime_snapshot.is_some();
     let starting_snapshot = state.starting_runtime.lock().ok().and_then(|value| {

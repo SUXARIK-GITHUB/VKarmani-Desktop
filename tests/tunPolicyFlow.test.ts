@@ -34,6 +34,15 @@ beforeEach(() => {
   });
 });
 describe('TUN settings through controller, service and actual IPC serializer', () => {
+  it.each([false, 1, 'corrupt', [], ['all']])('path contract: present malformed settings %j stay quarantined', value => {
+    expect(normalizeStoredSettings(value)).toMatchObject({ tunRoutingMode: 'selected', tunRoutingModeInvalid: true, autoConnect: false, autoConnectFavorite: false });
+  });
+  it('path contract: malformed JSON is distinct from absent first-run settings', () => {
+    expect(loadSettings()).toMatchObject({ tunRoutingMode: 'all', autoConnect: false });
+    ipc.data.set('vkarmani.settings', '{"tunRoutingMode":"selected"');
+    expect(loadSettings()).toMatchObject({ tunRoutingMode: 'selected', tunRoutingModeInvalid: true, autoConnect: false });
+    expect(ipc.data.get('vkarmani.settings')).toBe('{"tunRoutingMode":"selected"');
+  });
   it.each([{ entries: [] }, { entries: [entry] }])('explicit all survives save/restart with app list $entries', async ({ entries }) => {
     ipc.data.set('vkarmani.split-tunnel.entries', JSON.stringify(entries));
     // SettingsTab persists an explicit user intent, overriding legacy inference.

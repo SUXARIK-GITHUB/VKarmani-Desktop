@@ -283,18 +283,14 @@ fn journal_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 fn load_journal(app: &AppHandle) -> Result<Option<ProxyJournal>, String> {
     let path = journal_path(app)?;
-    if !path.exists() {
+    load_journal_at_path(&path)
+}
+fn load_journal_at_path(path: &Path) -> Result<Option<ProxyJournal>, String> {
+    let Some(payload) = crate::persistence::read_state_file(path, 256 * 1024)
+        .map_err(|error| format!("PROXY_JOURNAL_UNAVAILABLE: {error}"))?
+    else {
         return Ok(None);
-    }
-    if fs::metadata(&path)
-        .map_err(|_| "Не удалось проверить proxy journal".to_string())?
-        .len()
-        > 256 * 1024
-    {
-        return Err("Proxy journal превышает лимит".into());
-    }
-    let payload =
-        fs::read_to_string(&path).map_err(|_| "Не удалось прочитать proxy journal".to_string())?;
+    };
     let journal: ProxyJournal = serde_json::from_str(&decrypt_access_key(&payload)?)
         .map_err(|_| "Proxy journal повреждён".to_string())?;
     if journal.version != 2 {
@@ -383,6 +379,78 @@ pub(crate) fn windows_proxy_ownership_state(app: &AppHandle) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn path_contract_proxy_journal_rejects_hardlink_without_touching_backup() {
+        let dir = std::env::temp_dir().join(format!("vkarmani-proxy-link-{}", unix_now_string()));
+        fs::create_dir(&dir).unwrap();
+        let original = dir.join("backup.dpapi");
+        let link = dir.join("journal.dpapi");
+        let journal = ProxyJournal {
+            version: 2,
+            owner_pid: std::process::id(),
+            original: backend().current,
+            target: ProxySettings::owned_target(),
+            applied: true,
+        };
+        let sealed = encrypt_access_key(&serde_json::to_string(&journal).unwrap()).unwrap();
+        fs::write(&original, &sealed).unwrap();
+        fs::hard_link(&original, &link).unwrap();
+        let result = load_journal_at_path(&link);
+        assert_eq!(fs::read_to_string(&original).unwrap(), sealed);
+        fs::remove_file(&link).unwrap();
+        fs::remove_file(&original).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        assert!(
+            result.is_err(),
+            "a hardlinked journal is not an owned recovery file"
+        );
+    }
+
+    #[test]
+    fn path_contract_proxy_missing_is_distinct_from_corrupt_or_oversized() {
+        let dir = std::env::temp_dir().join(format!("vkarmani-proxy-bounds-{}", unix_now_string()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("journal.dpapi");
+        assert!(load_journal_at_path(&path).unwrap().is_none());
+        fs::write(&path, "not a sealed journal").unwrap();
+        assert!(load_journal_at_path(&path).is_err());
+        fs::write(&path, vec![b'x'; 256 * 1024 + 1]).unwrap();
+        assert!(load_journal_at_path(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn path_contract_proxy_journal_sharing_failure_is_not_first_run() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("vkarmani-proxy-sharing-{}", unix_now_string()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("journal.dpapi");
+        let journal = ProxyJournal {
+            version: 2,
+            owner_pid: std::process::id(),
+            original: backend().current,
+            target: ProxySettings::owned_target(),
+            applied: true,
+        };
+        let sealed = encrypt_access_key(&serde_json::to_string(&journal).unwrap()).unwrap();
+        fs::write(&path, &sealed).unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(load_journal_at_path(&path)
+            .unwrap_err()
+            .starts_with("PROXY_JOURNAL_UNAVAILABLE"));
+        drop(held);
+        assert!(load_journal_at_path(&path).unwrap().is_some());
+        assert_eq!(fs::read_to_string(&path).unwrap(), sealed);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
     use super::*;
     struct Fake {
         current: ProxySettings,
