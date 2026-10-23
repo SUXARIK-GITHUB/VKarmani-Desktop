@@ -472,22 +472,6 @@ pub(crate) fn wait_for_runtime_ports_release(timeout: Duration) -> Result<(), St
     }
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) const POWERSHELL_COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
-
-#[cfg(target_os = "windows")]
-pub(crate) fn run_powershell_command(command: Command, context: &str) -> Result<String, String> {
-    run_command_with_timeout(command, POWERSHELL_COMMAND_TIMEOUT, context)
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn run_powershell(script: &str) -> Result<String, String> {
-    let mut command = Command::new(system_program("powershell")?);
-    let utf8_script = format!("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; {script}");
-    command.args(["-NoProfile", "-NonInteractive", "-Command", &utf8_script]);
-    run_powershell_command(command, "script")
-}
-
 pub(crate) fn current_proxy_snapshot() -> Result<ProxyStatus, String> {
     read_wininet_settings().map(|settings| settings.status())
 }
@@ -581,11 +565,6 @@ pub(crate) fn is_process_elevated() -> Result<bool, String> {
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn is_process_elevated() -> Result<bool, String> {
     Ok(false)
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn ps_quote(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 fn wait_for_restarted_xray_ready(

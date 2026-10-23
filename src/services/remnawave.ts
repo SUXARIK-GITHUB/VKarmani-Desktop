@@ -41,6 +41,7 @@ import { parseXrayJsonSubscriptionToServers } from './remnawave/subscriptionPars
 import { assertNativeRuntimeServerMatches, nativeConnectFailurePreservesRuntime } from './connectionGuards';
 import {nativeMutations} from './nativeTransport';
 import {NativeOperationError} from '../utils/nativeErrors';
+import { requireTunRoutingMode } from '../utils/appPolicies';
 import { buildServerRuntimeFingerprint } from '../utils/serverIdentity';
 import { withSubscriptionUserinfo } from '../utils/subscriptionMetadata';
 import type { RemoteSubscriptionResponse } from './runtime';
@@ -1220,6 +1221,7 @@ export class RemnawaveClient {
       probeAfterConnect?: boolean;
       tunnelMode?: TunnelMode;
       tunRoutingMode?: 'all' | 'selected' | 'exclude';
+      tunRoutingModeInvalid?: boolean;
       splitTunnelEntries?: SplitTunnelEntry[];
       routingExclusions?: RoutingExclusionSettings;
       ipStack?: IpStack;
@@ -1248,7 +1250,9 @@ export class RemnawaveClient {
     if (isTauriRuntime) {
       const networkMode = options.tunnelMode ?? 'proxy';
       const ipStack = options.ipStack ?? 'ipv4';
-      const tunRoutingMode = options.tunRoutingMode ?? 'selected';
+      const tunRoutingMode = networkMode === 'tun'
+        ? requireTunRoutingMode(options.tunRoutingMode, options.tunRoutingModeInvalid)
+        : options.tunRoutingMode;
       const activeSplitTunnelEntries = (options.splitTunnelEntries ?? []).filter((entry) => entry.enabled);
       let startedConfigPath: string | undefined;
 

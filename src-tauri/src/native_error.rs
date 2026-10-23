@@ -125,6 +125,8 @@ impl NativeFailure {
             "TUN_ELEVATION_REQUIRED" => "TUN_ELEVATION_REQUIRED",
             "TUN_IPV6_UNSUPPORTED" => "TUN_IPV6_UNSUPPORTED",
             "TUN_PROCESS_ENFORCEMENT_UNAVAILABLE" => "TUN_PROCESS_ENFORCEMENT_UNAVAILABLE",
+            "TUN_POLICY_REQUIRED" => "TUN_POLICY_REQUIRED",
+            "TUN_POLICY_INVALID" => "TUN_POLICY_INVALID",
             "REQUEST_IDENTITY" => "REQUEST_IDENTITY",
             "CONNECT_PREFLIGHT" => "CONNECT_PREFLIGHT",
             "PROXY_OWNER_CHANGED" => "PROXY_OWNER_CHANGED",
@@ -268,6 +270,8 @@ mod tests {
             ("RUNTIME_SUPERSEDED: anything", "RUNTIME_SUPERSEDED"),
             ("RUNTIME_BUSY: anything", "RUNTIME_BUSY"),
             ("TUN_ELEVATION_REQUIRED", "TUN_ELEVATION_REQUIRED"),
+            ("TUN_POLICY_REQUIRED", "TUN_POLICY_REQUIRED"),
+            ("TUN_POLICY_INVALID", "TUN_POLICY_INVALID"),
             ("arbitrary port operation string", "RUNTIME_CONNECT_FAILED"),
         ] {
             assert_eq!(

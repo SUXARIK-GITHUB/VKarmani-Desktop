@@ -57,8 +57,11 @@ export const defaultSettings: AppSettings = {
 };
 
 export function normalizeStoredSettings(value: unknown, hasLegacyRules = false): AppSettings {
-  if (!value || typeof value !== 'object') {
+  if (value === null || value === undefined) {
     return { ...defaultSettings, tunRoutingMode: hasLegacyRules ? 'selected' : 'all' };
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    return { ...defaultSettings, tunRoutingMode: 'selected', tunRoutingModeInvalid: true };
   }
 
   const candidate = value as Partial<AppSettings>;
@@ -81,7 +84,14 @@ export function normalizeStoredSettings(value: unknown, hasLegacyRules = false):
   ];
 
   const next: AppSettings = { ...defaultSettings, tunRoutingMode: hasLegacyRules ? 'selected' : 'all' };
-  if (candidate.tunRoutingMode === 'all' || candidate.tunRoutingMode === 'selected' || candidate.tunRoutingMode === 'exclude') next.tunRoutingMode = candidate.tunRoutingMode;
+  const validPolicy = candidate.tunRoutingMode === 'all' || candidate.tunRoutingMode === 'selected' || candidate.tunRoutingMode === 'exclude';
+  if (validPolicy) next.tunRoutingMode = candidate.tunRoutingMode!;
+  if (candidate.tunRoutingModeInvalid === true || (Object.prototype.hasOwnProperty.call(candidate, 'tunRoutingMode') && !validPolicy)) {
+    // Do not broaden corrupt settings to all, or lose quarantine on save/reload.
+    // Proxy stays usable; TUN requires an explicit policy selection in Settings.
+    next.tunRoutingMode = 'selected';
+    next.tunRoutingModeInvalid = true;
+  }
 
   for (const key of booleanKeys) {
     if (typeof candidate[key] === 'boolean') {
@@ -380,7 +390,9 @@ export async function loadPersistentSnapshot() {
   const entries = normalizeStoredRules(values[NATIVE_SPLIT_TUNNEL_KEY]);
   const favorites = values[NATIVE_FAVORITES_KEY];
   return {
-    settings: normalizeStoredSettings(values[NATIVE_SETTINGS_KEY], entries.length > 0),
+    settings: normalizeStoredSettings(
+      Object.prototype.hasOwnProperty.call(values, NATIVE_SETTINGS_KEY) && values[NATIVE_SETTINGS_KEY] === null
+        ? { tunRoutingModeInvalid: true } : values[NATIVE_SETTINGS_KEY], entries.length > 0),
     entries,
     favorites: Array.isArray(favorites) ? [...new Set(favorites.map(value => String(value ?? '').trim()).filter(Boolean))] : [],
     selected: typeof values[NATIVE_SELECTED_SERVER_KEY] === 'string' ? String(values[NATIVE_SELECTED_SERVER_KEY]).trim() : ''
@@ -660,13 +672,16 @@ export function loadSettings() {
 
   try {
     const rawValue = window.localStorage.getItem(SETTINGS_STORAGE);
-    if (!rawValue) {
+    if (rawValue === null) {
       return normalizeStoredSettings(null, loadSplitTunnelEntries().length > 0);
     }
 
-    return normalizeStoredSettings(JSON.parse(rawValue) as unknown, loadSplitTunnelEntries().length > 0);
+    const parsed: unknown = JSON.parse(rawValue);
+    return normalizeStoredSettings(parsed === null ? { tunRoutingModeInvalid: true } : parsed, loadSplitTunnelEntries().length > 0);
   } catch {
-    return normalizeStoredSettings(null, loadSplitTunnelEntries().length > 0);
+    // Unreadable/present corrupt state is not an empty first-run profile.
+    // Keep the original bytes and require an explicit TUN policy choice.
+    return normalizeStoredSettings({ tunRoutingModeInvalid: true });
   }
 }
 
@@ -680,7 +695,7 @@ export async function loadSettingsBackup() {
   const value = await loadNativeClientStateValue<unknown>(NATIVE_SETTINGS_KEY);
   const entries = await loadNativeClientStateValue<unknown>(NATIVE_SPLIT_TUNNEL_KEY);
   const hasLegacyRules = normalizeStoredRules(entries).length > 0;
-  return value || hasLegacyRules ? normalizeStoredSettings(value, hasLegacyRules) : null;
+  return value !== null && value !== undefined || hasLegacyRules ? normalizeStoredSettings(value, hasLegacyRules) : null;
 }
 
 export function loadSplitTunnelEntries() {

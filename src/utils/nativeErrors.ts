@@ -1,5 +1,7 @@
 import {tr,type UiLanguage} from '../i18n';
 const messages:Record<string,[string,string]>={
+  TUN_POLICY_REQUIRED:['Политика TUN не передана. В настройках явно выберите «Все приложения» или другую нужную политику; подключение не запускалось.','TUN policy is missing. Explicitly choose All applications or the intended policy in Settings; connection was not started.'],
+  TUN_POLICY_INVALID:['Сохранённая или переданная политика TUN повреждена. Выберите нужную политику заново в настройках; подключение не запускалось.','The saved or requested TUN policy is invalid. Select the intended policy again in Settings; connection was not started.'],
   CORE_FRAGMENT_SCHEMA_UNSUPPORTED:['Профиль содержит несколько или конфликтующие диапазоны fragmentation, которые Xray 26.4.25 не поддерживает. Профиль не упрощался; обратитесь к провайдеру.','The profile contains multiple or conflicting fragmentation ranges unsupported by Xray 26.4.25. The profile was not simplified; contact the provider.'],
   CORE_CONFIG_REJECTED:['Xray отклонил конфигурацию до запуска runtime.','Xray rejected the configuration before runtime launch.'],
   CORE_SPAWN_ACCESS_DENIED:['Windows запретил запуск Xray (код 5). Проверьте защиту Windows и права доступа.','Windows denied Xray launch (code 5). Check Windows security and access permissions.'],

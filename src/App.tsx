@@ -1887,6 +1887,7 @@ export default function App() {
   function connectionOptions(value:AppSettings=settingsRef.current):ConnectionOptions {
     return structuredClone({useSystemProxy:shouldUseSystemProxy(value.tunnelMode,value.useSystemProxy),probeAfterConnect:false,
       tunnelMode:value.tunnelMode,tunRoutingMode:value.tunRoutingMode,splitTunnelEntries:splitTunnelEntriesRef.current,
+      ...(value.tunRoutingModeInvalid ? { tunRoutingModeInvalid: true } : {}),
       ipStack:value.ipStack,routingExclusions:value.routingExclusions});
   }
 
@@ -2524,7 +2525,7 @@ export default function App() {
                 onToggleSetting={toggleSetting}
                 onTunnelModeChange={(value) => void handleTunnelModeChange(value)}
                 onIpStackChange={(value) => void handleIpStackChange(value)}
-                onTunRoutingModeChange={value => { settingsRef.current = { ...settingsRef.current, tunRoutingMode: value }; setSettings(current => ({ ...current, tunRoutingMode: value })); }}
+                onTunRoutingModeChange={value => { settingsRef.current = { ...settingsRef.current, tunRoutingMode: value, tunRoutingModeInvalid: undefined }; setSettings(current => ({ ...current, tunRoutingMode: value, tunRoutingModeInvalid: undefined })); }}
                 onLanguageChange={(value) => setSettings((current: AppSettings) => ({ ...current, language: value }))}
                 onRoutingExclusionsChange={(value) => {
                   settingsRef.current = { ...settingsRef.current, routingExclusions: value };
