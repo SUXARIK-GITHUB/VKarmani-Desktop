@@ -206,6 +206,62 @@ fn temporary_replace_conflict(error: &std::io::Error, destination: &Path) -> boo
             .is_err_and(|probe| matches!(probe.raw_os_error(), Some(32 | 33)))
 }
 
+#[cfg(windows)]
+fn rename_access_currently_available(source: &Path, destination: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let mut guards = Vec::new();
+    for path in [source, destination] {
+        let Ok(file) = OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+        else {
+            return false;
+        };
+        if check_state_file(&file).is_err()
+            || !file.metadata().is_ok_and(|m| !m.permissions().readonly())
+        {
+            return false;
+        }
+        guards.push(file);
+    }
+    true
+}
+
+#[cfg(windows)]
+fn replace_file_with_retry(
+    temporary: &Path,
+    destination: &Path,
+    mut replace: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut rechecked_access = false;
+    let mut result = replace(temporary, destination);
+    for pause in [10, 20, 40, 80] {
+        let Some(error) = result.as_ref().err() else {
+            return result;
+        };
+        let sharing = temporary_replace_conflict(error, destination);
+        // A reader can close between MoveFileExW's error5 and the sharing
+        // probe. Permit ONE reattempt only after exclusive DELETE access to
+        // both safe, non-readonly files is confirmed. Never retry arbitrary
+        // access denial or extend the existing bounded retry budget.
+        let available = !sharing
+            && !rechecked_access
+            && error.raw_os_error() == Some(5)
+            && rename_access_currently_available(temporary, destination);
+        if !sharing && !available {
+            return result;
+        }
+        rechecked_access |= available;
+        std::thread::sleep(Duration::from_millis(pause));
+        existing_state_target(destination)?;
+        result = replace(temporary, destination);
+    }
+    result
+}
+
 #[cfg(not(target_os = "windows"))]
 fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     fs::rename(source, destination)
@@ -253,19 +309,7 @@ pub(crate) fn atomic_write_state_text_with_limit(
         drop(file);
         #[cfg(windows)]
         {
-            let mut result = replace_file(&temporary, path);
-            for pause in [10, 20, 40, 80] {
-                if !result
-                    .as_ref()
-                    .is_err_and(|error| temporary_replace_conflict(error, path))
-                {
-                    return result;
-                }
-                std::thread::sleep(Duration::from_millis(pause));
-                existing_state_target(path)?;
-                result = replace_file(&temporary, path);
-            }
-            result
+            replace_file_with_retry(&temporary, path, replace_file)
         }
         #[cfg(not(windows))]
         replace_file(&temporary, path)
@@ -562,12 +606,24 @@ mod tests {
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .open(&target)
                 .unwrap();
-            let result = std::thread::scope(|scope| {
-                scope.spawn(move || {
-                    std::thread::sleep(Duration::from_millis(30));
-                    drop(reader);
-                });
-                atomic_write_state_text(&target, "new")
+            let temporary = directory.join("synthetic-new.tmp");
+            fs::write(&temporary, "new").unwrap();
+            let mut reader = Some(reader);
+            let mut attempts = 0;
+            // Release at the precise failing boundary, on the writer thread.
+            // A sleep in a sibling thread does not establish a short hold
+            // under CI load and misses the post-failure-probe race.
+            let result = replace_file_with_retry(&temporary, &target, |source, destination| {
+                attempts += 1;
+                let result = replace_file(source, destination);
+                if reader.is_some() {
+                    assert_eq!(
+                        result.as_ref().err().and_then(|e| e.raw_os_error()),
+                        Some(5)
+                    );
+                    drop(reader.take());
+                }
+                result
             });
             let actual = fs::read_to_string(&target).unwrap();
             fs::remove_file(target).unwrap();
@@ -577,7 +633,84 @@ mod tests {
                 "a short cooperative reader must recover: {result:?}"
             );
             assert_eq!(actual, "new");
+            assert_eq!(attempts, 2);
+            assert!(!temporary.exists());
         }
+    }
+    #[test]
+    #[cfg(windows)]
+    fn access_recheck_is_safe_bounded_and_never_becomes_generic_denial_retry() {
+        let directory = std::env::temp_dir().join(format!(
+            "vkarmani-recheck-{}",
+            crate::durable_state::random_state_id().unwrap()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join("old.dpapi");
+        let temporary = directory.join("new.tmp");
+        fs::write(&target, "old").unwrap();
+        fs::write(&temporary, "new").unwrap();
+        assert!(rename_access_currently_available(&temporary, &target));
+        let mut attempts = 0;
+        let result = replace_file_with_retry(&temporary, &target, |_, _| {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(attempts, 2);
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        assert_eq!(fs::read_to_string(&temporary).unwrap(), "new");
+        let linked = directory.join("linked.dpapi");
+        fs::hard_link(&target, &linked).unwrap();
+        assert!(!rename_access_currently_available(&temporary, &target));
+        fs::remove_file(linked).unwrap();
+        let original_permissions = fs::metadata(&target).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
+        permissions.set_readonly(true);
+        fs::set_permissions(&target, permissions.clone()).unwrap();
+        assert!(!rename_access_currently_available(&temporary, &target));
+        attempts = 0;
+        let result = replace_file_with_retry(&temporary, &target, |source, destination| {
+            attempts += 1;
+            replace_file(source, destination)
+        });
+        assert_eq!(attempts, 1);
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        fs::set_permissions(&target, original_permissions).unwrap();
+        fs::remove_file(target).unwrap();
+        fs::remove_file(temporary).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+    #[test]
+    #[cfg(windows)]
+    fn permanent_reader_keeps_original_and_the_existing_five_attempt_limit() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory = std::env::temp_dir().join(format!(
+            "vkarmani-bounded-sharing-{}",
+            crate::durable_state::random_state_id().unwrap()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join("old.dpapi");
+        let temporary = directory.join("new.tmp");
+        fs::write(&target, "old").unwrap();
+        fs::write(&temporary, "new").unwrap();
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&target)
+            .unwrap();
+        let mut attempts = 0;
+        let result = replace_file_with_retry(&temporary, &target, |source, destination| {
+            attempts += 1;
+            replace_file(source, destination)
+        });
+        assert_eq!(attempts, 5);
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        drop(reader);
+        fs::remove_file(target).unwrap();
+        fs::remove_file(temporary).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
     #[test]
     fn dpapi_round_trip_rejects_corruption_without_plaintext_fallback() {
