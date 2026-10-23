@@ -1,4 +1,14 @@
 import type { SplitTunnelEntry, SplitTunnelEntryKind, RoutingPolicy, TunRoutingMode } from '../types/vpn';
+import { NativeOperationError } from './nativeErrors';
+
+export function requireTunRoutingMode(value: unknown, quarantined = false): TunRoutingMode {
+  if (quarantined) throw new NativeOperationError('TUN_POLICY_INVALID', 'network', false, 'Choose a TUN application policy explicitly.');
+  if (value === undefined) throw new NativeOperationError('TUN_POLICY_REQUIRED', 'network', false, 'Choose a TUN application policy explicitly.');
+  if (value !== 'all' && value !== 'selected' && value !== 'exclude') {
+    throw new NativeOperationError('TUN_POLICY_INVALID', 'network', false, 'Choose a TUN application policy explicitly.');
+  }
+  return value;
+}
 
 export const MAX_APP_RULES = 256;
 export function normalizeRuleValue(kind: SplitTunnelEntryKind, value: string, legacy = false): string {

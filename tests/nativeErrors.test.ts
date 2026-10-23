@@ -3,6 +3,13 @@ import {autostartStatusLabel,NativeOperationError,structuredNativeError} from '.
 import {normalizeNativeError} from '../src/services/runtime';
 
 describe('R12/R43 confirmed autostart and structured native failures',()=>{
+  it.each(['TUN_POLICY_REQUIRED','TUN_POLICY_INVALID'])('keeps %s actionable and private in both languages',code=>{
+    for(const language of ['ru','en'] as const){
+      const error=structuredNativeError({code,category:'network',retryable:false,message:'private settings'},'fallback',language)!;
+      expect(error.code).toBe(code);expect(error.message).not.toContain('private settings');
+      expect(error.message).toContain(language==='ru'?'настройк':'Settings');
+    }
+  });
   it.each(['ru','en'] as const)('keeps partial repair truthful and localized without raw backend data in %s',language=>{
     const error=structuredNativeError({code:'REPAIR_PARTIAL_ROUTES_UNCONFIRMED',category:'network',retryable:false,details:'private PAC'},'fallback',language)!;
     expect(error.code).toBe('REPAIR_PARTIAL_ROUTES_UNCONFIRMED');expect(error.retryable).toBe(false);expect(error.message).not.toContain('private');expect(error.message).toContain(language==='ru'?'не подтверждена':'not confirmed');

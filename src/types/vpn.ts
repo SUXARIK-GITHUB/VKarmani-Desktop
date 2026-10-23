@@ -294,6 +294,8 @@ export interface AppSettings {
   themeGlow: boolean;
   sortServersByPing: boolean;
   tunRoutingMode: TunRoutingMode;
+  // Quarantine a corrupt persisted policy until an explicit user selection.
+  tunRoutingModeInvalid?: boolean;
   releaseChannel: ReleaseChannel;
   protocolStrategy: 'auto' | 'reality-first' | 'xray-only';
   profileSyncOnLogin: boolean;

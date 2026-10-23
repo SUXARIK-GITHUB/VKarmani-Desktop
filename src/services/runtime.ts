@@ -22,6 +22,7 @@ import type {
 } from '../types/vpn';
 import { buildServerRuntimeFingerprint } from '../utils/serverIdentity';
 import { canonicalJson } from '../utils/canonicalJson';
+import { requireTunRoutingMode } from '../utils/appPolicies';
 
 const tauriWindow = typeof window !== 'undefined'
   ? (window as Window & { __TAURI_INTERNALS__?: unknown; __TAURI__?: unknown })
@@ -260,8 +261,9 @@ export async function requestNativeConnect(
   ipStack: IpStack = 'ipv4',
   reconnect = false,
   routingExclusions?: RoutingExclusionSettings,
-  tunRoutingMode: 'all' | 'selected' | 'exclude' = 'selected'
+  tunRoutingMode?: 'all' | 'selected' | 'exclude'
 ) {
+  if (networkMode === 'tun') requireTunRoutingMode(tunRoutingMode);
   if (!isTauriRuntime) {
     return getNativeRuntimeStatus();
   }

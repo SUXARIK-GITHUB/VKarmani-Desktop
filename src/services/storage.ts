@@ -81,7 +81,14 @@ export function normalizeStoredSettings(value: unknown, hasLegacyRules = false):
   ];
 
   const next: AppSettings = { ...defaultSettings, tunRoutingMode: hasLegacyRules ? 'selected' : 'all' };
-  if (candidate.tunRoutingMode === 'all' || candidate.tunRoutingMode === 'selected' || candidate.tunRoutingMode === 'exclude') next.tunRoutingMode = candidate.tunRoutingMode;
+  const validPolicy = candidate.tunRoutingMode === 'all' || candidate.tunRoutingMode === 'selected' || candidate.tunRoutingMode === 'exclude';
+  if (validPolicy) next.tunRoutingMode = candidate.tunRoutingMode!;
+  if (candidate.tunRoutingModeInvalid === true || (Object.prototype.hasOwnProperty.call(candidate, 'tunRoutingMode') && !validPolicy)) {
+    // Do not broaden corrupt settings to all, or lose quarantine on save/reload.
+    // Proxy stays usable; TUN requires an explicit policy selection in Settings.
+    next.tunRoutingMode = 'selected';
+    next.tunRoutingModeInvalid = true;
+  }
 
   for (const key of booleanKeys) {
     if (typeof candidate[key] === 'boolean') {

@@ -1,5 +1,5 @@
-//! Reject malformed IPC modes before preflight/teardown. Missing legacy fields
-//! retain their documented defaults; supplied unknown values never downgrade.
+//! Reject malformed IPC modes before preflight/teardown. TUN policy requires an
+//! explicit choice; other missing legacy fields retain their documented defaults.
 use super::*;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -37,18 +37,21 @@ impl NetworkMode {
     pub(crate) fn require_process_enforcement(
         self,
         policy_mode: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<&str, String> {
         if self == Self::Tun {
-            match policy_mode.unwrap_or("selected") {
+            match policy_mode {
                 // Xray26.4.25 returns false on lookup failure. The selected
                 // fallback DIRECT can expose protected traffic; no approved
                 // OS enforcement backend exists yet.
-                "selected" => return Err("TUN_PROCESS_ENFORCEMENT_UNAVAILABLE".into()),
-                "all" | "exclude" => {}
-                _ => return Err("RULE_MODE_UNSUPPORTED".into()),
+                Some("selected") => return Err("TUN_PROCESS_ENFORCEMENT_UNAVAILABLE".into()),
+                Some("all" | "exclude") => {}
+                None => return Err("TUN_POLICY_REQUIRED".into()),
+                _ => return Err("TUN_POLICY_INVALID".into()),
             }
         }
-        Ok(())
+        // The legacy fallback is reachable only for Proxy. TUN must have an
+        // explicit valid policy above; never invent selected or broaden to all.
+        Ok(policy_mode.unwrap_or("selected"))
     }
     pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
         match token(value, "proxy", "NETWORK_MODE_INVALID")?.as_str() {
@@ -108,14 +111,18 @@ mod tests {
     }
     #[test]
     fn selected_tun_fails_before_runtime_admission_without_os_enforcement() {
-        for policy in [None, Some("selected")] {
-            assert_eq!(
-                NetworkMode::Tun
-                    .require_process_enforcement(policy)
-                    .unwrap_err(),
-                "TUN_PROCESS_ENFORCEMENT_UNAVAILABLE"
-            );
-        }
+        assert_eq!(
+            NetworkMode::Tun
+                .require_process_enforcement(Some("selected"))
+                .unwrap_err(),
+            "TUN_PROCESS_ENFORCEMENT_UNAVAILABLE"
+        );
+        assert_eq!(
+            NetworkMode::Tun
+                .require_process_enforcement(None)
+                .unwrap_err(),
+            "TUN_POLICY_REQUIRED"
+        );
         for policy in [Some("all"), Some("exclude")] {
             NetworkMode::Tun
                 .require_process_enforcement(policy)
@@ -126,7 +133,7 @@ mod tests {
                 NetworkMode::Tun
                     .require_process_enforcement(policy)
                     .unwrap_err(),
-                "RULE_MODE_UNSUPPORTED"
+                "TUN_POLICY_INVALID"
             );
         }
         NetworkMode::Proxy

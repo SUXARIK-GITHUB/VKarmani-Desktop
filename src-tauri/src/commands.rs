@@ -747,12 +747,13 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         requested_generation,
     } = request;
     // Reject malformed supplied modes before authorization/storage reads,
-    // operation admission or core discovery. Missing legacy fields keep defaults.
-    let normalized_network_mode = NetworkMode::parse(network_mode.as_deref())?
-        .as_str()
-        .to_string();
-    NetworkMode::parse(Some(&normalized_network_mode))?
-        .require_process_enforcement(tun_routing_mode.as_deref())?;
+    // operation admission or core discovery. TUN requires an explicit policy;
+    // missing non-policy legacy fields keep their defaults.
+    let mode = NetworkMode::parse(network_mode.as_deref())?;
+    let normalized_network_mode = mode.as_str().to_string();
+    let policy_mode = mode
+        .require_process_enforcement(tun_routing_mode.as_deref())
+        .map_err(|error| crate::native_error::ConnectStage::Preflight.wrap(&error))?;
     let normalized_ip_stack = NetworkIpStack::parse(ip_stack.as_deref())?
         .as_str()
         .to_string();
@@ -787,7 +788,6 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
 
     let reconnect_requested = reconnect.unwrap_or(false);
 
-    let policy_mode = tun_routing_mode.as_deref().unwrap_or("selected");
     let stored_entries = split_tunnel_entries.unwrap_or_default();
     let active_split_tunnel_entries = if normalized_network_mode == "tun" {
         active_policy_entries(&stored_entries, policy_mode)
