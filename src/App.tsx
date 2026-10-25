@@ -147,6 +147,8 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
   const operationManager = useOperationManager();
   const [persistentStateReady, setPersistentStateReady] = useState(!isTauriRuntime);
   const [recoveryMode, setRecoveryMode] = useState(safeStart);
+  const recoveryModeRef = useRef(safeStart);
+  const recoveryEpochRef = useRef(0);
   const [storageIssue, setStorageIssue] = useState<NativeStorageError | null>(null);
   const [storageRecoveryBusy, setStorageRecoveryBusy] = useState(false);
   const [storageRecoveryToken, setStorageRecoveryToken] = useState<string | null>(null);
@@ -316,12 +318,14 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
   }
 
   function reportPersistentFailure(error: unknown) {
+    recoveryEpochRef.current++;
+    recoveryModeRef.current = true;
     setStorageIssue(storageFailure(error)); setRecoveryMode(true);
   }
 
   async function handleStorageRecovery(confirmBackup = false) {
     if (storageRecoveryLock.current) return;
-    storageRecoveryLock.current = true; setStorageRecoveryBusy(true); setRecoveryMode(true);
+    storageRecoveryLock.current = true; recoveryEpochRef.current++; recoveryModeRef.current = true; setStorageRecoveryBusy(true); setRecoveryMode(true);
     try {
       if (!confirmBackup) {
         const preview = await inspectPersistentRecovery();
@@ -340,9 +344,12 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
   }
 
   useEffect(() => {
+    // StrictMode replays setup/cleanup on the initial mount. Real unmount
+    // blocks any older async callback before a safe retry mounts a new App.
+    recoveryModeRef.current = recoveryMode;
     const handler = (event: Event) => reportPersistentFailure((event as CustomEvent).detail);
     window.addEventListener('vkarmani:storage-error', handler);
-    return () => window.removeEventListener('vkarmani:storage-error', handler);
+    return () => { recoveryEpochRef.current++; recoveryModeRef.current = true; window.removeEventListener('vkarmani:storage-error', handler); };
   }, []);
 
   useEffect(() => {
@@ -1988,6 +1995,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       return;
     }
 
+    const recoveryEpoch = recoveryEpochRef.current;
     try {
       const currentSettings = settingsRef.current;
       void writeNativeInterfaceLog(connectFavoriteAfterLaunch ? 'Начата авторизация по сохранённому ключу для автоподключения.' : 'Начата авторизация по ключу доступа.');
@@ -1995,13 +2003,15 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       setErrorText('');
       setAccessKey(normalizedAccessKey);
       const response = await remnawaveClient.authorizeByAccessKey(normalizedAccessKey, currentSettings.allowDemoFallback);
-      authorizedAccessKeyRef.current = normalizedAccessKey;
-      setSession(response);
+      if (recoveryEpoch !== recoveryEpochRef.current) return;
       const nextDevices = await remnawaveClient.loadDevices();
-      setDevices(nextDevices);
+      if (recoveryEpoch !== recoveryEpochRef.current) return;
       const keyPersisted = await saveStoredAccessKey(normalizedAccessKey);
-      setIsAuthorized(true);
+      if (recoveryEpoch !== recoveryEpochRef.current) return;
       const nativeSessionReady = await setNativeSessionAuthorized(true);
+      if (recoveryEpoch !== recoveryEpochRef.current) return;
+      authorizedAccessKeyRef.current = normalizedAccessKey;
+      setSession(response); setDevices(nextDevices); setIsAuthorized(true);
 
       if (!connectFavoriteAfterLaunch) {
         pushToast(tr(language, 'Ключ доступа принят.', 'Access key accepted.'), 'success');
@@ -2022,6 +2032,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
 
       overviewAutoRefreshAtRef.current = Date.now();
       let serverPool = mergeServerMeasurements(await remnawaveClient.loadServers(), serversRef.current);
+      if (recoveryEpoch !== recoveryEpochRef.current) return;
       if (serverPool.length) {
         serversRef.current = serverPool;
         setServers(serverPool);
@@ -2047,6 +2058,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       const syncResult = shouldRunLoginSync
         ? await handleSyncProfile(true, normalizedAccessKey)
         : null;
+      if (recoveryEpoch !== recoveryEpochRef.current) return;
       if (syncResult?.servers) {
         serverPool = syncResult.servers;
         saveLastKnownServers(syncResult.servers);
@@ -2059,7 +2071,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         }));
       }
 
-      if (!recoveryMode && connectFavoriteAfterLaunch) {
+      if (!recoveryModeRef.current && connectFavoriteAfterLaunch) {
         const favoriteServer = favoriteServerIdsRef.current
           .map((id) => serverPool.find((server: VpnServer) => server.id === id && server.runtimeTemplate) ?? serverPool.find((server: VpnServer) => server.id === id))
           .find((server): server is VpnServer => Boolean(server));
@@ -2074,7 +2086,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         }
       }
 
-      if (!recoveryMode && (currentSettings.autoConnect || connectFavoriteAfterLaunch) && preferredServerForAutoConnect) {
+      if (!recoveryModeRef.current && (currentSettings.autoConnect || connectFavoriteAfterLaunch) && preferredServerForAutoConnect) {
         void handleConnectionToggle(preferredServerForAutoConnect);
       }
     } catch (error) {
@@ -2611,7 +2623,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         pushToast(`${tr(language, 'Найдено обновление', 'Update found')} ${result.version}`, 'info');
       }
 
-      if (autoInstall && isTauriRuntime) {
+      if (autoInstall && isTauriRuntime && !recoveryModeRef.current) {
         await handleInstallUpdate(true);
       }
 
@@ -2626,6 +2638,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
   }
 
   async function handleInstallUpdate(silent = false) {
+    if (silent && recoveryModeRef.current) return;
     if (!persistentStateReady || updaterActionLock.current || isConnectionActionBusy() || ['checking', 'downloading', 'installing'].includes(updateInfoRef.current.status)) {
       return;
     }
@@ -2650,6 +2663,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
           message: percent >= 100 ? tr(language, 'Файлы загружены, запускаем установку…', 'Files are ready, starting installation…') : tr(language, 'Скачиваем обновление…', 'Downloading update…')
         }));
       }, async () => {
+        if (silent && recoveryModeRef.current) throw new Error(tr(language, 'Автоматическая установка отложена: включён режим восстановления.', 'Automatic installation deferred: recovery mode is active.'));
         // Download/signature verification and state flush are complete. Reserve
         // connection commands across the fresh observation and installer handoff.
         if (isConnectionActionBusy()) throw new Error(tr(language, 'Завершите текущее VPN-действие и повторите установку.', 'Finish the current VPN operation and retry installation.'));

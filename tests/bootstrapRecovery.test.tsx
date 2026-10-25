@@ -6,7 +6,7 @@ import { expect, it, vi } from 'vitest';
 import { RootErrorBoundary } from '../src/components/RootErrorBoundary';
 import { StorageRecoveryNotice } from '../src/components/StorageRecoveryNotice';
 import { LogoutConfirmModal } from '../src/components/LogoutConfirmModal';
-import { NativeStorageError } from '../src/services/nativeState';
+import { NativeStorageError, storageFailure } from '../src/services/nativeState';
 import { connectionFailureState } from '../src/utils/runtimeSnapshot';
 
 const appSource = ts.createSourceFile('App.tsx', readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -52,7 +52,7 @@ it('initial storage failure blocks authorization before remote validation withou
 it('backup preview never restores; explicit confirmation passes only the reviewed token; duplicates are ignored', async () => {
   const token = 'a'.repeat(64); const reload = vi.fn().mockResolvedValue({ selected: 'saved' }); const apply = vi.fn();
   const preview = vi.fn().mockResolvedValue({ readOnly: true, token }); const setToken = vi.fn(); const safe = vi.fn();
-  const common = { storageRecoveryLock: { current: false }, setStorageRecoveryBusy: vi.fn(), setRecoveryMode: safe,
+  const common = { storageRecoveryLock: { current: false }, recoveryEpochRef: { current: 0 }, recoveryModeRef: { current: false }, setStorageRecoveryBusy: vi.fn(), setRecoveryMode: safe,
     inspectPersistentRecovery: preview, reloadPersistentSnapshot: reload, applyRestoredPersistentState: apply,
     setStorageIssue: vi.fn(), setStorageRecoveryToken: setToken, reportPersistentFailure: vi.fn(), NativeStorageError: Error };
   await appFunction('handleStorageRecovery', { ...common, storageRecoveryToken: null })(false);
@@ -67,7 +67,7 @@ it('backup preview never restores; explicit confirmation passes only the reviewe
 it('failed recovery retains the storage error, clears stale consent and releases the busy lock', async () => {
   const failure = new Error('STATE_RECOVERY_CHANGED'); const report = vi.fn(); const setToken = vi.fn();
   const lock = { current: false }; const busy = vi.fn(); const apply = vi.fn(); const clearIssue = vi.fn();
-  await appFunction('handleStorageRecovery', { storageRecoveryLock: lock, setStorageRecoveryBusy: busy,
+  await appFunction('handleStorageRecovery', { storageRecoveryLock: lock, recoveryEpochRef: { current: 0 }, recoveryModeRef: { current: false }, setStorageRecoveryBusy: busy,
     setRecoveryMode: vi.fn(), storageRecoveryToken: 'a'.repeat(64), inspectPersistentRecovery: vi.fn(),
     reloadPersistentSnapshot: vi.fn().mockRejectedValue(failure), applyRestoredPersistentState: apply,
     setStorageIssue: clearIssue, setStorageRecoveryToken: setToken, reportPersistentFailure: report, NativeStorageError: Error })(true);
@@ -149,4 +149,77 @@ it.each(['ru', 'en'] as const)('logout consent names data scope and offers cance
   const html = renderToStaticMarkup(<LogoutConfirmModal open language={language} busy={false} onCancel={vi.fn()} onConfirm={vi.fn()} />);
   expect(html).toContain('role="dialog"'); expect(html).toContain(language === 'ru' ? 'Отмена' : 'Cancel');
   expect(html).toContain(language === 'ru' ? 'Настройки и правила приложений останутся' : 'Settings and app rules will remain');
+});
+
+it.each([false, true])('late login uses current recovery admission while preserving healthy autoconnect: recovery=%s', async recovery => {
+  let release!: (servers: unknown[]) => void;
+  const server = { id: 'saved', runtimeTemplate: { family: 'xray', outbound: {} } };
+  const loadServers = vi.fn(() => new Promise<unknown[]>(resolve => { release = resolve; }));
+  const automatic = { current: false }; const connect = vi.fn(); const error = vi.fn();
+  const bindings: Record<string, any> = { isTauriRuntime: true, persistentStateReady: true, recoveryEpochRef: { current: 0 }, recoveryMode: false, recoveryModeRef: automatic,
+    settingsRef: { current: { autoConnect: true, allowDemoFallback: false, profileSyncOnLogin: false } },
+    remnawaveClient: { authorizeByAccessKey: vi.fn().mockResolvedValue({}), loadDevices: vi.fn().mockResolvedValue([]), loadServers, getProfileSyncInfo: vi.fn() },
+    authorizedAccessKeyRef: { current: '' }, overviewAutoRefreshAtRef: { current: 0 }, serversRef: { current: [] },
+    selectedServerIdRef: { current: server.id }, selectedServer: server, mergeServerMeasurements: (values: unknown[]) => values,
+    saveStoredAccessKey: vi.fn().mockResolvedValue(true), setNativeSessionAuthorized: vi.fn().mockResolvedValue(true),
+    pickPreferredServer: () => server, handleConnectionToggle: connect, setErrorText: error,
+    tr: (_: unknown, ru: string) => ru, language: 'ru', normalizeNativeError: (e: Error) => e };
+  for (const name of ['writeNativeInterfaceLog','setAuthLoading','setAccessKey','setSession','setDevices','setIsAuthorized',
+    'pushToast','setServers','saveLastKnownServers','setFavoriteServerIds','setProfileSyncInfo','setSelectedServerId']) bindings[name] = vi.fn();
+  const pending = appFunction('authorizeWithAccessKey', bindings)('https://sub.vkarmani.com/synthetic');
+  await vi.waitFor(() => expect(loadServers).toHaveBeenCalled());
+  automatic.current = recovery; release([server]); await pending;
+  expect(error.mock.calls).toEqual([['']]); expect(bindings.setProfileSyncInfo).toHaveBeenCalled();
+  expect(connect).toHaveBeenCalledTimes(recovery ? 0 : 1);
+});
+
+it.each(['response', 'devices'] as const)('recovery invalidates a pending login before it can overwrite the restored key: %s', async phase => {
+  let release!: (value: unknown) => void; const epoch = { current: 0 }; const save = vi.fn().mockResolvedValue(true); const setSession = vi.fn();
+  const deferred = () => new Promise(resolve => { release = resolve; });
+  const client = { authorizeByAccessKey: vi.fn(phase === 'response' ? deferred : async () => ({})),
+    loadDevices: vi.fn(phase === 'devices' ? deferred : async () => []), loadServers: vi.fn().mockResolvedValue([]) };
+  const error = vi.fn();
+  const pending = appFunction('authorizeWithAccessKey', { isTauriRuntime: true, persistentStateReady: true, recoveryEpochRef: epoch,
+    recoveryModeRef: { current: true }, settingsRef: { current: {} }, remnawaveClient: client,
+    writeNativeInterfaceLog: vi.fn(), setAuthLoading: vi.fn(), setErrorText: error, setAccessKey: vi.fn(),
+    authorizedAccessKeyRef: { current: '' }, setSession, setDevices: vi.fn(), saveStoredAccessKey: save,
+    setIsAuthorized: vi.fn(), setNativeSessionAuthorized: vi.fn().mockResolvedValue(true),
+    tr: (_: unknown, ru: string) => ru, language: 'ru', normalizeNativeError: (e: Error) => e, pushToast: vi.fn() })('https://sub.vkarmani.com/synthetic');
+  if (phase === 'devices') await vi.waitFor(() => expect(client.loadDevices).toHaveBeenCalled());
+  epoch.current++; release(phase === 'response' ? {} : []); await pending;
+  expect(save).not.toHaveBeenCalled(); expect(setSession).not.toHaveBeenCalled(); expect(error.mock.calls).toEqual([['']]);
+});
+
+it.each([false, true])('late update check respects current recovery admission: recovery=%s', async recovery => {
+  let release!: (result: unknown) => void; const automatic = { current: false }; const install = vi.fn();
+  const result = { status: 'available', available: true, version: 'synthetic' };
+  const check = vi.fn(() => new Promise(resolve => { release = resolve; }));
+  const pending = appFunction('handleCheckUpdates', { updateInfoRef: { current: { status: 'idle' } }, setUpdateInfo: vi.fn(),
+    setNativeTrayUpdateState: vi.fn(), checkForUpdates: check, settings: { releaseChannel: 'stable' },
+    recoveryModeRef: automatic, isTauriRuntime: true, handleInstallUpdate: install, writeNativeInterfaceLog: vi.fn(),
+    tr: (_: unknown, ru: string) => ru, language: 'ru' })(true, true);
+  automatic.current = recovery; release(result); expect(await pending).toBe(result);
+  expect(install).toHaveBeenCalledTimes(recovery ? 0 : 1);
+});
+
+it('the actual recovery listener revokes pending automatic work immediately, supports StrictMode replay and revokes on unmount', () => {
+  let effect: ts.ArrowFunction | undefined;
+  const find = (node: ts.Node) => {
+    if (ts.isCallExpression(node) && node.expression.getText(appSource) === 'useEffect' && node.arguments[0]
+      && ts.isArrowFunction(node.arguments[0]) && node.arguments[0].getText(appSource).includes("addEventListener('vkarmani:storage-error'")) effect = node.arguments[0];
+    ts.forEachChild(node, find);
+  }; find(appSource); expect(effect).toBeDefined();
+  const ref = { current: false }; const setMode = vi.fn(); const setIssue = vi.fn();
+  const epoch = { current: 0 };
+  const report = appFunction('reportPersistentFailure', { recoveryEpochRef: epoch, recoveryModeRef: ref, storageFailure, setStorageIssue: setIssue, setRecoveryMode: setMode });
+  let listener!: (event: unknown) => void;
+  const bindings = { recoveryMode: false, recoveryEpochRef: epoch, recoveryModeRef: ref, reportPersistentFailure: report,
+    window: { addEventListener: (_: string, callback: typeof listener) => { listener = callback; }, removeEventListener: vi.fn() } };
+  const js = ts.transpileModule('const effect=' + effect!.getText(appSource), { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
+  const setup = new Function('bindings', 'const {' + Object.keys(bindings).join(',') + '}=bindings;' + js + ';return effect;')(bindings);
+  const firstCleanup = setup(); expect(ref.current).toBe(false); firstCleanup(); expect(ref.current).toBe(true);
+  const cleanup = setup(); expect(ref.current).toBe(false);
+  listener({ detail: new NativeStorageError('STATE_WRITE_FAILED', 'synthetic') });
+  expect(ref.current).toBe(true); expect(setMode).toHaveBeenCalledWith(true); expect(setIssue).toHaveBeenCalled();
+  cleanup(); expect(ref.current).toBe(true);
 });

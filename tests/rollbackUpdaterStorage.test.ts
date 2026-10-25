@@ -45,8 +45,11 @@ it.each([
   { label: 'unavailable', active: false, runtime: null, installAllowed: false },
   { label: 'unverified bridge', active: false, runtime: { bridge: 'web-preview', tunnelActive: false }, installAllowed: false },
   { label: 'native operation', active: false, runtime: { bridge: 'tauri', tunnelActive: false, operation: { kind: 'connect' } }, installAllowed: false },
-  { label: 'live PID despite idle UI', active: false, runtime: { bridge: 'tauri', tunnelActive: false, xrayPid: 999 }, installAllowed: false }
-])('actual App installer preserves connections and checks $label state', async ({ active, runtime, installAllowed }) => {
+  { label: 'live PID despite idle UI', active: false, runtime: { bridge: 'tauri', tunnelActive: false, xrayPid: 999 }, installAllowed: false },
+  { label: 'recovery before download', active: false, runtime: { bridge: 'tauri', tunnelActive: false }, installAllowed: false },
+  { label: 'recovery during download', active: false, runtime: { bridge: 'tauri', tunnelActive: false }, installAllowed: false },
+  { label: 'automatic idle', active: false, runtime: { bridge: 'tauri', tunnelActive: false }, installAllowed: true }
+])('actual App installer preserves connections and checks $label state', async ({ label, active, runtime, installAllowed }) => {
   const source = ts.createSourceFile('App.tsx', readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   let handler: ts.FunctionDeclaration | undefined;
   const visit = (node: ts.Node) => {
@@ -56,12 +59,13 @@ it.each([
   const disconnect = vi.fn();
   const install = vi.fn();
   const close = vi.fn().mockResolvedValue(undefined);
-  mocks.check.mockResolvedValue({ download: vi.fn(async () => undefined), install, close });
+  const recoveryModeRef = { current: label === 'recovery before download' };
+  mocks.check.mockResolvedValue({ download: vi.fn(async () => { if (label === 'recovery during download') recoveryModeRef.current = true; }), install, close });
   const storage = await import('../src/services/storage'); await storage.loadPersistentSnapshot();
   const updater = await import('../src/services/updater');
   const connectionLease = { current: false };
   const bindings = {
-    persistentStateReady: true, updaterActionLock: { current: false }, connectionActionLock: connectionLease,
+    persistentStateReady: true, recoveryModeRef, updaterActionLock: { current: false }, connectionActionLock: connectionLease,
     updateInfoRef: { current: { status: 'available', available: true } }, setNativeTrayUpdateState: vi.fn(),
     isTauriRuntime: true, connectionStateRef: { current: active ? 'connected' : 'idle' },
     setUpdateInfo: vi.fn(), tr: (_: string, ru: string) => ru, language: 'ru',
@@ -73,10 +77,12 @@ it.each([
   };
   const js = ts.transpileModule(handler!.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
   const run = new Function('bindings', 'const {' + Object.keys(bindings).join(',') + '}=bindings;' + js + ';return handleInstallUpdate;')(bindings);
-  await run(false);
+  await run(label.startsWith('recovery') || label === 'automatic idle');
   expect(disconnect).not.toHaveBeenCalled();
   expect(install).toHaveBeenCalledTimes(installAllowed ? 1 : 0);
   expect(connectionLease.current).toBe(installAllowed);
+  expect(close).toHaveBeenCalledTimes(label === 'recovery before download' ? 0 : 1);
+  expect(document.body.inert).toBe(installAllowed);
 });
 
 it('does not check installation policy or run installer after signature/download failure', async () => {
