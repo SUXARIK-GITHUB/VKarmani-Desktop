@@ -1,6 +1,7 @@
 import type { ReleaseChannel, UpdateInfo } from '../types/vpn';
 import { appVersion, isTauriRuntime } from './runtime';
 import { quiescePersistentWrites, resumePersistentWrites } from './storage';
+import type { Update } from '@tauri-apps/plugin-updater';
 
 const wait = (value: number) => new Promise<void>((resolve) => window.setTimeout(resolve, value));
 
@@ -48,15 +49,19 @@ export async function checkForUpdates(channel: ReleaseChannel): Promise<UpdateIn
         };
       }
 
-      return {
-        available: true,
-        currentVersion: update.currentVersion,
-        version: update.version,
-        notes: update.body ?? 'Доступно новое обновление VKarmani Desktop.',
-        publishedAt: update.date,
-        source: 'tauri',
-        status: 'available'
-      };
+      try {
+        return {
+          available: true,
+          currentVersion: update.currentVersion,
+          version: update.version,
+          notes: update.body ?? 'Доступно новое обновление VKarmani Desktop.',
+          publishedAt: update.date,
+          source: 'tauri',
+          status: 'available'
+        };
+      } finally {
+        await update.close().catch(() => undefined);
+      }
     } catch (error) {
       return {
         available: false,
@@ -80,14 +85,16 @@ export async function checkForUpdates(channel: ReleaseChannel): Promise<UpdateIn
 }
 
 export async function installAvailableUpdate(
-  onProgress: (percent: number) => void
+  onProgress: (percent: number) => void,
+  beforeInstall?: () => Promise<void>
 ): Promise<{ ok: true } | { ok: false; message: string }> {
   if (isTauriRuntime) {
     let interactionRoot: HTMLElement | null = null;
     let previousInert = false;
+    let update: Update | null = null;
     try {
       const { check } = await import('@tauri-apps/plugin-updater');
-      const update = await check({ timeout: 15000 });
+      update = await check({ timeout: 15000 });
 
       if (!update) {
         return { ok: false, message: 'Новой версии не найдено.' };
@@ -131,12 +138,17 @@ export async function installAvailableUpdate(
       previousInert = interactionRoot?.inert ?? false;
       if (interactionRoot) interactionRoot.inert = true;
       await quiescePersistentWrites();
+      await beforeInstall?.();
       await update.install();
       return { ok: true };
     } catch (error) {
       if (interactionRoot) interactionRoot.inert = previousInert;
       resumePersistentWrites();
       return { ok: false, message: normalizeUpdaterError(error) };
+    } finally {
+      // Failed downloads/policy/flush must also release SDK byte resources.
+      // Successful Windows install may already have consumed the handles.
+      await update?.close().catch(() => undefined);
     }
   }
 
