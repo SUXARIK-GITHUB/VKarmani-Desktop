@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-const native = vi.hoisted(() => ({ connect: vi.fn(), proxy: vi.fn(), rollback: vi.fn(), disconnect: vi.fn() }));
+const native = vi.hoisted(() => ({ connect: vi.fn(), proxy: vi.fn(), rollback: vi.fn(), disconnect: vi.fn(), flush: vi.fn() }));
+vi.mock('../src/services/storage', () => ({ flushPersistentWrites: native.flush }));
 vi.mock('../src/services/runtime', async importOriginal => ({ ...await importOriginal<Record<string, unknown>>(),
   isTauriRuntime: true, requestNativeConnect: native.connect, setNativeSystemProxy: native.proxy,
   rollbackFailedNativeConnect: native.rollback, requestNativeDisconnect: native.disconnect,
@@ -10,8 +11,23 @@ import { remnawaveClient } from '../src/services/remnawave';
 import { buildServerRuntimeFingerprint } from '../src/utils/serverIdentity';
 const [server] = parse(JSON.stringify(auto));
 const status = () => ({ lastPreparedServerId: server.id, lastPreparedServerFingerprint: buildServerRuntimeFingerprint(server), configPath: 'owned-B.json' });
-beforeEach(() => { vi.clearAllMocks(); native.proxy.mockResolvedValue({ enabled: true }); native.rollback.mockResolvedValue({ tunnelActive: false }); });
+beforeEach(() => { vi.clearAllMocks(); native.flush.mockResolvedValue(undefined); native.proxy.mockResolvedValue({ enabled: true }); native.rollback.mockResolvedValue({ tunnelActive: false }); });
 describe('native connect cleanup is scoped to the exact returned runtime', () => {
+  it.each(['STATE_WRITE_PENDING', 'STATE_CONFLICT', 'STATE_RESTORE_BLOCKED'])('preserves the existing connection when saving is unconfirmed: %s', async code => {
+    native.flush.mockRejectedValueOnce(new Error(code));
+    await expect(remnawaveClient.connect(server, { reconnect: true, useSystemProxy: true })).rejects.toThrow(code);
+    expect(native.connect).not.toHaveBeenCalled(); expect(native.proxy).not.toHaveBeenCalled();
+    expect(native.rollback).not.toHaveBeenCalled(); expect(native.disconnect).not.toHaveBeenCalled();
+  });
+  it('waits for durable save before starting or replacing a runtime', async () => {
+    let release!: () => void;
+    native.flush.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    native.connect.mockResolvedValueOnce(status());
+    const pending = remnawaveClient.connect(server);
+    await vi.waitFor(() => expect(native.flush).toHaveBeenCalled());
+    expect(native.connect).not.toHaveBeenCalled(); release();
+    await pending; expect(native.connect).toHaveBeenCalledTimes(1);
+  });
   it.each(['prepare failure', 'PROCESS_STOP_UNCONFIRMED', 'Runtime уже выполняет другое действие', 'Подключение заняло больше'])('never restores proxy/disconnects on rejected connect: %s', async message => {
     native.connect.mockRejectedValueOnce(new Error(message));
     await expect(remnawaveClient.connect(server, { reconnect: true, useSystemProxy: true })).rejects.toThrow();

@@ -24,6 +24,7 @@ import type { IntegrationMeta } from '../types/vpn';
 interface AuthScreenProps {
   accessKey: string;
   authLoading: boolean;
+  storageBlocked?: boolean;
   errorText: string;
   integrationMeta: IntegrationMeta;
   language: UiLanguage;
@@ -71,6 +72,7 @@ function summarizeAccessKey(value: string) {
 export function AuthScreen({
   accessKey,
   authLoading,
+  storageBlocked = false,
   errorText,
   integrationMeta,
   language,
@@ -81,7 +83,7 @@ export function AuthScreen({
   const normalizedKey = accessKey.trim();
   const accessKeyKind = detectAccessKeyKind(accessKey);
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const canSubmit = Boolean(normalizedKey) && accessKeyKind === 'url' && !authLoading;
+  const canSubmit = Boolean(normalizedKey) && accessKeyKind === 'url' && !authLoading && !storageBlocked;
   const hasClipboard = typeof navigator !== 'undefined' && 'clipboard' in navigator;
   const keyPreview = summarizeAccessKey(accessKey);
   const isError = Boolean(errorText);

@@ -74,11 +74,16 @@ export async function commitNativeChange(scope: string, key: string, value: unkn
     throw failure;
   }
 }
-export async function recoverNativeState(): Promise<NativeStateSnapshot> {
+export async function recoverNativeState(confirmedToken: string): Promise<NativeStateSnapshot> {
   const current = await inspectNativeState(true);
-  if (!current.readOnly) return current;
-  if (!current.recoveryToken) throw new NativeStorageError('STATE_RECOVERY_REQUIRED', 'Нет проверенной резервной копии.', false);
-  snapshot = validate(await rpc<NativeStateSnapshot>('recover_state_snapshot', { token: current.recoveryToken }));
+  if (!current.readOnly || !confirmedToken || current.recoveryToken !== confirmedToken) {
+    throw new NativeStorageError('STATE_RECOVERY_CHANGED', 'Резервная копия изменилась. Требуется повторный просмотр и подтверждение.', false);
+  }
+  const recovered = validate(await rpc<NativeStateSnapshot>('recover_state_snapshot', { token: confirmedToken }));
+  if (recovered.readOnly || recovered.generation === current.generation || recovered.revision !== '0') {
+    throw new NativeStorageError('STATE_PROTOCOL_INVALID', 'Восстановление не подтверждено. Сохранённые файлы не сбрасывались.', false);
+  }
+  snapshot = recovered;
   conflict = null;
   return snapshot;
 }

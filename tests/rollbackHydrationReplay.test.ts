@@ -19,14 +19,17 @@ it.each(['ensureAdminLaunch', 'setNativeLaunchOnStartup'])('defers %s until nati
   const call = vi.fn().mockResolvedValue(undefined);
   const attempted = { current: false };
   const js = ts.transpileModule('const effect=' + effect!.arguments[0].getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
-  const run = (ready: boolean) => new Function('bindings', 'const {persistentStateReady,settings,hasTriedAdminLaunch,isTauriRuntime,ensureAdminLaunch,setNativeLaunchOnStartup}=bindings;' + js + ';effect();')({
-    persistentStateReady: ready, settings: { runAsAdmin: true, launchOnStartup: false }, hasTriedAdminLaunch: attempted,
+  const run = (ready: boolean, recoveryMode = false) => new Function('bindings', 'const {persistentStateReady,recoveryMode,settings,hasTriedAdminLaunch,isTauriRuntime,ensureAdminLaunch,setNativeLaunchOnStartup}=bindings;' + js + ';effect();')({
+    persistentStateReady: ready, recoveryMode, settings: { runAsAdmin: true, launchOnStartup: false }, hasTriedAdminLaunch: attempted,
     isTauriRuntime: true, ensureAdminLaunch: call, setNativeLaunchOnStartup: call
   });
   run(false);
   expect(call).not.toHaveBeenCalled();
   expect(attempted.current).toBe(false);
   expect(effect!.arguments[1].getText(source)).toContain('persistentStateReady');
+  run(true, true);
+  expect(call).not.toHaveBeenCalled(); expect(attempted.current).toBe(false);
+  expect(effect!.arguments[1].getText(source)).toContain('recoveryMode');
   run(true);
   expect(call).toHaveBeenCalledExactlyOnceWith(command === 'ensureAdminLaunch');
 });
@@ -44,9 +47,12 @@ it('executes the actual App hydration effect twice with cleanup without enabling
   const refs={settingsRef:{current:storage.defaultSettings},splitTunnelEntriesRef:{current:[]},favoriteServerIdsRef:{current:[] as string[]},selectedServerIdRef:{current:''}};
   const ready=vi.fn();
   const bindings={isTauriRuntime:true,persistentRestoreStarted:{current:false},setPersistentStateReady:ready,...refs,
-    loadSettingsBackup:storage.loadSettingsBackup,loadSplitTunnelEntriesBackup:storage.loadSplitTunnelEntriesBackup,loadFavoriteServerIdsBackup:storage.loadFavoriteServerIdsBackup,loadSelectedServerIdBackup:storage.loadSelectedServerIdBackup,
+    loadPersistentSnapshot:storage.loadPersistentSnapshot,reportPersistentFailure:vi.fn(),
     setSettings:vi.fn(),setSplitTunnelEntries:vi.fn(),setFavoriteServerIds:vi.fn(),setSelectedServerId:vi.fn(),pushToast:vi.fn(),tr:(_:unknown,ru:string)=>ru,language:'ru',writeNativeInterfaceLog:vi.fn()};
-  const js=ts.transpileModule('const hydrationEffect='+effect!.getText(source),{compilerOptions:{target:ts.ScriptTarget.ES2020,module:ts.ModuleKind.ESNext}}).outputText;
+  let adopt: ts.FunctionDeclaration | undefined;
+  const findAdopt=(node:ts.Node)=>{if(ts.isFunctionDeclaration(node)&&node.name?.text==='applyRestoredPersistentState')adopt=node;ts.forEachChild(node,findAdopt);};findAdopt(source);
+  expect(adopt).toBeDefined();
+  const js=ts.transpileModule(adopt!.getText(source)+';const hydrationEffect='+effect!.getText(source),{compilerOptions:{target:ts.ScriptTarget.ES2020,module:ts.ModuleKind.ESNext}}).outputText;
   const hydrate=new Function('bindings','const {'+Object.keys(bindings).join(',')+'}=bindings;'+js+';return hydrationEffect;')(bindings) as ()=>()=>void;
   const cleanup=hydrate();cleanup();const finalCleanup=hydrate();
   expect(ready).not.toHaveBeenCalled();

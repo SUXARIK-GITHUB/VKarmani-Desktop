@@ -11,6 +11,45 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('coherent v2 native protocol', () => {
+  it('does not recover a different backup than the user confirmed', async () => {
+    backend.snapshot.readOnly = true; backend.snapshot.recoveryToken = 'b'.repeat(64);
+    invoke.mockImplementation(async (command, args) => {
+      if (command === 'recover_state_snapshot') {
+        backend.snapshot.readOnly = false; backend.snapshot.recoveryToken = null; backend.snapshot.generation = 'c'.repeat(48);
+        return structuredClone(backend.snapshot);
+      }
+      return backend.invoke(command, args);
+    });
+    const native = await import('../src/services/nativeState');
+    await expect(native.recoverNativeState('a'.repeat(64))).rejects.toMatchObject({ code: 'STATE_RECOVERY_CHANGED' });
+    expect(invoke.mock.calls.some(([name]) => name === 'recover_state_snapshot')).toBe(false);
+  });
+  it('does not mutate a backup when the user only requested a reload', async () => {
+    backend.snapshot.readOnly = true; backend.snapshot.recoveryToken = 'b'.repeat(64);
+    invoke.mockImplementation(async (command, args) => {
+      if (command === 'recover_state_snapshot') {
+        backend.snapshot.readOnly = false; backend.snapshot.recoveryToken = null; backend.snapshot.generation = 'c'.repeat(48);
+        return structuredClone(backend.snapshot);
+      }
+      return backend.invoke(command, args);
+    });
+    const storage = await import('../src/services/storage');
+    await expect(storage.reloadPersistentSnapshot()).rejects.toMatchObject({ code: 'STATE_RECOVERY_REQUIRED' });
+    expect(invoke.mock.calls.some(([name]) => name === 'recover_state_snapshot')).toBe(false);
+  });
+  it.each(['same-generation', 'read-only', 'nonzero-revision'])('rejects invalid recovery ACK %s and retains the recovery snapshot', async variant => {
+    backend.snapshot.readOnly = true; backend.snapshot.recoveryToken = 'b'.repeat(64);
+    const native = await import('../src/services/nativeState');
+    await native.inspectNativeState();
+    const candidate = structuredClone(backend.snapshot);
+    candidate.readOnly = false; candidate.recoveryToken = null; candidate.generation = 'c'.repeat(48);
+    if (variant === 'same-generation') candidate.generation = backend.snapshot.generation;
+    if (variant === 'read-only') { candidate.readOnly = true; candidate.recoveryToken = 'd'.repeat(64); }
+    if (variant === 'nonzero-revision') candidate.revision = '1';
+    invoke.mockImplementation(async (command, args) => command === 'recover_state_snapshot' ? candidate : backend.invoke(command, args));
+    await expect(native.recoverNativeState('b'.repeat(64))).rejects.toMatchObject({ code: 'STATE_PROTOCOL_INVALID' });
+    expect(native.peekNativeState()).toMatchObject({ readOnly: true, recoveryToken: 'b'.repeat(64) });
+  });
   it('hydrates all fields from one revision without stale mirror defaults', async () => {
     backend.snapshot.payload.public = { settings: { themeGlow: false }, favoriteServerIds: ['a'], selectedServerId: 'b' };
     const storage = await import('../src/services/storage');
@@ -71,7 +110,7 @@ describe('coherent v2 native protocol', () => {
       }
       return backend.invoke(command, args);
     });
-    await native.recoverNativeState(); await native.commitNativeChange('public', 'selectedServerId', 'recovered');
+    await native.recoverNativeState('b'.repeat(64)); await native.commitNativeChange('public', 'selectedServerId', 'recovered');
     expect(backend.snapshot.payload.public.selectedServerId).toBe('recovered');
   });
   it('cancels an obsolete profile write after credential session generation changes', async () => {
