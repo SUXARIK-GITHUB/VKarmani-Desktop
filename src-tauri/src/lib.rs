@@ -105,6 +105,10 @@ mod commands;
 pub(crate) use commands::*;
 mod persistence;
 pub(crate) use persistence::*;
+mod compat_storage;
+pub(crate) use compat_storage::ipc::{
+    commit_state_patch, export_state_legacy, load_state_snapshot, recover_state_snapshot,
+};
 mod subscription;
 pub(crate) use subscription::*;
 mod app_run;

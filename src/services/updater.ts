@@ -1,5 +1,6 @@
 import type { ReleaseChannel, UpdateInfo } from '../types/vpn';
 import { appVersion, isTauriRuntime } from './runtime';
+import { quiescePersistentWrites, resumePersistentWrites } from './storage';
 
 const wait = (value: number) => new Promise<void>((resolve) => window.setTimeout(resolve, value));
 
@@ -82,6 +83,8 @@ export async function installAvailableUpdate(
   onProgress: (percent: number) => void
 ): Promise<{ ok: true } | { ok: false; message: string }> {
   if (isTauriRuntime) {
+    let interactionRoot: HTMLElement | null = null;
+    let previousInert = false;
     try {
       const { check } = await import('@tauri-apps/plugin-updater');
       const update = await check({ timeout: 15000 });
@@ -93,7 +96,7 @@ export async function installAvailableUpdate(
       let downloaded = 0;
       let total = 0;
 
-      await update.downloadAndInstall((event: unknown) => {
+      await update.download((event: unknown) => {
         const payload = event as
           | { event?: string; data?: { contentLength?: number; chunkLength?: number } }
           | undefined;
@@ -122,8 +125,17 @@ export async function installAvailableUpdate(
         }
       });
 
+      // Downloading allows normal edits. Only the final installer handoff blocks
+      // input and drains durable writes before Windows exits this exact process.
+      interactionRoot = typeof document === 'undefined' ? null : document.body;
+      previousInert = interactionRoot?.inert ?? false;
+      if (interactionRoot) interactionRoot.inert = true;
+      await quiescePersistentWrites();
+      await update.install();
       return { ok: true };
     } catch (error) {
+      if (interactionRoot) interactionRoot.inert = previousInert;
+      resumePersistentWrites();
       return { ok: false, message: normalizeUpdaterError(error) };
     }
   }

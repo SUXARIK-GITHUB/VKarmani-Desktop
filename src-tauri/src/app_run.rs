@@ -268,6 +268,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             bootstrap_info,
+            load_state_snapshot,
+            commit_state_patch,
+            recover_state_snapshot,
+            export_state_legacy,
             save_access_key_secure,
             load_access_key_secure,
             clear_access_key_secure,

@@ -298,10 +298,11 @@ export default function App() {
   }, [updateInfo.available, updateInfo.status]);
 
   useEffect(() => {
-    if (!isTauriRuntime || persistentRestoreStarted.current) {
+    if (!isTauriRuntime) {
       setPersistentStateReady(true);
       return;
     }
+    if (persistentRestoreStarted.current) return;
 
     persistentRestoreStarted.current = true;
     let cancelled = false;
@@ -313,6 +314,12 @@ export default function App() {
       loadSelectedServerIdBackup()
     ]).then(([settingsResult, splitResult, favoritesResult, selectedResult]) => {
       if (cancelled) {
+        return;
+      }
+
+      if ([settingsResult, splitResult, favoritesResult, selectedResult].some(result => result.status === 'rejected')) {
+        pushToast(tr(language, 'Не удалось восстановить сохранённые данные. Автосохранение заблокировано; оригиналы сохранены.', 'Stored data could not be restored. Autosave is blocked; originals are preserved.'), 'error');
+        void writeNativeInterfaceLog('STATE_RESTORE_BLOCKED: saved data was not loaded; autosave remains disabled.');
         return;
       }
 
@@ -335,7 +342,6 @@ export default function App() {
         selectedServerIdRef.current = selectedResult.value;
         setSelectedServerId(selectedResult.value);
       }
-    }).finally(() => {
       if (!cancelled) {
         setPersistentStateReady(true);
       }
@@ -343,12 +349,15 @@ export default function App() {
 
     return () => {
       cancelled = true;
+      // StrictMode replays the effect after cleanup; replay must hydrate again.
+      persistentRestoreStarted.current = false;
     };
   }, []);
 
   useEffect(() => {
     let cancelled = false;
 
+    if (!persistentStateReady) return;
     void loadStoredAccessKeySecure()
       .then((storedKey) => {
         if (!cancelled && storedKey.trim()) {
@@ -368,7 +377,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [persistentStateReady]);
 
 
   useEffect(() => {

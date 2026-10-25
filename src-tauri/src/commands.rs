@@ -98,36 +98,6 @@ pub(crate) fn normalize_access_key_for_native(value: &str) -> Result<String, Str
     Ok(normalized)
 }
 
-pub(crate) fn secure_access_key_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| format!("Не удалось определить каталог данных приложения: {error}"))?;
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("Не удалось создать каталог данных приложения: {error}"))?;
-    Ok(dir.join("access-key.dpapi"))
-}
-
-pub(crate) fn client_state_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| format!("Не удалось определить каталог данных приложения: {error}"))?;
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("Не удалось создать каталог данных приложения: {error}"))?;
-    Ok(dir.join("client-state-v1.json"))
-}
-
-pub(crate) fn sensitive_client_state_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| format!("Не удалось определить каталог данных приложения: {error}"))?;
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("Не удалось создать каталог данных приложения: {error}"))?;
-    Ok(dir.join("sensitive-client-state-v1.dpapi"))
-}
-
 pub(crate) fn is_allowed_client_state_key(key: &str) -> bool {
     matches!(
         key,
@@ -146,50 +116,7 @@ pub(crate) fn is_allowed_sensitive_client_state_key(key: &str) -> bool {
 pub(crate) fn read_client_state_map(
     app: &AppHandle,
 ) -> Result<serde_json::Map<String, Value>, String> {
-    let path = client_state_path(app)?;
-    if !path.exists() {
-        return Ok(serde_json::Map::new());
-    }
-
-    let metadata = fs::metadata(&path)
-        .map_err(|error| format!("Не удалось проверить сохранённые настройки клиента: {error}"))?;
-    if metadata.len() > CLIENT_STATE_MAX_BYTES {
-        return Err(
-            "Файл сохранённых настроек клиента слишком большой и не будет загружен.".to_string(),
-        );
-    }
-
-    let raw = fs::read_to_string(&path)
-        .map_err(|error| format!("Не удалось прочитать сохранённые настройки клиента: {error}"))?;
-
-    if raw.trim().is_empty() {
-        return Ok(serde_json::Map::new());
-    }
-
-    let value: Value = match serde_json::from_str(&raw) {
-        Ok(value) => value,
-        Err(error) => {
-            let backup_name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .map(|name| format!("{name}.corrupt-{}", unix_timestamp_seconds()))
-                .unwrap_or_else(|| {
-                    format!("client-state-v1.json.corrupt-{}", unix_timestamp_seconds())
-                });
-            let backup_path = path.with_file_name(backup_name);
-            let _ = fs::copy(&path, &backup_path);
-            let _ = append_interface_event(
-                app,
-                &format!(
-                    "Сохранённые настройки клиента повреждены и не будут загружены: {error}. Backup: {}",
-                    backup_path.display()
-                ),
-            );
-            return Ok(serde_json::Map::new());
-        }
-    };
-
-    Ok(value.as_object().cloned().unwrap_or_default())
+    Ok(crate::compat_storage::snapshot(app)?.payload.public_state)
 }
 
 fn save_client_state_value_blocking(
@@ -197,37 +124,8 @@ fn save_client_state_value_blocking(
     value: String,
     app: AppHandle,
 ) -> Result<(), String> {
-    let storage_state = app.state::<AppState>();
-    let _storage_guard = storage_state
-        .storage_lock
-        .lock()
-        .map_err(|_| "Не удалось заблокировать хранилище состояния.".to_string())?;
-
-    let normalized_key = key.trim();
-    if !is_allowed_client_state_key(normalized_key) {
-        return Err("Недопустимый ключ клиентского состояния.".into());
-    }
-
-    if value.len() as u64 > CLIENT_STATE_MAX_BYTES {
-        return Err("Настройки клиента слишком большие.".into());
-    }
-    let parsed_value: Value = serde_json::from_str(&value).map_err(|error| {
-        format!("Не удалось сохранить настройки клиента: некорректный JSON: {error}")
-    })?;
-
-    let mut map = read_client_state_map(&app).unwrap_or_default();
-    map.insert(normalized_key.to_string(), parsed_value);
-    map.insert("updatedAt".to_string(), Value::String(unix_now_string()));
-
-    let payload = serde_json::to_string_pretty(&Value::Object(map)).map_err(|error| {
-        format!("Не удалось подготовить настройки клиента к сохранению: {error}")
-    })?;
-
-    if payload.len() as u64 > CLIENT_STATE_MAX_BYTES {
-        return Err("Настройки клиента слишком большие.".into());
-    }
-    let path = client_state_path(&app)?;
-    atomic_write_text(&path, &payload, "Не удалось сохранить настройки клиента")
+    let _ = (key, value, app);
+    Err(crate::compat_storage::reject_legacy_write())
 }
 
 fn load_client_state_value_blocking(key: String, app: AppHandle) -> Result<Option<String>, String> {
@@ -243,30 +141,8 @@ fn load_client_state_value_blocking(key: String, app: AppHandle) -> Result<Optio
 }
 
 fn clear_client_state_value_blocking(key: String, app: AppHandle) -> Result<(), String> {
-    let storage_state = app.state::<AppState>();
-    let _storage_guard = storage_state
-        .storage_lock
-        .lock()
-        .map_err(|_| "Не удалось заблокировать хранилище состояния.".to_string())?;
-
-    let normalized_key = key.trim();
-    if !is_allowed_client_state_key(normalized_key) {
-        return Err("Недопустимый ключ клиентского состояния.".into());
-    }
-
-    let mut map = read_client_state_map(&app).unwrap_or_default();
-    map.remove(normalized_key);
-    map.insert("updatedAt".to_string(), Value::String(unix_now_string()));
-
-    let payload = serde_json::to_string_pretty(&Value::Object(map)).map_err(|error| {
-        format!("Не удалось подготовить настройки клиента к сохранению: {error}")
-    })?;
-
-    if payload.len() as u64 > CLIENT_STATE_MAX_BYTES {
-        return Err("Настройки клиента слишком большие.".into());
-    }
-    let path = client_state_path(&app)?;
-    atomic_write_text(&path, &payload, "Не удалось сохранить настройки клиента")
+    let _ = (key, app);
+    Err(crate::compat_storage::reject_legacy_write())
 }
 
 #[tauri::command]
@@ -300,78 +176,7 @@ pub(crate) async fn clear_client_state_value(key: String, app: AppHandle) -> Res
 fn read_sensitive_client_state_map(
     app: &AppHandle,
 ) -> Result<serde_json::Map<String, Value>, String> {
-    let path = sensitive_client_state_path(app)?;
-    if !path.exists() {
-        return Ok(serde_json::Map::new());
-    }
-
-    let metadata = fs::metadata(&path)
-        .map_err(|error| format!("Не удалось проверить защищённый кэш клиента: {error}"))?;
-    if metadata.len() > ENCRYPTED_STATE_MAX_BYTES {
-        return Err(
-            "Файл защищённого кэша клиента слишком большой и не будет загружен.".to_string(),
-        );
-    }
-
-    let encrypted = fs::read_to_string(&path)
-        .map_err(|error| format!("Не удалось прочитать защищённый кэш клиента: {error}"))?;
-    if encrypted.trim().is_empty() {
-        return Ok(serde_json::Map::new());
-    }
-
-    let decrypted = decrypt_access_key(encrypted.trim()).map_err(|error| {
-        let backup_name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(|name| format!("{name}.corrupt-{}", unix_timestamp_seconds()))
-            .unwrap_or_else(|| {
-                format!(
-                    "sensitive-client-state-v1.dpapi.corrupt-{}",
-                    unix_timestamp_seconds()
-                )
-            });
-        let backup_path = path.with_file_name(backup_name);
-        let _ = fs::copy(&path, &backup_path);
-        let _ = append_interface_event(
-            app,
-            &format!(
-                "Защищённый кэш клиента повреждён и не будет загружен: {error}. Backup: {}",
-                backup_path.display()
-            ),
-        );
-        format!("Не удалось расшифровать защищённый кэш клиента: {error}")
-    })?;
-
-    if decrypted.len() as u64 > SENSITIVE_CLIENT_STATE_MAX_BYTES {
-        return Err(
-            "Расшифрованный защищённый кэш клиента слишком большой и не будет загружен."
-                .to_string(),
-        );
-    }
-
-    if decrypted.trim().is_empty() {
-        return Ok(serde_json::Map::new());
-    }
-
-    let value: Value = serde_json::from_str(&decrypted).map_err(|error| {
-        let backup_name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(|name| format!("{name}.invalid-json-{}", unix_timestamp_seconds()))
-            .unwrap_or_else(|| format!("sensitive-client-state-v1.dpapi.invalid-json-{}", unix_timestamp_seconds()));
-        let backup_path = path.with_file_name(backup_name);
-        let _ = fs::copy(&path, &backup_path);
-        let _ = append_interface_event(
-            app,
-            &format!(
-                "Защищённый кэш клиента содержит некорректный JSON и не будет загружен: {error}. Backup: {}",
-                backup_path.display()
-            ),
-        );
-        format!("Защищённый кэш клиента содержит некорректный JSON: {error}")
-    })?;
-
-    Ok(value.as_object().cloned().unwrap_or_default())
+    Ok(crate::compat_storage::snapshot(app)?.payload.protected)
 }
 
 fn save_sensitive_client_state_value_blocking(
@@ -379,46 +184,8 @@ fn save_sensitive_client_state_value_blocking(
     value: String,
     app: AppHandle,
 ) -> Result<(), String> {
-    let storage_state = app.state::<AppState>();
-    let _storage_guard = storage_state
-        .storage_lock
-        .lock()
-        .map_err(|_| "Не удалось заблокировать хранилище состояния.".to_string())?;
-
-    let normalized_key = key.trim();
-    if !is_allowed_sensitive_client_state_key(normalized_key) {
-        return Err("Недопустимый ключ защищённого клиентского состояния.".into());
-    }
-
-    if value.len() as u64 > SENSITIVE_CLIENT_STATE_MAX_BYTES {
-        return Err(
-            "Защищённое клиентское состояние слишком большое и не будет сохранено.".to_string(),
-        );
-    }
-
-    let parsed_value: Value = serde_json::from_str(&value).map_err(|error| {
-        format!("Не удалось сохранить защищённый кэш клиента: некорректный JSON: {error}")
-    })?;
-
-    let mut map = read_sensitive_client_state_map(&app).unwrap_or_default();
-    map.insert(normalized_key.to_string(), parsed_value);
-    map.insert("updatedAt".to_string(), Value::String(unix_now_string()));
-
-    let payload = serde_json::to_string(&Value::Object(map)).map_err(|error| {
-        format!("Не удалось подготовить защищённый кэш клиента к сохранению: {error}")
-    })?;
-    if payload.len() as u64 > SENSITIVE_CLIENT_STATE_MAX_BYTES {
-        return Err("Защищённый кэш клиента слишком большой и не будет сохранён.".to_string());
-    }
-
-    let encrypted = encrypt_access_key(&payload)
-        .map_err(|error| format!("Не удалось зашифровать защищённый кэш клиента: {error}"))?;
-    let path = sensitive_client_state_path(&app)?;
-    atomic_write_text(
-        &path,
-        &encrypted,
-        "Не удалось сохранить защищённый кэш клиента",
-    )
+    let _ = (key, value, app);
+    Err(crate::compat_storage::reject_legacy_write())
 }
 
 fn load_sensitive_client_state_value_blocking(
@@ -437,33 +204,8 @@ fn load_sensitive_client_state_value_blocking(
 }
 
 fn clear_sensitive_client_state_value_blocking(key: String, app: AppHandle) -> Result<(), String> {
-    let storage_state = app.state::<AppState>();
-    let _storage_guard = storage_state
-        .storage_lock
-        .lock()
-        .map_err(|_| "Не удалось заблокировать хранилище состояния.".to_string())?;
-
-    let normalized_key = key.trim();
-    if !is_allowed_sensitive_client_state_key(normalized_key) {
-        return Err("Недопустимый ключ защищённого клиентского состояния.".into());
-    }
-
-    let mut map = read_sensitive_client_state_map(&app).unwrap_or_default();
-    map.remove(normalized_key);
-    map.insert("updatedAt".to_string(), Value::String(unix_now_string()));
-
-    let payload = serde_json::to_string(&Value::Object(map)).map_err(|error| {
-        format!("Не удалось подготовить защищённый кэш клиента к очистке: {error}")
-    })?;
-    let encrypted = encrypt_access_key(&payload).map_err(|error| {
-        format!("Не удалось зашифровать защищённый кэш клиента после очистки: {error}")
-    })?;
-    let path = sensitive_client_state_path(&app)?;
-    atomic_write_text(
-        &path,
-        &encrypted,
-        "Не удалось очистить защищённый кэш клиента",
-    )
+    let _ = (key, app);
+    Err(crate::compat_storage::reject_legacy_write())
 }
 
 #[tauri::command]
@@ -598,57 +340,21 @@ pub(crate) fn decrypt_access_key(value: &str) -> Result<String, String> {
 }
 
 fn save_access_key_secure_blocking(value: String, app: AppHandle) -> Result<(), String> {
-    let normalized = value.trim();
-    if normalized.is_empty() {
-        return clear_access_key_secure_blocking(app);
-    }
-    let storage_state = app.state::<AppState>();
-    let _storage_guard = storage_state
-        .storage_lock
-        .lock()
-        .map_err(|_| "Не удалось заблокировать хранилище состояния.".to_string())?;
-    let normalized = normalize_access_key_for_native(normalized)?;
-    let encrypted = encrypt_access_key(&normalized)?;
-    let path = secure_access_key_path(&app)?;
-    atomic_write_text(
-        &path,
-        &encrypted,
-        "Не удалось сохранить ключ доступа в защищённое хранилище",
-    )
+    let _ = (value, app);
+    Err(crate::compat_storage::reject_legacy_write())
 }
 
 pub(crate) fn load_access_key_secure_blocking(app: AppHandle) -> Result<Option<String>, String> {
-    let path = secure_access_key_path(&app)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let metadata = fs::metadata(&path)
-        .map_err(|error| format!("Не удалось проверить защищённый ключ доступа: {error}"))?;
-    if metadata.len() > 64 * 1024 {
-        return Err(
-            "Файл защищённого ключа выглядит слишком большим и не будет загружен.".to_string(),
-        );
-    }
-
-    let encrypted = fs::read_to_string(path)
-        .map_err(|error| format!("Не удалось прочитать защищённый ключ доступа: {error}"))?;
-    let value = decrypt_access_key(encrypted.trim())?;
-    Ok(Some(normalize_access_key_for_native(&value)?))
+    crate::compat_storage::snapshot(&app)?
+        .payload
+        .access_key
+        .map(|value| normalize_access_key_for_native(&value))
+        .transpose()
 }
 
 fn clear_access_key_secure_blocking(app: AppHandle) -> Result<(), String> {
-    let storage_state = app.state::<AppState>();
-    let _storage_guard = storage_state
-        .storage_lock
-        .lock()
-        .map_err(|_| "Не удалось заблокировать хранилище состояния.".to_string())?;
-
-    let path = secure_access_key_path(&app)?;
-    if path.exists() {
-        fs::remove_file(path)
-            .map_err(|error| format!("Не удалось удалить сохранённый ключ доступа: {error}"))?;
-    }
-    Ok(())
+    let _ = app;
+    Err(crate::compat_storage::reject_legacy_write())
 }
 
 #[tauri::command]

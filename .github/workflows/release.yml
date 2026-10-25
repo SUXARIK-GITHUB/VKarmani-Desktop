@@ -157,7 +157,7 @@ jobs:
             - Исправлены лишнее пространство внизу Settings и вторичная информация карточки подключённого сервера.
             - Proxy — системный HTTP/HTTPS-прокси; generic UDP в нём не гарантируется. Для полного трафика приложений, включая UDP, предусмотрен TUN.
             - Native-проверки TUN/Proxy, Discord/media, сна и длительной работы в этом выпуске не выполнялись; эти риски приняты пользователем.
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
           updaterJsonPreferNsis: true

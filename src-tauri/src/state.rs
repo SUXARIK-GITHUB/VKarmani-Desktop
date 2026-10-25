@@ -42,6 +42,7 @@ pub(crate) struct AppState {
     pub(crate) operation_generation: std::sync::atomic::AtomicU64,
     pub(crate) stop_requested: std::sync::atomic::AtomicBool,
     pub(crate) storage_lock: Mutex<()>,
+    pub(crate) storage_closed: std::sync::atomic::AtomicBool,
     pub(crate) session_authorized: Mutex<bool>,
     pub(crate) session_authorization: Mutex<Option<NativeSessionAuthorization>>,
     pub(crate) subscription_lock: Mutex<()>,
