@@ -9,6 +9,7 @@ import { SidebarNav } from './components/SidebarNav';
 import { SplitTunnelModal } from './components/SplitTunnelModal';
 import { StartupSkeleton } from './components/StartupSkeleton';
 import { StorageRecoveryNotice } from './components/StorageRecoveryNotice';
+import { LogoutConfirmModal } from './components/LogoutConfirmModal';
 import { SupportTab } from './components/SupportTab';
 import { ToastViewport } from './components/ToastViewport';
 import { TabErrorBoundary } from './components/TabErrorBoundary';
@@ -59,6 +60,7 @@ import {
   loadPersistentSnapshot,
   inspectPersistentRecovery,
   reloadPersistentSnapshot,
+  flushPersistentWrites,
   NativeStorageError,
   loadLastKnownServers,
   loadLastKnownServersBackup,
@@ -148,6 +150,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
   const [storageIssue, setStorageIssue] = useState<NativeStorageError | null>(null);
   const [storageRecoveryBusy, setStorageRecoveryBusy] = useState(false);
   const [storageRecoveryToken, setStorageRecoveryToken] = useState<string | null>(null);
+  const [logoutConfirmationOpen, setLogoutConfirmationOpen] = useState(false);
   const storageRecoveryLock = useRef(false);
   const [isBootstrapping, setIsBootstrapping] = useState(true);
   const { toasts, pushToast } = useToastManager(settings.notifications);
@@ -2734,10 +2737,17 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
     });
   }
 
-  async function handleClearAccessKey() {
-    profileSyncGenerationRef.current++; remnawaveClient.invalidateProfileSync(); cancelPing();
+  function handleClearAccessKey() {
+    setLogoutConfirmationOpen(true);
+  }
+
+  async function performConfirmedLogout() {
     await runActionOnce('logout', async () => {
+      setLogoutConfirmationOpen(false);
       try {
+        // No invalidation, disconnect or deletion before durable save succeeds.
+        await flushPersistentWrites();
+        profileSyncGenerationRef.current++; remnawaveClient.invalidateProfileSync(); cancelPing();
         clearPendingConnectionQueue();
 
         if (isConnectionActionBusy()) {
@@ -2754,19 +2764,29 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         }
 
         const runtimeBeforeLogout = await refreshDiagnosticsAndRuntime();
-        const shouldDisconnectBeforeLogout = connectionStateRef.current === 'connected'
-          || Boolean(runtimeBeforeLogout?.tunnelActive)
-          || proxyStatusRef.current.enabled;
+        if (isTauriRuntime && (!runtimeBeforeLogout || runtimeBeforeLogout.bridge !== 'tauri' || runtimeBeforeLogout.operation
+          || !['none', 'owned', 'prepared', 'changed', 'restored-pending-journal'].includes(runtimeBeforeLogout.proxyOwnership ?? '')
+          || !['none', 'confirmed', 'missing', 'changed', 'unconfirmed'].includes(runtimeBeforeLogout.routeOwnership ?? ''))) {
+          throw new Error(tr(language, 'Состояние VPN не подтверждено. Выход отложен; ключ не удалён.', 'VPN state is unconfirmed. Sign out deferred; saved key was not removed.'));
+        }
+        const shouldDisconnectBeforeLogout = Boolean(runtimeBeforeLogout?.tunnelActive)
+          || Boolean(runtimeBeforeLogout?.xrayPid)
+          || (isTauriRuntime && (runtimeBeforeLogout?.routeOwnership !== 'none' || runtimeBeforeLogout?.proxyOwnership !== 'none'));
 
         if (shouldDisconnectBeforeLogout) {
           setConnectionStateSafe('disconnecting');
-          await remnawaveClient.disconnect({ useSystemProxy: proxyStatusRef.current.enabled || shouldUseSystemProxy(settingsRef.current.tunnelMode, settingsRef.current.useSystemProxy) });
+          await remnawaveClient.disconnect({ useSystemProxy: runtimeBeforeLogout?.proxyOwnership !== 'none' });
+          const afterDisconnect = await refreshDiagnosticsAndRuntime();
+          if (isTauriRuntime && (!afterDisconnect || afterDisconnect.bridge !== 'tauri' || afterDisconnect.tunnelActive
+            || afterDisconnect.xrayPid || afterDisconnect.operation
+            || afterDisconnect.proxyOwnership !== 'none' || afterDisconnect.routeOwnership !== 'none')) {
+            throw new Error(tr(language, 'Отключение VPN не подтверждено. Ключ сохранён; повторите выход после проверки соединения.', 'VPN disconnect is unconfirmed. Saved key retained; retry sign out after checking the connection.'));
+          }
           setConnectedServerId('');
           connectedServerIdRef.current = '';
           setConnectivityProbe(null);
           setVpnExternalIp('—');
           setSessionDuration(0);
-          await refreshDiagnosticsAndRuntime();
           await refreshPrimaryExternalIp();
         }
 
@@ -2791,7 +2811,11 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         setConnectionStateSafe('idle');
         pushToast(tr(language, 'VPN остановлен, ключ очищен, сессия завершена.', 'VPN stopped, key cleared and session ended.'), 'info');
       } catch (error) {
-        setConnectionStateSafe('idle');
+        if (error instanceof NativeStorageError) reportPersistentFailure(error);
+        const actual = await refreshDiagnosticsAndRuntime();
+        const actualState = connectionFailureState(actual, 0, 0);
+        if (actualState === 'active') setConnectionStateSafe('connected');
+        else if (actualState === 'idle') setConnectionStateSafe('idle');
         pushToast(
           error instanceof Error
             ? error.message
@@ -2988,6 +3012,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       </div>
 
       <StorageRecoveryNotice language={language} code={storageIssue?.code} busy={storageRecoveryBusy} safeStart={recoveryMode} confirmBackup={Boolean(storageRecoveryToken)} onInspect={() => void handleStorageRecovery()} onConfirm={() => void handleStorageRecovery(true)} onCancel={() => setStorageRecoveryToken(null)} />
+      <LogoutConfirmModal open={logoutConfirmationOpen} language={language} busy={operationManager.hasConflict('logout')} onCancel={() => setLogoutConfirmationOpen(false)} onConfirm={() => void performConfirmedLogout()} />
       <AppInfoModal
         open={isAppInfoOpen}
         language={language}
