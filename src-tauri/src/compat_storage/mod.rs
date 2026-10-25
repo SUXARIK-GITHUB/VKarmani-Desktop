@@ -3,6 +3,7 @@
 use super::*;
 mod io;
 use io::*;
+pub(crate) use io::{atomic_write_state_text_with_limit, read_state_file};
 mod client;
 use client::*;
 pub(crate) mod durable;
