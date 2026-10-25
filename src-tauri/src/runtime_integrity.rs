@@ -570,6 +570,32 @@ pub(crate) fn write_new_runtime_config(path: &Path, content: &[u8]) -> Result<()
     }
     Ok(())
 }
+// Own only the newly created candidate file. Aborting preflight must never
+// restore proxy, remove routes or change the still-running previous runtime.
+pub(crate) struct PreparedRuntimeConfig {
+    path: Option<PathBuf>,
+    _parents: Vec<File>,
+}
+impl PreparedRuntimeConfig {
+    pub(crate) fn write(path: &Path, content: &[u8]) -> Result<Self, String> {
+        let parents = lock_runtime_parent_paths(path)?;
+        write_new_runtime_config(path, content)?;
+        Ok(Self {
+            path: Some(path.to_path_buf()),
+            _parents: parents,
+        })
+    }
+    pub(crate) fn commit(&mut self) {
+        self.path.take();
+    }
+}
+impl Drop for PreparedRuntimeConfig {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
 pub(crate) fn prepare_core_launch(
     core: &Path,
     config: Option<(&Path, &str)>,
@@ -598,6 +624,55 @@ pub(crate) fn read_verified_runtime_config(path: &Path, hash: &str) -> Result<Va
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
+    #[test]
+    fn prepared_candidate_pins_parent_until_abort_cleanup_finishes() {
+        let dir = std::env::temp_dir().join(format!(
+            "vkarmani-prepared-parent-{}",
+            crate::compat_storage::durable::random_state_id().unwrap()
+        ));
+        let moved = dir.with_extension("moved");
+        assert!(!moved.exists());
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("candidate.json");
+        let candidate = PreparedRuntimeConfig::write(&path, b"owned").unwrap();
+        let rename = fs::rename(&dir, &moved);
+        drop(candidate);
+        if rename.is_ok() {
+            fs::rename(&moved, &dir).unwrap();
+            fs::remove_file(&path).unwrap();
+        }
+        let cleaned = !path.exists();
+        fs::remove_dir(&dir).unwrap();
+        assert!(
+            rename.is_err(),
+            "candidate cleanup requires an immovable parent path"
+        );
+        assert!(cleaned);
+    }
+    #[test]
+    fn prepared_candidate_file_cleans_abort_keeps_commit_and_never_deletes_existing() {
+        let dir = std::env::temp_dir().join(format!(
+            "vkarmani-prepared-config-{}",
+            crate::compat_storage::durable::random_state_id().unwrap()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("candidate.json");
+        fs::write(&path, b"existing-original").unwrap();
+        assert!(PreparedRuntimeConfig::write(&path, b"replacement").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"existing-original");
+        fs::remove_file(&path).unwrap();
+        {
+            let _candidate = PreparedRuntimeConfig::write(&path, b"abort").unwrap();
+        }
+        assert!(!path.exists());
+        {
+            let mut candidate = PreparedRuntimeConfig::write(&path, b"committed").unwrap();
+            candidate.commit();
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"committed");
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
     #[test]
     fn runtime_config_create_new_preserves_existing_file_and_flushes_owned_bytes() {
         let dir = std::env::temp_dir().join(format!("vkarmani-new-config-{}", std::process::id()));

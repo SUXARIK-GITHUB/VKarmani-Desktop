@@ -873,10 +873,17 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     };
 
     // Pure adapters and read-only physical/service discovery finish before stopping the old runtime.
-    let outbound_ips = outbound_host
-        .as_deref()
-        .map(|host| resolve_ipv4_addresses(host, outbound_port))
-        .unwrap_or_default();
+    let outbound_ips = if normalized_network_mode == "tun" {
+        let host = outbound_host
+            .as_deref()
+            .ok_or("CONNECT_PREFLIGHT: TUN_ENDPOINT_MISSING")?;
+        resolve_ipv4_addresses(host, outbound_port)
+            .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?
+    } else {
+        // Proxy does not need an IPv4 route endpoint. Leave DNS and IPv6
+        // selection to the imported Xray profile instead of querying twice.
+        Vec::new()
+    };
     let outbound_ip_display = if outbound_ips.is_empty() {
         "—".to_string()
     } else {
@@ -894,13 +901,6 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     let send_through_ip: Option<String> = None;
     #[cfg(not(target_os = "windows"))]
     let physical_route: Option<DefaultRouteSnapshot> = None;
-
-    if normalized_network_mode == "tun" && outbound_ips.is_empty() {
-        return Err(format!(
-            "CONNECT_PREFLIGHT: TUN режим пока поддерживает только серверы с IPv4 endpoint. Для сервера {} не удалось получить IPv4 адрес. Выберите другой сервер или используйте Proxy режим.",
-            outbound_host.as_deref().unwrap_or("—")
-        ));
-    }
 
     if normalized_network_mode == "tun" && send_through_ip.is_none() {
         return Err("CONNECT_PREFLIGHT: Не удалось определить локальный IPv4 адрес активного сетевого адаптера для TUN режима. Подключитесь к сети без VPN/виртуального адаптера и попробуйте снова.".into());
@@ -940,6 +940,25 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         .map_err(|error| format!("Не удалось сериализовать config: {error}"))?;
     let config_hash = sha256_hex_bytes(config_text.as_bytes());
     _operation_guard.check()?;
+    _operation_guard.stage("validating")?;
+    validate_or_create_log(&runtime_trace_path)
+        .map_err(|error| format!("CONNECT_PREFLIGHT: CONNECT_LOG: {error}"))?;
+    let mut prepared_config = PreparedRuntimeConfig::write(&config_path, config_text.as_bytes())
+        .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
+    {
+        // Xray -test constructs TUN even without server.Start. Validate the
+        // provider/routing/DNS graph without constructing a competing adapter.
+        let projection = config_preflight_projection(&config)
+            .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
+        let bytes = serde_json::to_vec_pretty(&projection)
+            .map_err(|_| "CONNECT_PREFLIGHT: CONFIG_SERIALIZE".to_string())?;
+        let projection_path = config_path.with_extension("preflight.json");
+        let _projection = PreparedRuntimeConfig::write(&projection_path, &bytes)
+            .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
+        validate_xray_config_with_core(&core_path, &projection_path, &sha256_hex_bytes(&bytes))
+            .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
+    }
+    _operation_guard.check()?;
     _operation_guard.stage("stopping")?;
     stop_managed_or_starting_runtime(
         &app,
@@ -947,12 +966,8 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         !reconnect_requested || normalized_network_mode == "tun",
         "connect_preflight",
     )?;
-    let config_written = std::cell::Cell::new(false);
     let mut failed_connect = FailedConnectRollback::new(|| {
         let _ = restore_saved_proxy_state(&app, &state, "connect_failed_after_stop");
-        if config_written.get() {
-            remove_startup_runtime_config(&app, &config_path, "connect_failed_after_stop");
-        }
         if let Ok(mut connected) = state.connected.lock() {
             *connected = false;
         }
@@ -978,22 +993,11 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     }
     ensure_runtime_ports_available()?;
 
-    validate_or_create_log(&runtime_trace_path).map_err(|error| format!("CONNECT_LOG: {error}"))?;
+    // Full TUN construction can happen only after the old owned child stops.
+    // Projection success is not full TUN readiness or egress proof.
     _operation_guard.stage("validating")?;
-    write_new_runtime_config(&config_path, config_text.as_bytes())
-        .map_err(|error| format!("Не удалось записать config: {error}"))?;
-    config_written.set(true);
-
-    validate_xray_config_with_core(&core_path, &config_path, &config_hash).inspect_err(
-        |error| {
-            let _ = append_runtime_event(&app, error);
-            remove_startup_runtime_config(&app, &config_path, "config_validation_failed");
-        },
-    )?;
-    if let Err(error) = _operation_guard.check() {
-        remove_startup_runtime_config(&app, &config_path, "operation_cancelled");
-        return Err(error);
-    }
+    validate_xray_config_with_core(&core_path, &config_path, &config_hash)?;
+    _operation_guard.check()?;
 
     if normalized_network_mode == "tun" {
         let core_dir = core_path.parent().map(|value| value.to_path_buf());
@@ -1261,6 +1265,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
 
     clear_starting_runtime(&state, child_pid);
     failed_connect.commit();
+    prepared_config.commit();
 
     let _ = app.emit("vkarmani://native-connect", server_id);
     let _ = app.emit("vkarmani://native-status", server_label);
