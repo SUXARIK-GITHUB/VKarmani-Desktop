@@ -96,7 +96,7 @@ function logoutBindings() {
   const bindings: Record<string, any> = { ...profileWorkBindings(), recoveryEpochRef: { current: 4 }, isTauriRuntime: true, language: 'en', NativeStorageError, connectionFailureState,
     tr: (_: unknown, _ru: string, en: string) => en, runActionOnce: async (_: string, operation: () => Promise<void>) => operation(),
     flushPersistentWrites: vi.fn().mockResolvedValue(undefined), profileSyncGenerationRef: { current: 7 },
-    remnawaveClient: { invalidateProfileSync: vi.fn(), disconnect: vi.fn().mockResolvedValue(undefined) },
+    remnawaveClient: { invalidateProfileSync: vi.fn(), clearSessionCache: vi.fn(), disconnect: vi.fn().mockResolvedValue(undefined) },
     isConnectionActionBusy: () => false, refreshDiagnosticsAndRuntime: vi.fn().mockResolvedValue(idle),
     clearStoredAccessKey: vi.fn().mockResolvedValue(undefined), clearLastKnownServers: vi.fn().mockResolvedValue(undefined),
     setNativeSessionAuthorized: vi.fn().mockResolvedValue(false), connectedServerIdRef: { current: 'old' },
@@ -114,6 +114,7 @@ it('confirmed logout refuses failed saves before disconnect, invalidation or key
   expect(b.remnawaveClient.disconnect).not.toHaveBeenCalled(); expect(b.clearStoredAccessKey).not.toHaveBeenCalled();
   expect(b.reportPersistentFailure).toHaveBeenCalledWith(failure); expect(b.setConnectionStateSafe).toHaveBeenCalledExactlyOnceWith('connected');
   expect(b.recoveryEpochRef.current).toBe(4); expect(b.profileSyncInFlightRef.current).toBe(true);
+  expect(b.remnawaveClient.clearSessionCache).not.toHaveBeenCalled();
 });
 
 it.each([null, { bridge: 'tauri', operation: { kind: 'connect' } }, { bridge: 'tauri', proxyOwnership: 'unavailable' }])('unknown or busy runtime prevents credential deletion: %j', async runtime => {
@@ -139,6 +140,14 @@ it('a foreign proxy with no VKarmani ownership does not cause proxy restoration 
   expect(b.flushPersistentWrites.mock.invocationCallOrder[0]).toBeLessThan(b.clearStoredAccessKey.mock.invocationCallOrder[0]);
   expect(b.recoveryEpochRef.current).toBe(5); expect(b.profileSyncInFlightRef.current).toBe(false);
   expect(b.setAuthLoading).toHaveBeenCalledWith(false); expect(b.setIsSyncingProfile).toHaveBeenCalledWith(false);
+  expect(b.remnawaveClient.clearSessionCache).toHaveBeenCalledTimes(1);
+  expect(b.remnawaveClient.clearSessionCache.mock.invocationCallOrder[0]).toBeGreaterThan(b.setNativeSessionAuthorized.mock.invocationCallOrder[0]);
+});
+
+it('failed persistent profile deletion retains the client cache and does not report a successful logout', async () => {
+  const { bindings: b, run } = logoutBindings(); b.clearLastKnownServers.mockRejectedValue(new NativeStorageError('STATE_WRITE_FAILED', 'synthetic'));
+  await run(); expect(b.remnawaveClient.clearSessionCache).not.toHaveBeenCalled();
+  expect(b.setIsAuthorized).not.toHaveBeenCalledWith(false); expect(b.reportPersistentFailure).toHaveBeenCalled();
 });
 
 it('a superseded login error cannot overwrite newer loading, show an error or authorize a stale key', async () => {
