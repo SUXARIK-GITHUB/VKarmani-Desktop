@@ -353,7 +353,7 @@ pub(crate) fn resolve_socket_addresses(
         let result = (normalized.as_str(), port)
             .to_socket_addrs()
             .map(|items| items.take(65).collect::<Vec<_>>())
-            .map_err(|_| "DNS resolution failed".to_string());
+            .map_err(|_| "DNS_RESOLUTION_FAILED: system resolver failed".to_string());
         let _ = sender.send(result);
     });
     let mut addresses = receiver
@@ -677,11 +677,7 @@ fn prepare_network_config(
     // Xray constructs/starts its TUN adapter inside core.New even for -test.
     // Check provider transports without constructing another live TUN. The
     // unchanged full config is validated only after confirmed owned-child stop.
-    let mut projection = config.clone();
-    projection["inbounds"]
-        .as_array_mut()
-        .ok_or("NETWORK_CONFIG_INBOUNDS")?
-        .retain(|inbound| inbound["protocol"] != "tun");
+    let projection = config_preflight_projection(&config)?;
     let projection_bytes =
         serde_json::to_vec_pretty(&projection).map_err(|_| "NETWORK_CONFIG_SERIALIZE")?;
     let projection_path = prepared.path.with_extension("preflight.json");

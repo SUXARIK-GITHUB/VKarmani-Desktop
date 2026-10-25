@@ -933,23 +933,129 @@ pub(crate) fn extract_outbound_address_and_port(
     (None, default_port)
 }
 
-pub(crate) fn resolve_ipv4_addresses(host: &str, port: u16) -> Vec<String> {
-    let mut addresses = Vec::new();
+#[test]
+fn endpoint_resolution_failure_is_not_reported_as_empty_ipv4_success() {
+    // Invalid literal input fails before any system DNS call.
+    let result = resolve_ipv4_addresses("", 443);
+    assert!(
+        format!("{result:?}").contains("Invalid socket endpoint"),
+        "the resolver error must survive the IPv4 projection, not become an empty successful list"
+    );
+}
 
-    if let Ok(items) = resolve_socket_addresses(host, port) {
-        for addr in items {
-            if !addr.ip().is_ipv4() {
-                continue;
-            }
-
-            let ip = addr.ip().to_string();
-            if !addresses.iter().any(|item| item == &ip) {
-                addresses.push(ip);
-            }
+pub(crate) fn config_preflight_projection(config: &Value) -> Result<Value, String> {
+    let inbounds = config
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .ok_or("CONFIG_PREFLIGHT_INBOUNDS_INVALID")?;
+    for inbound in inbounds {
+        let object = inbound
+            .as_object()
+            .ok_or("CONFIG_PREFLIGHT_INBOUNDS_INVALID")?;
+        let protocol = object
+            .get("protocol")
+            .and_then(Value::as_str)
+            .ok_or("CONFIG_PREFLIGHT_INBOUNDS_INVALID")?;
+        if object
+            .keys()
+            .any(|name| xray_json_field_matches(name, "protocol") && name != "protocol")
+            || protocol.eq_ignore_ascii_case("tun") && protocol != "tun"
+        {
+            return Err("CONFIG_PREFLIGHT_INBOUNDS_INVALID".into());
         }
     }
+    let mut projection = config.clone();
+    projection["inbounds"] = json!(inbounds
+        .iter()
+        .filter(|inbound| inbound["protocol"] != "tun")
+        .collect::<Vec<_>>());
+    Ok(projection)
+}
 
-    addresses
+#[test]
+fn preflight_projection_omits_only_tun_and_never_mutates_the_runtime_graph() {
+    let original = json!({"inbounds":[{"protocol":"tun","tag":"tun","settings":{"name":"vkarmani-tun"}},{"protocol":"http","tag":"http","port":10809}],
+        "dns":{"servers":["localhost"]},"outbounds":[{"tag":"proxy","protocol":"freedom"}],
+        "routing":{"rules":[{"inboundTag":["tun"],"outboundTag":"proxy"}]}});
+    let before = original.clone();
+    let projection = config_preflight_projection(&original).unwrap();
+    assert_eq!(original, before);
+    assert_eq!(
+        projection["inbounds"],
+        json!([{"protocol":"http","tag":"http","port":10809}])
+    );
+    for key in ["dns", "routing", "outbounds"] {
+        assert_eq!(projection[key], original[key]);
+    }
+    assert_eq!(original["inbounds"][0]["protocol"], "tun");
+}
+#[test]
+fn preflight_projection_refuses_ambiguous_tun_protocols_without_constructing_them() {
+    for config in [
+        json!(null),
+        json!({}),
+        json!({"inbounds":[null]}),
+        json!({"inbounds":[{}]}),
+        json!({"inbounds":[{"protocol":"TUN"}]}),
+        json!({"inbounds":[{"protocol":"http","Protocol":"tun"}]}),
+    ] {
+        assert!(config_preflight_projection(&config).is_err());
+    }
+}
+
+pub(crate) fn resolve_ipv4_addresses(host: &str, port: u16) -> Result<Vec<String>, String> {
+    ipv4_endpoint_addresses(resolve_socket_addresses(host, port))
+}
+
+fn ipv4_endpoint_addresses(
+    resolution: Result<Vec<std::net::SocketAddr>, String>,
+) -> Result<Vec<String>, String> {
+    let mut addresses = Vec::new();
+    for addr in resolution? {
+        if !addr.ip().is_ipv4() {
+            continue;
+        }
+        let ip = addr.ip().to_string();
+        if !addresses.iter().any(|item| item == &ip) {
+            addresses.push(ip);
+        }
+    }
+    if addresses.is_empty() {
+        return Err("TUN_ENDPOINT_NO_IPV4: TUN requires an IPv4 endpoint; use Proxy for an IPv6-only endpoint.".into());
+    }
+    Ok(addresses)
+}
+
+#[test]
+fn endpoint_ipv4_projection_keeps_dns_failures_distinct_and_deduplicates_without_network() {
+    for error in [
+        "DNS_TIMEOUT: resolution deadline",
+        "DNS_BUSY: bounded resolver workers exhausted",
+        "DNS_RESOLUTION_FAILED",
+    ] {
+        assert_eq!(
+            ipv4_endpoint_addresses(Err(error.into())).unwrap_err(),
+            error
+        );
+    }
+    assert!(
+        ipv4_endpoint_addresses(Ok(vec!["[2001:db8::1]:443".parse().unwrap()]))
+            .unwrap_err()
+            .starts_with("TUN_ENDPOINT_NO_IPV4")
+    );
+    let items = [
+        "192.0.2.1:443",
+        "[2001:db8::1]:443",
+        "192.0.2.1:443",
+        "192.0.2.2:443",
+    ]
+    .into_iter()
+    .map(|value| value.parse().unwrap())
+    .collect();
+    assert_eq!(
+        ipv4_endpoint_addresses(Ok(items)).unwrap(),
+        vec!["192.0.2.1", "192.0.2.2"]
+    );
 }
 
 #[cfg(target_os = "windows")]
