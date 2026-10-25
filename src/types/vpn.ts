@@ -109,13 +109,9 @@ export interface VpnServer {
 export interface UserPlan {
   title: string;
   expiresAt: string;
-  trafficUsedGb: number | null;
-  trafficLimitGb: number | null;
-  devices: number | null;
-  uploadBytes?: string | null;
-  downloadBytes?: string | null;
-  totalBytes?: string | null;
-  expiresAtUnix?: string | null;
+  trafficUsedGb: number;
+  trafficLimitGb: number;
+  devices: number;
 }
 
 export interface RemnawaveSession {
@@ -123,7 +119,7 @@ export interface RemnawaveSession {
   userId: string;
   displayName: string;
   loginHint: string;
-  deviceLimit: number | null;
+  deviceLimit: number;
   plan: UserPlan;
   source: RemnawaveSource;
   shortUuid?: string;
@@ -150,7 +146,7 @@ export interface SessionRecord {
   startedAt: string;
   serverLabel: string;
   durationLabel: string;
-  transferredGb: number | null;
+  transferredGb: number;
   status: 'completed' | 'current' | 'interrupted';
 }
 
@@ -178,7 +174,6 @@ export interface ProfileSyncInfo {
 }
 
 export interface RuntimeStatus {
-  diagnosticFacts?: DiagnosticFacts;
   runtimeId?: string;
   nativeInstanceId?: string;
   bridge: RuntimeBridge;
@@ -202,7 +197,6 @@ export interface RuntimeStatus {
   proxyServer?: string;
   proxyBypass?: string;
   networkMode?: TunnelMode;
-  tunRoutingMode?: TunRoutingMode;
   tunInterfaceName?: string;
   xrayPid?: number;
   runtimeConfigHash?: string;
@@ -219,27 +213,6 @@ export interface RuntimeStatus {
   proxyAutoDetect?: boolean;
 }
 
-export interface RepairReceipt {atUnixMs:number;code:string;restoreProxy:boolean;routeCount:number}
-export interface DiagnosticFacts {
-  lastConnectFailure?:ConnectFailureObservation;
-  tunInterface?:'ready'|'unavailable'|'not-applicable';
-  ports?:DiagnosticPort[];
-  checkedAtUnixMs:number;
-  resourceIntegrity:'verified'|'mismatch'|'unavailable';
-  storageMetadata:'present'|'missing'|'unavailable';
-  logsMetadata:'present'|'missing'|'unavailable';
-  elevation:'elevated'|'standard'|'unavailable';
-  repairHistory:RepairReceipt[];
-  repairHistoryStatus:'available'|'unavailable';
-}
-export interface ConnectFailureObservation {
-  checkedAtUnixMs:number;operationId:number|null;mode:'proxy'|'tun';
-  failure:{code:string;category:string;retryable:boolean;stage?:string;cause?:string;win32Code?:number};
-  process:'running'|'exited'|'not-started'|'unavailable';exitCode:number|null;
-  ports:DiagnosticPort[];systemProxy:'enabled'|'disabled'|'unavailable';
-  proxyOwnership:string;routeOwnership:string;ownedRouteCount:number;
-}
-export interface DiagnosticPort {port:10808|10809|10810;state:'free'|'owned'|'foreign'|'unconfirmed'|'unavailable'}
 export interface ProxyStatus {
   enabled: boolean;
   server?: string;
@@ -252,7 +225,6 @@ export interface ProxyStatus {
 }
 
 export interface ConnectivityProbe {
-  kind?: 'server-direct' | 'xray-http' | 'unavailable';
   success: boolean;
   checkedAt: string;
   httpPortOpen: boolean;
@@ -294,8 +266,6 @@ export interface AppSettings {
   themeGlow: boolean;
   sortServersByPing: boolean;
   tunRoutingMode: TunRoutingMode;
-  // Quarantine a corrupt persisted policy until an explicit user selection.
-  tunRoutingModeInvalid?: boolean;
   releaseChannel: ReleaseChannel;
   protocolStrategy: 'auto' | 'reality-first' | 'xray-only';
   profileSyncOnLogin: boolean;
@@ -333,7 +303,4 @@ export interface ToastItem {
   id: string;
   title: string;
   tone: 'info' | 'success' | 'error';
-  code?: string;
-  createdAt?: string;
-  overflowCount?: number;
 }

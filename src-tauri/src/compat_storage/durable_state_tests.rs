@@ -55,6 +55,92 @@ fn synthetic_key(suffix: &str) -> String {
 }
 
 #[test]
+fn rollback_carrier_retains_exact_v2_originals_and_unknown_fields_across_restarts() {
+    let f = Fixture::new();
+    let store = f.store();
+    let original = Envelope {
+        schema_version: 2, generation: "a".repeat(48), revision: 7, updated_at: "0".into(),
+        operations: Vec::new(),
+        payload: DurablePayload {
+            public_state: serde_json::from_value(json!({"settings":{"language":"en","future076Unknown":{"keep":true}},"favoriteServerIds":["server-a"],"selectedServerId":"server-a","futureRoot":{"keep":true}})).unwrap(),
+            protected: serde_json::from_value(json!({"futureProtected":{"keep":true},"lastKnownServers":[{"id":"server-a","rawUri":"synthetic-private"}]})).unwrap(),
+            access_key: Some(synthetic_key("rollback")), ..Default::default()
+        },
+    };
+    let cipher = encode_envelope(&original).unwrap();
+    fs::write(store.primary(), &cipher).unwrap();
+    fs::write(store.backup(), &cipher).unwrap();
+    fs::write(f.root.join("state-v2.initialized"), V2_MARKER).unwrap();
+    let snapshot = store.load().unwrap();
+    let archive = f.root.join("rollback-083-originals");
+    assert_eq!(fs::read(archive.join(V2_NAME)).unwrap(), cipher.as_bytes());
+    assert_eq!(
+        fs::read(archive.join("client-state-v2.dpapi.lkg.dpapi")).unwrap(),
+        cipher.as_bytes()
+    );
+    let saved = store
+        .patch(patch(
+            &snapshot,
+            "old-ui-edit",
+            "public",
+            "settings",
+            Some(json!({"language":"ru"})),
+        ))
+        .unwrap()
+        .snapshot;
+    assert_eq!(
+        saved.payload.public_state["settings"]["future076Unknown"]["keep"],
+        true
+    );
+    assert_eq!(saved.payload.public_state["futureRoot"]["keep"], true);
+    assert_eq!(saved.payload.protected["futureProtected"]["keep"], true);
+    assert_eq!(
+        saved.payload.protected["lastKnownServers"][0]["rawUri"],
+        "synthetic-private"
+    );
+    let restarted = f.store().load().unwrap();
+    assert_eq!(restarted.revision, saved.revision);
+    assert_eq!(restarted.payload.access_key, original.payload.access_key);
+    assert_eq!(
+        restarted.payload.public_state["favoriteServerIds"],
+        json!(["server-a"])
+    );
+    assert_eq!(
+        restarted.payload.public_state["selectedServerId"],
+        "server-a"
+    );
+    assert_eq!(fs::read(archive.join(V2_NAME)).unwrap(), cipher.as_bytes());
+    assert!(!fs::read_to_string(store.primary())
+        .unwrap()
+        .contains("synthetic-private"));
+}
+
+#[test]
+fn incomplete_or_tampered_rollback_archive_cannot_authorize_overwrite() {
+    let f = Fixture::new();
+    let store = f.store();
+    let first = store.load().unwrap();
+    let primary = fs::read(store.primary()).unwrap();
+    let dir = f.root.join("rollback-083-originals");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join(V2_NAME), "synthetic-conflicting-original").unwrap();
+    assert!(store
+        .patch(patch(
+            &first,
+            "must-fail",
+            "public",
+            "selectedServerId",
+            Some(json!("new"))
+        ))
+        .is_err());
+    assert_eq!(fs::read(store.primary()).unwrap(), primary);
+    assert_eq!(
+        fs::read_to_string(dir.join(V2_NAME)).unwrap(),
+        "synthetic-conflicting-original"
+    );
+}
+
+#[test]
 fn history_is_optional_bounded_secret_free_and_preserves_other_state() {
     let f = Fixture::new();
     let store = f.store();
@@ -592,7 +678,7 @@ fn interrupted_precommit_child_releases_lease_and_temp_is_not_authority() {
     command
         .args([
             "--exact",
-            "durable_state::tests::cross_process_fixture_entry",
+            "compat_storage::durable::tests::cross_process_fixture_entry",
             "--ignored",
             "--nocapture",
         ])
@@ -649,7 +735,7 @@ fn a_separate_process_cannot_bypass_the_native_writer_lease() {
     let result = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "durable_state::tests::cross_process_fixture_entry",
+            "compat_storage::durable::tests::cross_process_fixture_entry",
             "--ignored",
             "--nocapture",
         ])

@@ -231,12 +231,13 @@ impl DurableStore {
         if let Some(raw) = primary.as_ref() {
             match decode_envelope(raw) {
                 Ok((envelope, ciphertext)) => {
+                    self.preserve_rollback_originals(raw)?;
                     return Ok(Loaded {
                         envelope,
                         ciphertext: Some(ciphertext),
                         recovery_token: None,
                         corrupt_primary: None,
-                    })
+                    });
                 }
                 Err(error) if error.code == "STATE_UNSUPPORTED_SCHEMA" => return Err(error),
                 Err(_) => {}
@@ -257,6 +258,66 @@ impl DurableStore {
             return Err(failure("STATE_CORRUPT"));
         }
         self.migrate_legacy_locked()
+    }
+    fn preserve_rollback_originals(&self, primary: &[u8]) -> StateResult<()> {
+        // One immutable encrypted pre-rollback snapshot. Normal v2 primary/LKG
+        // continue their existing transaction semantics; originals stay recoverable.
+        let directory = self.root.join("rollback-083-originals");
+        let _guards = state_directory_guards(&directory, true).map_err(StateStorageError::io)?;
+        let manifest = directory.join("COMPLETE.json");
+        let names = [
+            V2_NAME,
+            "client-state-v2.dpapi.lkg.dpapi",
+            "state-v2.initialized",
+        ];
+        if let Some(text) = read_state_file(&manifest, 4096).map_err(StateStorageError::io)? {
+            let receipt: serde_json::Map<String, Value> =
+                serde_json::from_str(&text).map_err(|_| failure("STATE_ORIGINALS_INVALID"))?;
+            if receipt.len() != names.len() {
+                return Err(failure("STATE_ORIGINALS_INVALID"));
+            }
+            for name in names {
+                let expected = receipt
+                    .get(name)
+                    .ok_or_else(|| failure("STATE_ORIGINALS_INVALID"))?;
+                let actual = read_state_bytes(&directory.join(name), V2_CIPHER_LIMIT)
+                    .map_err(StateStorageError::io)?;
+                match (expected.as_str(), expected.is_null(), actual) {
+                    (Some(hash), _, Some(bytes)) if hash == sha256_hex_bytes(&bytes) => {}
+                    (None, true, None) => {}
+                    _ => return Err(failure("STATE_ORIGINALS_INVALID")),
+                }
+            }
+            return Ok(());
+        }
+        let sources = [
+            Some(primary.to_vec()),
+            self.read_bytes(&self.backup())?,
+            read_state_bytes(&self.root.join("state-v2.initialized"), 64)
+                .map_err(StateStorageError::io)?,
+        ];
+        let mut receipt = serde_json::Map::new();
+        for (name, source) in names.into_iter().zip(sources) {
+            let target = directory.join(name);
+            let existing =
+                read_state_bytes(&target, V2_CIPHER_LIMIT).map_err(StateStorageError::io)?;
+            if let Some(bytes) = source {
+                if let Some(saved) = existing {
+                    if saved != bytes {
+                        return Err(failure("STATE_ORIGINALS_CONFLICT"));
+                    }
+                } else {
+                    write_new_owned_bytes(&target, &bytes)?;
+                }
+                receipt.insert(name.into(), Value::String(sha256_hex_bytes(&bytes)));
+            } else {
+                if existing.is_some() {
+                    return Err(failure("STATE_ORIGINALS_CONFLICT"));
+                }
+                receipt.insert(name.into(), Value::Null);
+            }
+        }
+        write_new_owned_text(&manifest, &Value::Object(receipt).to_string())
     }
     fn migrate_legacy_locked(&self) -> StateResult<Loaded> {
         let marker = read_state_file(&self.root.join("state-v2.initialized"), 64)
@@ -528,6 +589,9 @@ impl DurableStore {
 }
 
 fn write_new_owned_text(path: &Path, payload: &str) -> StateResult<()> {
+    write_new_owned_bytes(path, payload.as_bytes())
+}
+fn write_new_owned_bytes(path: &Path, payload: &[u8]) -> StateResult<()> {
     if payload.len() as u64 > V2_CIPHER_LIMIT {
         return Err(failure("STATE_PRESERVATION_TOO_LARGE"));
     }
@@ -541,7 +605,7 @@ fn write_new_owned_text(path: &Path, payload: &str) -> StateResult<()> {
         .create_new(true)
         .open(path)
         .map_err(StateStorageError::io)?;
-    file.write_all(payload.as_bytes())
+    file.write_all(payload)
         .and_then(|_| file.sync_all())
         .map_err(StateStorageError::io)
 }

@@ -1,5 +1,5 @@
 import { CircleAlert, Copy, Download, MonitorCog, RefreshCw, X } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { copyInformation } from '../utils/clipboard';
 import { tr, type UiLanguage } from '../i18n';
 import type { NativeAppInfo, UpdateInfo } from '../types/vpn';
@@ -33,28 +33,10 @@ export function AppInfoModal({ open, language, info, updateInfo, onCheckUpdates,
   const [copying, setCopying] = useState(false);
   const copyBusy = useRef(false);
   const generation = useRef(0);
-  const dialog=useRef<HTMLElement>(null);
-  const closeRef=useRef(onClose);closeRef.current=onClose;
-  const invalidateCopies=useCallback(()=>{generation.current++;},[]);
   useEffect(() => {
-    invalidateCopies(); copyBusy.current = false; setCopying(false);
-    return invalidateCopies;
-  }, [open,invalidateCopies]);
-  useEffect(()=>{
-    if(!open)return;
-    const previous=document.activeElement as HTMLElement|null;
-    const focusable=()=>Array.from(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled),a[href],input:not(:disabled),[tabindex="0"]')??[]).filter(element=>element.tabIndex>=0);
-    focusable()[0]?.focus();
-    const key=(event:KeyboardEvent)=>{
-      if(event.key==='Escape'){event.preventDefault();closeRef.current();return;}
-      if(event.key!=='Tab')return;
-      const elements=focusable(),first=elements[0],last=elements[elements.length-1];
-      if(event.shiftKey&&document.activeElement===first){event.preventDefault();last?.focus();}
-      if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first?.focus();}
-    };
-    window.addEventListener('keydown',key,true);
-    return()=>{window.removeEventListener('keydown',key,true);previous?.focus();};
-  },[open]);
+    generation.current++; copyBusy.current = false; setCopying(false);
+    return () => { generation.current++; };
+  }, [open]);
   if (!open) {
     return null;
   }
@@ -78,7 +60,7 @@ export function AppInfoModal({ open, language, info, updateInfo, onCheckUpdates,
 
   return (
     <div className="vk-modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section ref={dialog} className="vk-modal-card vk-info-modal" role="dialog" aria-modal="true" aria-label={tr(language, 'Информация о приложении', 'Application information')} onMouseDown={(event) => event.stopPropagation()}>
+      <section className="vk-modal-card vk-info-modal" role="dialog" aria-modal="true" aria-label={tr(language, 'Информация о приложении', 'Application information')} onMouseDown={(event) => event.stopPropagation()}>
         <header className="vk-modal-header">
           <div>
             <span className="section-kicker"><CircleAlert size={16} /> VKarmani</span>

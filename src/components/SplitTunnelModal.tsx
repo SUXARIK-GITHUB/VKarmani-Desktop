@@ -6,7 +6,6 @@ import { listNativeWindowsServices } from '../services/runtime';
 import { PolicyChoice } from './PolicyChoice';
 import { policyEntryDisplay } from '../utils/policyDisplay';
 import { activePolicyEntries } from '../utils/appPolicies';
-import { applicationChoices, serviceChoices } from '../utils/appInventory';
 import '../styles/policies.css';
 
 interface SplitTunnelModalProps {
@@ -25,6 +24,10 @@ interface SplitTunnelModalProps {
   onRemoveEntry: (entryId: string) => void;
   onPickExecutable: (policy?: RoutingPolicy) => Promise<void> | void;
   onRefreshRunningApps: () => Promise<void> | void;
+}
+
+function getAppValue(app: RunningAppInfo) {
+  return app.path || app.name;
 }
 
 export function SplitTunnelModal({
@@ -47,26 +50,21 @@ export function SplitTunnelModal({
   const [appValue, setAppValue] = useState('');
   const [serviceValue, setServiceValue] = useState('');
   const [appSearch, setAppSearch] = useState('');
-  const [ruleSearch, setRuleSearch] = useState('');
-  const [serviceSearch, setServiceSearch] = useState('');
-  const [appLimit, setAppLimit] = useState(160);
-  const [serviceLimit, setServiceLimit] = useState(160);
   const [policy, setPolicy] = useState<RoutingPolicy>('VPN');
   const [services, setServices] = useState<WindowsServiceInfo[]>([]);
   const [servicesBusy, setServicesBusy] = useState(false);
   const [servicesError, setServicesError] = useState(false);
   const serviceGeneration = useRef(0);
-  const invalidateServices=useCallback(()=>++serviceGeneration.current,[]);
   const dialog = useRef<HTMLElement>(null);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
   const refreshServices = useCallback(async () => {
-    const generation = invalidateServices();
+    const generation = ++serviceGeneration.current;
     setServicesBusy(true); setServicesError(false);
     try { const next = await listNativeWindowsServices(); if (generation === serviceGeneration.current) setServices(next); }
     catch { if (generation === serviceGeneration.current) setServicesError(true); }
     finally { if (generation === serviceGeneration.current) setServicesBusy(false); }
-  }, [invalidateServices]);
+  }, []);
   useEffect(() => {
     if (!open) return;
     void refreshServices();
@@ -81,22 +79,20 @@ export function SplitTunnelModal({
       if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
     };
     window.addEventListener('keydown', key, true);
-    return () => { invalidateServices(); window.removeEventListener('keydown', key, true); previous?.focus(); };
-  }, [open, refreshServices,invalidateServices]);
-  const query = ruleSearch.trim().toLowerCase();
+    return () => { serviceGeneration.current++; window.removeEventListener('keydown', key, true); previous?.focus(); };
+  }, [open, refreshServices]);
+  const query = appSearch.trim().toLowerCase();
   const policyOptions = [{ value: 'VPN' as const, label: tr(language, 'Через VPN', 'Through VPN') }, { value: 'DIRECT' as const, label: tr(language, 'Напрямую', 'Direct') }];
   const filteredEntries = entries.filter(entry => `${entry.kind} ${entry.value} ${policyOptions.find(option => option.value === (entry.policy ?? 'VPN'))?.label ?? ''}`.toLowerCase().includes(query));
-  const uniqueServices = useMemo(() => serviceChoices(services), [services]);
-  const filteredServices = uniqueServices.filter(service => `${service.name} ${service.displayName} ${service.exePath}`.toLowerCase().includes(serviceSearch.trim().toLowerCase()));
+  const filteredServices = services.filter(service => `${service.name} ${service.displayName} ${service.exePath}`.toLowerCase().includes(query));
   const activeCount = useMemo(() => activePolicyEntries(entries, tunRoutingMode).length, [entries, tunRoutingMode]);
   const filteredRunningApps = useMemo(() => {
     const query = appSearch.trim().toLowerCase();
-    const unique = applicationChoices(runningApps);
     if (!query) {
-      return unique;
+      return runningApps;
     }
 
-    return unique.filter((app) => [app.name, app.path, app.title, ...app.processIds.map(String)]
+    return runningApps.filter((app) => [app.name, app.path, app.title, String(app.pid)]
       .filter(Boolean)
       .some((value) => String(value).toLowerCase().includes(query)));
   }, [appSearch, runningApps]);
@@ -146,7 +142,7 @@ export function SplitTunnelModal({
           </p>
           {tunnelMode === 'proxy' && <p className="split-tunnel-help policy-warning">{tr(language, 'Эти правила работают в режиме TUN. В режиме Proxy приложение с собственными настройками прокси может подключаться через него.', 'These rules apply in TUN mode. In Proxy mode, an application with its own proxy settings may still use that proxy.')}</p>}
           <div className="policy-toolbar">
-            <label className="split-field"><span>{tr(language, 'Поиск правил', 'Search rules')}</span><input value={ruleSearch} onChange={event => setRuleSearch(event.target.value)} placeholder={tr(language, 'Имя или путь…', 'Name or path…')} /></label>
+            <label className="split-field"><span>{tr(language, 'Поиск правил, программ и служб', 'Search rules, applications and services')}</span><input value={appSearch} onChange={event => setAppSearch(event.target.value)} placeholder={tr(language, 'Имя или путь…', 'Name or path…')} /></label>
             <div className="split-field"><span>{tr(language, 'Новое правило', 'New rule')}</span><PolicyChoice label={tr(language, 'Новое правило', 'New rule')} value={policy} onChange={setPolicy} options={policyOptions} /></div>
           </div>
 
@@ -183,7 +179,7 @@ export function SplitTunnelModal({
                 onKeyDown={stopModalEvent}
                 autoComplete="off"
                 spellCheck={false}
-                placeholder={tr(language,'Имя службы с отдельным .exe','Service name with a dedicated .exe')}
+                placeholder="Dnscache, WinHttpAutoProxySvc…"
               />
             </label>
             <button type="button" className="vk-secondary-action" onClick={() => { if (onAddEntry('service', serviceValue, policy)) setServiceValue(''); }}>
@@ -230,7 +226,7 @@ export function SplitTunnelModal({
               <span>{tr(language, 'Поиск по приложениям', 'Search applications')}</span>
               <input
                 value={appSearch}
-                onChange={(event) => { setAppSearch(event.target.value); setAppLimit(160); }}
+                onChange={(event) => setAppSearch(event.target.value)}
                 onMouseDown={stopModalEvent}
                 onClick={stopModalEvent}
                 onKeyDown={stopModalEvent}
@@ -240,29 +236,24 @@ export function SplitTunnelModal({
               />
             </label>
             <div className="running-app-list">
-              {filteredRunningApps.slice(0, appLimit).map((app) => {
-                const value = app.executable;
+              {filteredRunningApps.slice(0, 160).map((app) => {
+                const value = getAppValue(app);
                 return (
-                  <button type="button" className="running-app-row" key={app.identity} disabled={!value} onClick={() => { if (value) onAddEntry('app', value, policy); }}>
+                  <button type="button" className="running-app-row" key={`${app.pid}-${value}`} onClick={() => onAddEntry('app', value, policy)}>
                     <strong>{app.name}</strong>
-                    <small>{value || tr(language, 'Путь недоступен — выберите .exe вручную', 'Path unavailable — choose the .exe manually')} · {tr(language, `Процессов: ${app.processIds.length}`, `Processes: ${app.processIds.length}`)}</small>
+                    <small>{app.path || app.title || `PID ${app.pid}`}</small>
                   </button>
                 );
               })}
               {!runningApps.length ? <div className="split-empty">{isLoadingApps ? tr(language, 'Загружаем список приложений…', 'Loading application list…') : tr(language, 'Список приложений пуст.', 'The application list is empty.')}</div> : null}
               {runningApps.length > 0 && !filteredRunningApps.length ? <div className="split-empty">{tr(language, 'По этому поиску приложений не найдено.', 'No applications found for this search.')}</div> : null}
             </div>
-            <p className="split-tunnel-help">{tr(language, `Показано: ${Math.min(appLimit, filteredRunningApps.length)} из ${filteredRunningApps.length}`, `Showing ${Math.min(appLimit, filteredRunningApps.length)} of ${filteredRunningApps.length}`)}</p>
-            {filteredRunningApps.length > appLimit && <button type="button" className="vk-secondary-action compact" onClick={() => setAppLimit(value => value + 160)}>{tr(language, 'Показать ещё', 'Show more')}</button>}
           </section>
           <section className="split-section">
             <div className="split-section-title"><strong>{tr(language, 'Службы Windows', 'Windows services')}</strong><button type="button" className="vk-secondary-action compact" disabled={servicesBusy} onClick={() => void refreshServices()}><RefreshCw size={16} className={servicesBusy ? 'spin-icon' : ''} />{tr(language, 'Обновить', 'Refresh')}</button></div>
             <p className="split-tunnel-help">{tr(language, 'Можно выбрать службу с отдельным приложением. Службы в общем процессе, например svchost.exe, нельзя направить отдельно.', 'Choose a service with a dedicated application. Services sharing a process, such as svchost.exe, cannot be routed separately.')}</p>
-            <label className="split-field"><span>{tr(language, 'Поиск служб', 'Search services')}</span><input value={serviceSearch} onChange={event => { setServiceSearch(event.target.value); setServiceLimit(160); }} /></label>
             {servicesError && <p role="alert" className="split-empty">{tr(language, 'Список служб недоступен. Повторите загрузку.', 'Service list unavailable. Retry loading.')}</p>}
-            <div className="running-app-list">{filteredServices.slice(0,serviceLimit).map(service => <button type="button" className="running-app-row" key={service.name.toLowerCase()} disabled={!service.supported} onClick={() => onAddEntry('service', service.name, policy)}><strong>{service.displayName} · {service.name}</strong><small>{service.supported ? service.exePath : tr(language, 'Общий процесс или недоступное приложение', 'Shared process or unavailable application')}</small></button>)}</div>
-            <p className="split-tunnel-help">{tr(language, `Показано: ${Math.min(serviceLimit, filteredServices.length)} из ${filteredServices.length}`, `Showing ${Math.min(serviceLimit, filteredServices.length)} of ${filteredServices.length}`)}</p>
-            {filteredServices.length > serviceLimit && <button type="button" className="vk-secondary-action compact" onClick={() => setServiceLimit(value => value + 160)}>{tr(language, 'Показать ещё', 'Show more')}</button>}
+            <div className="running-app-list">{filteredServices.slice(0,160).map(service => <button type="button" className="running-app-row" key={service.name} disabled={!service.supported} onClick={() => onAddEntry('service', service.name, policy)}><strong>{service.displayName} · {service.name}</strong><small>{service.supported ? service.exePath : tr(language, 'Общий процесс или недоступное приложение', 'Shared process or unavailable application')}</small></button>)}</div>
             {!services.length && !servicesError && <div className="split-empty">{servicesBusy ? tr(language, 'Загружаем службы…', 'Loading services…') : tr(language, 'Службы доступны в Windows-клиенте.', 'Services are available in the Windows client.')}</div>}
             {services.length > 0 && !filteredServices.length && <div className="split-empty">{tr(language, 'Службы не найдены.', 'No services found.')}</div>}
           </section>

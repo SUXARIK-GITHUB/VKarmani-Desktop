@@ -1,5 +1,6 @@
 import type { ReleaseChannel, UpdateInfo } from '../types/vpn';
 import { appVersion, isTauriRuntime } from './runtime';
+import { quiescePersistentWrites, resumePersistentWrites } from './storage';
 
 const wait = (value: number) => new Promise<void>((resolve) => window.setTimeout(resolve, value));
 
@@ -33,11 +34,9 @@ function normalizeUpdaterError(error: unknown) {
 
 export async function checkForUpdates(channel: ReleaseChannel): Promise<UpdateInfo> {
   if (isTauriRuntime) {
-    let disposable: { close: () => Promise<void> } | null = null;
     try {
       const { check } = await import('@tauri-apps/plugin-updater');
       const update = await check({ timeout: 15000 });
-      disposable = update;
 
       if (!update) {
         return {
@@ -66,7 +65,7 @@ export async function checkForUpdates(channel: ReleaseChannel): Promise<UpdateIn
         status: 'error',
         message: normalizeUpdaterError(error)
       };
-    } finally { await disposable?.close().catch(() => undefined); }
+    }
   }
 
   await wait(450);
@@ -81,15 +80,14 @@ export async function checkForUpdates(channel: ReleaseChannel): Promise<UpdateIn
 }
 
 export async function installAvailableUpdate(
-  onProgress: (percent: number) => void,
-  beforeInstall: () => Promise<void>
+  onProgress: (percent: number) => void
 ): Promise<{ ok: true } | { ok: false; message: string }> {
   if (isTauriRuntime) {
-    let disposable: { close: () => Promise<void> } | null = null;
+    let interactionRoot: HTMLElement | null = null;
+    let previousInert = false;
     try {
       const { check } = await import('@tauri-apps/plugin-updater');
       const update = await check({ timeout: 15000 });
-      disposable = update;
 
       if (!update) {
         return { ok: false, message: 'Новой версии не найдено.' };
@@ -126,14 +124,20 @@ export async function installAvailableUpdate(
           onProgress(100);
         }
       });
-      // The native download verifies the signature before returning. Only
-      // then may the caller seal durable state and disconnect its own VPN.
-      await beforeInstall();
+
+      // Downloading allows normal edits. Only the final installer handoff blocks
+      // input and drains durable writes before Windows exits this exact process.
+      interactionRoot = typeof document === 'undefined' ? null : document.body;
+      previousInert = interactionRoot?.inert ?? false;
+      if (interactionRoot) interactionRoot.inert = true;
+      await quiescePersistentWrites();
       await update.install();
       return { ok: true };
     } catch (error) {
+      if (interactionRoot) interactionRoot.inert = previousInert;
+      resumePersistentWrites();
       return { ok: false, message: normalizeUpdaterError(error) };
-    } finally { await disposable?.close().catch(() => undefined); }
+    }
   }
 
   for (let percent = 8; percent <= 100; percent += 8) {
@@ -141,6 +145,5 @@ export async function installAvailableUpdate(
     onProgress(percent);
   }
 
-  await beforeInstall();
   return { ok: true };
 }

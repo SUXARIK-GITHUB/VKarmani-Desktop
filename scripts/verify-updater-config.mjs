@@ -115,19 +115,17 @@ if (tauri.bundle?.createUpdaterArtifacts !== true) {
   ok('createUpdaterArtifacts is enabled');
 }
 
+
+const coreFiles = ['xray.exe', 'geoip.dat', 'geosite.dat', 'wintun.dll'];
 const updaterDependency = cargo.match(/^tauri-plugin-updater\s*=\s*\{([^}]+)\}/m)?.[1] ?? '';
 if (!/version\s*=\s*"2\.10\.0"/.test(updaterDependency)
   || !/default-features\s*=\s*false/.test(updaterDependency)
-  || !/features\s*=\s*\[\s*"rustls-tls"\s*\]/.test(updaterDependency)) {
-  fail('updater must retain reviewed 2.10.0/rustls-tls with default-features=false; legacy archive support is forbidden');
-} else if (/^name\s*=\s*"zip"\s*$/m.test(cargoLock)) {
-  fail('Cargo.lock must not include the legacy ZIP updater extractor');
+  || !/features\s*=\s*\[\s*"rustls-tls"\s*\]/.test(updaterDependency)
+  || /^name\s*=\s*"zip"\s*$/m.test(cargoLock)) {
+  fail('updater must retain reviewed 2.10.0/rustls-tls, without the unused legacy ZIP extractor');
 } else {
-  ok('direct signed EXE/MSI updater retains rustls-tls without legacy archive extraction');
+  ok('direct signed EXE/MSI updater retains TLS and signature verification without legacy ZIP extraction');
 }
-
-
-const coreFiles = ['xray.exe', 'geoip.dat', 'geosite.dat', 'wintun.dll'];
 const resources = tauri.bundle?.resources;
 
 if (!resources || Array.isArray(resources)) {
@@ -297,16 +295,13 @@ if (!fs.existsSync(workflowPath)) {
   }
   const cargoLockPath = path.join(root, 'src-tauri/Cargo.lock');
   const cargoLock = fs.existsSync(cargoLockPath) ? fs.readFileSync(cargoLockPath, 'utf8') : '';
-  const rustlsPinned = /name = "rustls"\r?\nversion = "0\.23\.46"/.test(cargoLock);
-  const rustlsWebpkiPinned = /name = "rustls-webpki"\r?\nversion = "0\.103\.16"/.test(cargoLock);
-  const rootsPinned = /name = "webpki-roots"\r?\nversion = "1\.0\.10"/.test(cargoLock);
+  const patchedPins = { rustls: '0.23.46', 'rustls-webpki': '0.103.16', 'webpki-roots': '1.0.10',
+    'quinn-proto': '0.11.18', 'webpki-root-certs': '1.0.10', plist: '1.10.0', 'quick-xml': '0.41.0' };
+  const patchedPinsPresent = Object.entries(patchedPins).every(([name, version]) => cargoLock.includes(`name = "${name}"\nversion = "${version}"`)
+    || cargoLock.includes(`name = "${name}"\r\nversion = "${version}"`));
   const tarPinned = /name = "tar"\r?\nversion = "0\.4\.45"/.test(cargoLock);
-  const quinnPinned = /name = "quinn-proto"\r?\nversion = "0\.11\.18"/.test(cargoLock);
-  const rootCertsPinned = /name = "webpki-root-certs"\r?\nversion = "1\.0\.10"/.test(cargoLock);
-  const plistPinned = /name = "plist"\r?\nversion = "1\.10\.0"/.test(cargoLock);
-  const xmlPinned = /name = "quick-xml"\r?\nversion = "0\.41\.0"/.test(cargoLock);
-  if (!rustlsPinned || !rustlsWebpkiPinned || !rootsPinned || !tarPinned || !quinnPinned || !rootCertsPinned || !plistPinned || !xmlPinned) {
-    fail('Cargo.lock must retain accepted patched dependencies: rustls 0.23.46, rustls-webpki 0.103.16, webpki-roots 1.0.10, tar 0.4.45, quinn-proto 0.11.18, webpki-root-certs 1.0.10, plist 1.10.0 and quick-xml 0.41.0');
+  if (!patchedPinsPresent || !tarPinned) {
+    fail('Cargo.lock must retain reviewed patched dependency versions; run the unchanged complete advisory gate too');
   } else if (/cargo\s+update/.test(workflow)) {
     fail('release workflow must not mutate Cargo.lock with cargo update; patched Rust dependencies must be committed in Cargo.lock');
   } else {
@@ -329,11 +324,10 @@ if (!fs.existsSync(workflowPath)) {
   } else {
     ok('release workflow includes latest.json');
   }
-  const draftSettings = [...workflow.matchAll(/^\s*releaseDraft:\s*([^\r\n#]+)/gm)].map(match => match[1].trim());
-  if (draftSettings.length !== 1 || draftSettings[0] !== 'true') {
-    fail('release workflow must build a draft first; stable promotion requires verified artifacts, full production GO and control-channel safety');
+  if (!/releaseDraft:\s*true/.test(workflow)) {
+    fail('release workflow must build to Draft before explicit verified Stable promotion');
   } else {
-    ok('release workflow creates a draft without replacing the installed-client latest endpoint');
+    ok('release workflow stages Draft; Stable promotion requires independent asset/signature/data verification');
   }
 }
 

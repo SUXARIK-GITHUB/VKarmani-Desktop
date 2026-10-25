@@ -316,336 +316,12 @@ mod windows {
             }
         }
     }
-    #[test]
-    fn path_contract_runtime_hardening_removes_explicit_world_access() {
-        let dir = std::env::temp_dir().join(format!("vkarmani-world-acl-{}", unix_now_string()));
-        let sddl = "D:P(A;OICI;FA;;;WD)"
-            .encode_utf16()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        let mut descriptor = null_mut();
-        assert_ne!(
-            unsafe {
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    sddl.as_ptr(),
-                    1,
-                    &mut descriptor,
-                    null_mut(),
-                )
-            },
-            0
-        );
-        let _descriptor = Descriptor(descriptor);
-        let attrs = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor,
-            bInheritHandle: 0,
-        };
-        assert_ne!(
-            unsafe { CreateDirectoryW(wide(&dir).unwrap().as_ptr(), &attrs) },
-            0
-        );
-        let _ = harden_runtime_output_dir(&dir);
-        let file = lock(&dir, true).unwrap();
-        let (mut dacl, mut descriptor) = (null_mut(), null_mut());
-        let code = unsafe {
-            GetSecurityInfo(
-                file.as_raw_handle(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                null_mut(),
-                null_mut(),
-                &mut dacl,
-                null_mut(),
-                &mut descriptor,
-            )
-        };
-        let _descriptor = Descriptor(descriptor);
-        assert_eq!(code, 0);
-        assert!(!dacl.is_null());
-        let mut world_access = false;
-        for index in 0..unsafe { (*dacl).AceCount } as u32 {
-            let mut ace = null_mut();
-            assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
-            let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
-            world_access |= allowed.Header.AceType == 0
-                && unsafe {
-                    IsWellKnownSid((&allowed.SidStart as *const u32) as PSID, WinWorldSid)
-                } != 0;
-        }
-        drop(file);
-        fs::remove_dir(&dir).unwrap();
-        assert!(
-            !world_access,
-            "runtime must not retain explicit Everyone access"
-        );
-    }
-    #[test]
-    fn path_contract_config_acl_is_private_before_first_plaintext_write() {
-        let dir = std::env::temp_dir().join(format!("vkarmani-config-acl-{}", unix_now_string()));
-        fs::create_dir(&dir).unwrap();
-        let path = dir.join("synthetic.json");
-        let mut file = create_private_config(&path).unwrap();
-        assert_eq!(file.metadata().unwrap().len(), 0);
-        private_acl(&file, true).unwrap();
-        // Even another handle in this process cannot swap or read it mid-write.
-        assert!(File::open(&path).is_err());
-        assert!(fs::remove_file(&path).is_err());
-        file.write_all(b"synthetic-private-config").unwrap();
-        file.sync_all().unwrap();
-        drop(file);
-        let file = OpenOptions::new()
-            .access_mode(READ_CONTROL)
-            .open(&path)
-            .unwrap();
-        private_acl(&file, true).unwrap();
-        drop(file);
-        assert!(write_new_runtime_config(&path, b"replacement").is_err());
-        assert_eq!(fs::read(&path).unwrap(), b"synthetic-private-config");
-        fs::remove_file(path).unwrap();
-        fs::remove_dir(dir).unwrap();
-    }
-    #[test]
-    fn path_contract_runtime_root_type_and_sharing_fail_without_writing_config() {
-        let dir = std::env::temp_dir().join(format!("vkarmani-root-denied-{}", unix_now_string()));
-        fs::create_dir(&dir).unwrap();
-        let path = dir.join("runtime");
-        fs::write(&path, b"preserve-not-a-directory").unwrap();
-        assert!(secure_directory(&path).is_err());
-        assert_eq!(fs::read(&path).unwrap(), b"preserve-not-a-directory");
-        fs::remove_file(&path).unwrap();
-        secure_directory(&path).unwrap();
-        let lock = OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(&path)
-            .unwrap();
-        assert!(secure_directory(&path).is_err());
-        drop(lock);
-        assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
-        secure_directory(&path).unwrap();
-        fs::remove_dir(path).unwrap();
-        fs::remove_dir(dir).unwrap();
-    }
-    #[test]
-    fn path_contract_complete_unicode_bundle_pins_manifest_and_all_sidecars() {
-        let dir = std::env::temp_dir().join(format!(
-            "VKarmani Приложение & пробелы-{}",
-            unix_now_string()
-        ));
-        fs::create_dir(&dir).unwrap();
-        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../resources/core/windows");
-        let names = [
-            "xray.exe",
-            "wintun.dll",
-            "geoip.dat",
-            "geosite.dat",
-            "core-manifest.json",
-        ];
-        for name in names {
-            fs::copy(source.join(name), dir.join(name)).unwrap();
-        }
-        validate_bundle(&dir.join("xray.exe")).unwrap();
-        for name in names {
-            let path = dir.join(name);
-            let displaced = dir.join("displaced-fixture");
-            fs::rename(&path, &displaced).unwrap();
-            assert!(validate_bundle(&dir.join("xray.exe")).is_err());
-            fs::write(&path, b"tampered-fixture").unwrap();
-            assert!(validate_bundle(&dir.join("xray.exe")).is_err());
-            fs::remove_file(&path).unwrap();
-            fs::rename(&displaced, &path).unwrap();
-        }
-        validate_bundle(&dir.join("xray.exe")).unwrap();
-        for name in names {
-            fs::remove_file(dir.join(name)).unwrap();
-        }
-        fs::remove_dir(dir).unwrap();
-    }
     fn trusted_sid(sid: PSID) -> bool {
         !sid.is_null()
             && unsafe {
                 IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
                     || IsWellKnownSid(sid, WinLocalSystemSid) != 0
             }
-    }
-    fn current_user_sid() -> Result<Vec<u32>, String> {
-        crate::process_inventory::owner_sid(unsafe {
-            windows_sys::Win32::System::Threading::GetCurrentProcess()
-        })
-        .ok_or_else(|| "RUNTIME_ACL_USER_UNAVAILABLE".into())
-    }
-    fn private_descriptor() -> Result<Descriptor, String> {
-        let sid = current_user_sid()?;
-        let mut text = null_mut();
-        if unsafe { ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut text) } == 0 {
-            return Err("RUNTIME_ACL_SID_UNAVAILABLE".into());
-        }
-        let _text = Descriptor(text.cast());
-        let mut len = 0;
-        while len < 256 && unsafe { *text.add(len) } != 0 {
-            len += 1;
-        }
-        if len == 256 {
-            return Err("RUNTIME_ACL_SID_INVALID".into());
-        }
-        let sid = String::from_utf16(unsafe { slice::from_raw_parts(text, len) })
-            .map_err(|_| "RUNTIME_ACL_SID_INVALID")?;
-        let sddl = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})")
-            .encode_utf16()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        let mut descriptor = null_mut();
-        if unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                1,
-                &mut descriptor,
-                null_mut(),
-            )
-        } == 0
-        {
-            return Err("RUNTIME_ACL_DESCRIPTOR_FAILED".into());
-        }
-        Ok(Descriptor(descriptor))
-    }
-    fn private_acl(file: &File, check_dacl: bool) -> Result<(), String> {
-        let user = current_user_sid()?;
-        let is_user = |sid: PSID| {
-            !sid.is_null() && unsafe { EqualSid(sid, user.as_ptr().cast_mut().cast()) } != 0
-        };
-        let (mut owner, mut dacl, mut descriptor) = (null_mut(), null_mut(), null_mut());
-        let code = unsafe {
-            GetSecurityInfo(
-                file.as_raw_handle(),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut owner,
-                null_mut(),
-                &mut dacl,
-                null_mut(),
-                &mut descriptor,
-            )
-        };
-        let _descriptor = Descriptor(descriptor);
-        if code != 0 || !(is_user(owner) || trusted_sid(owner)) {
-            return Err("RUNTIME_ACL_OWNER_UNVERIFIED".into());
-        }
-        if !check_dacl {
-            return Ok(());
-        }
-        let (mut control, mut revision) = (0, 0);
-        if dacl.is_null()
-            || unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
-            || control & SE_DACL_PROTECTED == 0
-        {
-            return Err("RUNTIME_ACL_UNPROTECTED".into());
-        }
-        let mut has_user = false;
-        let mut has_system = false;
-        let mut has_admin = false;
-        for index in 0..unsafe { (*dacl).AceCount } as u32 {
-            let mut ace = null_mut();
-            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
-                return Err("RUNTIME_ACL_ACE_UNAVAILABLE".into());
-            }
-            let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
-            let sid = (&allowed.SidStart as *const u32) as PSID;
-            if allowed.Header.AceType != 0
-                || allowed.Header.AceFlags & INHERIT_ONLY_ACE as u8 != 0
-                || allowed.Mask != FILE_ALL_ACCESS
-                || !(is_user(sid) || trusted_sid(sid))
-            {
-                return Err("RUNTIME_ACL_UNEXPECTED_ACCESS".into());
-            }
-            has_user |= is_user(sid);
-            has_system |= unsafe { IsWellKnownSid(sid, WinLocalSystemSid) } != 0;
-            has_admin |= unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) } != 0;
-        }
-        if !(has_user && has_system && has_admin) {
-            return Err("RUNTIME_ACL_TRUSTEES_MISSING".into());
-        }
-        Ok(())
-    }
-    pub(super) fn secure_directory(path: &Path) -> Result<(), String> {
-        let parent = path.parent().ok_or("RUNTIME_ROOT_INVALID")?;
-        let _parents = crate::persistence::state_directory_guards(parent, true)
-            .map_err(|error| format!("RUNTIME_ROOT_UNAVAILABLE: {error}"))?;
-        let descriptor = private_descriptor()?;
-        let attrs = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor.0,
-            bInheritHandle: 0,
-        };
-        if unsafe { CreateDirectoryW(wide(path)?.as_ptr(), &attrs) } == 0
-            && std::io::Error::last_os_error().raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32)
-        {
-            return Err("RUNTIME_DIRECTORY_CREATE_DENIED".into());
-        }
-        let _directory = crate::persistence::state_directory_guards(path, false)
-            .map_err(|error| format!("RUNTIME_DIRECTORY_UNSAFE: {error}"))?;
-        let file = OpenOptions::new()
-            .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-            .map_err(|_| "RUNTIME_ACL_OPEN_DENIED")?;
-        private_acl(&file, false)?; // Never adopt an unverified owner's directory.
-        let (mut present, mut dacl, mut defaulted) = (0, null_mut(), 0);
-        if unsafe {
-            GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted)
-        } == 0
-            || present == 0
-            || dacl.is_null()
-        {
-            return Err("RUNTIME_ACL_DESCRIPTOR_FAILED".into());
-        }
-        if unsafe {
-            SetSecurityInfo(
-                file.as_raw_handle(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                null_mut(),
-                null_mut(),
-                dacl,
-                null_mut(),
-            )
-        } != 0
-        {
-            return Err("RUNTIME_ACL_SET_DENIED".into());
-        }
-        private_acl(&file, true)
-    }
-    pub(super) fn create_private_config(path: &Path) -> Result<File, String> {
-        use std::os::windows::io::FromRawHandle;
-        let descriptor = private_descriptor()?;
-        let attrs = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor.0,
-            bInheritHandle: 0,
-        };
-        let handle = unsafe {
-            CreateFileW(
-                wide(path)?.as_ptr(),
-                GENERIC_WRITE | READ_CONTROL,
-                0,
-                &attrs,
-                CREATE_NEW,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-                null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err("CONFIG_CREATE_NEW_FAILED".into());
-        }
-        let file = unsafe { File::from_raw_handle(handle) };
-        if let Err(error) = private_acl(&file, true) {
-            drop(file);
-            let _ = fs::remove_file(path);
-            return Err(error);
-        }
-        Ok(file)
     }
     fn protected_acl(file: &File, require_protected: bool) -> Result<(), String> {
         let (mut owner, mut dacl, mut descriptor) = (null_mut(), null_mut(), null_mut());
@@ -757,11 +433,10 @@ mod windows {
         }
         value
     }
-    type BundleArtifact = (&'static str, u64, String, File);
-    fn pin_bundle(core: &Path) -> Result<(Vec<File>, Vec<BundleArtifact>), String> {
-        if core.file_name().and_then(|name| name.to_str()) != Some("xray.exe") {
-            return Err("CORE_EXECUTABLE_NAME_INVALID".into());
-        }
+    pub(super) fn prepare(
+        core: &Path,
+        config: Option<(&Path, &str)>,
+    ) -> Result<LaunchIntegrity, String> {
         let dir = core.parent().ok_or("CORE_DIRECTORY_MISSING")?;
         let mut source_locks = lock_ancestors(core)?;
         let mut resources = Vec::new();
@@ -770,22 +445,6 @@ mod windows {
             let file = verified_file(&dir.join(name), Some(size), &hash)?;
             resources.push((name, size, hash, file));
         }
-        source_locks.push(verified_file(
-            &dir.join("core-manifest.json"),
-            Some(COMPILED_CORE_MANIFEST.len() as u64),
-            &sha256_hex_bytes(COMPILED_CORE_MANIFEST.as_bytes()),
-        )?);
-        Ok((source_locks, resources))
-    }
-    pub(super) fn validate_bundle(core: &Path) -> Result<(), String> {
-        let _pins = pin_bundle(core)?;
-        Ok(())
-    }
-    pub(super) fn prepare(
-        core: &Path,
-        config: Option<(&Path, &str)>,
-    ) -> Result<LaunchIntegrity, String> {
-        let (mut source_locks, mut resources) = pin_bundle(core)?;
         let mut config_file = if let Some((path, hash)) = config {
             source_locks.extend(lock_ancestors(path)?);
             Some(verified_file(path, None, hash)?)
@@ -898,9 +557,6 @@ pub(crate) fn ensure_safe_log_directory(path: &Path) -> Result<Vec<File>, String
 }
 pub(crate) fn write_new_runtime_config(path: &Path, content: &[u8]) -> Result<(), String> {
     let _parents = lock_runtime_parent_paths(path)?;
-    #[cfg(target_os = "windows")]
-    let mut file = windows::create_private_config(path)?;
-    #[cfg(not(target_os = "windows"))]
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -913,28 +569,6 @@ pub(crate) fn write_new_runtime_config(path: &Path, content: &[u8]) -> Result<()
         return Err("CONFIG_WRITE_FAILED".into());
     }
     Ok(())
-}
-pub(crate) fn secure_runtime_directory(path: &Path) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        windows::secure_directory(path)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = path;
-        Err("WINDOWS_RUNTIME_REQUIRED".into())
-    }
-}
-pub(crate) fn validate_core_bundle(core: &Path) -> Result<(), String> {
-    validate_core_path(core)?;
-    #[cfg(target_os = "windows")]
-    {
-        windows::validate_bundle(core)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Err("WINDOWS_RUNTIME_REQUIRED".into())
-    }
 }
 pub(crate) fn prepare_core_launch(
     core: &Path,

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks=vi.hoisted(()=>({fetch:vi.fn(),cache:vi.fn()}));
-vi.mock('../src/services/runtime',async importOriginal=>({ ...await importOriginal<typeof import('../src/services/runtime')>(),fetchRemoteSubscription:async(...args:unknown[])=>({text:await mocks.fetch(...args),userinfo:{upload:null,download:null,total:null,expire:null}}),cacheNativeProfileSync:mocks.cache }));
+vi.mock('../src/services/runtime',async importOriginal=>({ ...await importOriginal<typeof import('../src/services/runtime')>(),fetchRemoteText:mocks.fetch,cacheNativeProfileSync:mocks.cache }));
 import { RemnawaveClient } from '../src/services/remnawave';
 import { parseXrayJsonSubscriptionToServers as parse } from '../src/services/remnawave/subscriptionParser';
 import { resolveConnectedProfile, buildServerRuntimeFingerprint } from '../src/utils/serverIdentity';

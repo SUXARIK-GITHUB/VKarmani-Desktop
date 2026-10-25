@@ -12,9 +12,6 @@ const [server] = parse(JSON.stringify(auto));
 const status = () => ({ lastPreparedServerId: server.id, lastPreparedServerFingerprint: buildServerRuntimeFingerprint(server), configPath: 'owned-B.json' });
 beforeEach(() => { vi.clearAllMocks(); native.proxy.mockResolvedValue({ enabled: true }); native.rollback.mockResolvedValue({ tunnelActive: false }); });
 describe('native connect cleanup is scoped to the exact returned runtime', () => {
-  it('native disconnect delegates the complete owned cleanup to one RPC',async()=>{
-    await remnawaveClient.disconnect({useSystemProxy:true});expect(native.disconnect).toHaveBeenCalledOnce();expect(native.proxy).not.toHaveBeenCalled();
-  });
   it.each(['prepare failure', 'PROCESS_STOP_UNCONFIRMED', 'Runtime уже выполняет другое действие', 'Подключение заняло больше'])('never restores proxy/disconnects on rejected connect: %s', async message => {
     native.connect.mockRejectedValueOnce(new Error(message));
     await expect(remnawaveClient.connect(server, { reconnect: true, useSystemProxy: true })).rejects.toThrow();

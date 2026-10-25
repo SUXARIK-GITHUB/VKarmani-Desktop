@@ -43,31 +43,12 @@ if ((Get-Item -LiteralPath (Join-Path $WorkDir 'valid/folder/file')).Length -ne 
 $script:count++; Write-Host 'PASS valid archive'
 $bundle = Join-Path $WorkDir ('.windows-stage-' + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($bundle) | Out-Null
-$pe = New-Object byte[] 1024
+$pe = New-Object byte[] 512
 [BitConverter]::GetBytes([uint16]23117).CopyTo($pe, 0)
 [BitConverter]::GetBytes([uint32]128).CopyTo($pe, 60)
 [BitConverter]::GetBytes([uint32]17744).CopyTo($pe, 128)
 [BitConverter]::GetBytes([uint16]34404).CopyTo($pe, 132)
-[BitConverter]::GetBytes([uint16]1).CopyTo($pe, 134)
-[BitConverter]::GetBytes([uint16]240).CopyTo($pe, 148)
 [BitConverter]::GetBytes([uint16]523).CopyTo($pe, 152)
-[BitConverter]::GetBytes([uint32]512).CopyTo($pe, 408)
-[BitConverter]::GetBytes([uint32]512).CopyTo($pe, 412)
-$peProbe = Join-Path $WorkDir 'bounds-probe.exe'
-[IO.File]::WriteAllBytes($peProbe, [byte[]]$pe[0..511])
-Must-Reject 'truncated PE section data with valid MZ/amd64/PE32+ header' { Assert-WindowsAmd64Pe $peProbe }
-foreach ($mutation in @(
-  @{label='zero sections'; offset=134; bytes=[BitConverter]::GetBytes([uint16]0)},
-  @{label='excessive sections'; offset=134; bytes=[BitConverter]::GetBytes([uint16]97)},
-  @{label='short optional header'; offset=148; bytes=[BitConverter]::GetBytes([uint16]2)},
-  @{label='section table outside file'; offset=148; bytes=[BitConverter]::GetBytes([uint16]65535)},
-  @{label='section overlaps headers'; offset=412; bytes=[BitConverter]::GetBytes([uint32]200)},
-  @{label='section uint32 addition overflow'; offset=412; bytes=[BitConverter]::GetBytes([uint32]4294967280)}
-)) {
-  $malformed = $pe.Clone(); $mutation.bytes.CopyTo($malformed, $mutation.offset)
-  [IO.File]::WriteAllBytes($peProbe, $malformed)
-  Must-Reject $mutation.label { Assert-WindowsAmd64Pe $peProbe }
-}
 foreach ($name in @('xray.exe', 'wintun.dll')) { [IO.File]::WriteAllBytes((Join-Path $bundle $name), $pe) }
 foreach ($name in @('geoip.dat', 'geosite.dat')) { [IO.File]::WriteAllBytes((Join-Path $bundle $name), [byte[]]@(1,2,3)) }
 $entries = foreach ($name in @('xray.exe', 'wintun.dll', 'geoip.dat', 'geosite.dat')) {

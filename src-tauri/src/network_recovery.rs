@@ -40,20 +40,6 @@ pub(crate) fn run_owned_recovery<T>(
     }
 }
 
-pub(crate) fn require_physical_binding(
-    expected: &DefaultRouteSnapshot,
-    observed: Result<DefaultRouteSnapshot, String>,
-) -> Result<(), String> {
-    match observed {
-        Ok(current) if &current == expected => Ok(()),
-        Ok(_) => Err(
-            "NETWORK_BINDING_CHANGED: physical adapter/source/gateway/DNS changed during connect"
-                .into(),
-        ),
-        Err(_) => Err("NETWORK_BINDING_UNCONFIRMED: physical binding cannot be confirmed".into()),
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct PhysicalRecoveryPolicy {
     epoch: Option<u64>,
@@ -271,29 +257,6 @@ mod tests {
             next_hop: "192.0.2.1".into(),
             dns_servers: vec!["192.0.2.53".into()],
         }
-    }
-    #[test]
-    fn connect_requires_exact_current_physical_binding_and_never_exposes_query_errors() {
-        let expected = binding();
-        require_physical_binding(&expected, Ok(expected.clone())).unwrap();
-        for change in 0..6 {
-            let mut changed = expected.clone();
-            match change {
-                0 => changed.source_ip = "192.0.2.44".into(),
-                1 => changed.interface_index += 1,
-                2 => changed.interface_luid += 1,
-                3 => changed.interface_alias = "Wi-Fi".into(),
-                4 => changed.next_hop = "192.0.2.2".into(),
-                _ => changed.dns_servers = vec!["192.0.2.54".into()],
-            }
-            assert!(require_physical_binding(&expected, Ok(changed))
-                .unwrap_err()
-                .starts_with("NETWORK_BINDING_CHANGED"));
-        }
-        let error =
-            require_physical_binding(&expected, Err("PRIVATE-SYNTHETIC-PATH".into())).unwrap_err();
-        assert!(error.starts_with("NETWORK_BINDING_UNCONFIRMED"));
-        assert!(!error.contains("PRIVATE"));
     }
     #[test]
     fn physical_changes_debounce_and_rate_limit_across_new_runtime_epochs() {

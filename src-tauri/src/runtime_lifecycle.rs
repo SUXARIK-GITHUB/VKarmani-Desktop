@@ -82,11 +82,6 @@ impl std::ops::DerefMut for PendingXray {
 impl Drop for PendingXray {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            crate::diagnostic_facts::record_pending_failure_if_missing(
-                &self.app,
-                &self.network_mode,
-                Some(child),
-            );
             let pid = child.id();
             let _ = terminate_child_with_timeout(child, Duration::from_secs(3));
             child.release_integrity();
@@ -104,33 +99,6 @@ impl Drop for PendingXray {
 
 pub(crate) const MAX_XRAY_SELF_RESTARTS: u8 = 3;
 pub(crate) const XRAY_SELF_RESTART_READY_TIMEOUT: Duration = Duration::from_secs(14);
-
-pub(crate) fn owned_runtime_ports_ready(child: &mut Child) -> Result<bool, String> {
-    checked_child_readiness(child, |child| {
-        #[cfg(target_os = "windows")]
-        {
-            crate::diagnostic_facts::runtime_ports_ready(child.id())
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = child;
-            Err("WINDOWS_NETWORK_REQUIRED: listener ownership unavailable".into())
-        }
-    })
-}
-fn checked_child_readiness(
-    child: &mut Child,
-    query: impl FnOnce(&mut Child) -> Result<bool, String>,
-) -> Result<bool, String> {
-    if !matches!(child.try_wait(), Ok(None)) {
-        return Err("CORE_EXITED_EARLY: child not live before listener query".into());
-    }
-    let ready = query(child)?;
-    if !matches!(child.try_wait(), Ok(None)) {
-        return Err("CORE_EXITED_EARLY: child exited during listener query".into());
-    }
-    Ok(ready)
-}
 
 pub(crate) fn spawn_xray_runtime_child(
     core_path: &Path,
@@ -339,14 +307,12 @@ pub(crate) fn stop_runtime_orphans_for_app(
     false
 }
 
-pub(crate) fn cleanup_application(app: &AppHandle, reason: &str) -> Result<(), String> {
+pub(crate) fn cleanup_application(app: &AppHandle, reason: &str) {
     let _ = append_runtime_event(app, &format!("Запущен cleanup приложения: {reason}."));
-    let result = request_disconnect_blocking(app.clone()).map(|_| ());
-    if let Err(error) = &result {
+    if let Err(error) = request_disconnect_blocking(app.clone()) {
         let _ = append_runtime_event(app, &format!("Cleanup не подтверждён ({reason}): {error}"));
     }
     refresh_tray_menu(app);
-    result
 }
 
 pub(crate) fn normalize_socket_host(host: &str) -> String {
@@ -447,7 +413,7 @@ pub(crate) fn ensure_runtime_ports_available() -> Result<(), String> {
     }
 
     Err(format!(
-        "CORE_PORT_CONFLICT: Локальные порты VKarmani уже заняты: {}. Закройте другой VPN/proxy-клиент или перезапустите VKarmani.",
+        "Локальные порты VKarmani уже заняты: {}. Закройте другой VPN/proxy-клиент или перезапустите VKarmani.",
         format_busy_runtime_ports(&busy_ports)
     ))
 }
@@ -470,6 +436,22 @@ pub(crate) fn wait_for_runtime_ports_release(timeout: Duration) -> Result<(), St
 
         std::thread::sleep(Duration::from_millis(120));
     }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) const POWERSHELL_COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
+
+#[cfg(target_os = "windows")]
+pub(crate) fn run_powershell_command(command: Command, context: &str) -> Result<String, String> {
+    run_command_with_timeout(command, POWERSHELL_COMMAND_TIMEOUT, context)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn run_powershell(script: &str) -> Result<String, String> {
+    let mut command = Command::new(system_program("powershell")?);
+    let utf8_script = format!("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; {script}");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &utf8_script]);
+    run_powershell_command(command, "script")
 }
 
 pub(crate) fn current_proxy_snapshot() -> Result<ProxyStatus, String> {
@@ -567,6 +549,11 @@ pub(crate) fn is_process_elevated() -> Result<bool, String> {
     Ok(false)
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn ps_quote(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 fn wait_for_restarted_xray_ready(
     app: &AppHandle,
     state: &tauri::State<AppState>,
@@ -601,10 +588,14 @@ fn wait_for_restarted_xray_ready(
             });
         }
 
-        if owned_runtime_ports_ready(child)? {
+        let http_ready = tcp_port_open("127.0.0.1", HTTP_PORT, 90);
+        let socks_ready = tcp_port_open("127.0.0.1", SOCKS_PORT, 90);
+        let api_ready = tcp_port_open("127.0.0.1", XRAY_API_PORT, 90);
+
+        if http_ready && socks_ready && api_ready {
             let _ = append_runtime_event(
                 app,
-                "Автоматически перезапущенный Xray владеет всеми runtime listeners.",
+                &format!("Автоматически перезапущенный Xray снова готов: http={http_ready} socks={socks_ready} api={api_ready}."),
             );
             return Ok(());
         }
@@ -640,7 +631,7 @@ impl Drop for PreparedNetworkConfig {
         }
     }
 }
-pub(crate) fn current_physical_binding() -> Result<DefaultRouteSnapshot, String> {
+fn current_physical_binding() -> Result<DefaultRouteSnapshot, String> {
     #[cfg(target_os = "windows")]
     {
         default_route_snapshot()
@@ -686,7 +677,28 @@ fn prepare_network_config(
     // Xray constructs/starts its TUN adapter inside core.New even for -test.
     // Check provider transports without constructing another live TUN. The
     // unchanged full config is validated only after confirmed owned-child stop.
-    validate_config_projection(Path::new(&runtime.core_path), &prepared.path, &config)?;
+    let mut projection = config.clone();
+    projection["inbounds"]
+        .as_array_mut()
+        .ok_or("NETWORK_CONFIG_INBOUNDS")?
+        .retain(|inbound| inbound["protocol"] != "tun");
+    let projection_bytes =
+        serde_json::to_vec_pretty(&projection).map_err(|_| "NETWORK_CONFIG_SERIALIZE")?;
+    let projection_path = prepared.path.with_extension("preflight.json");
+    let projection_parents = lock_runtime_parent_paths(&projection_path)?;
+    write_new_runtime_config(&projection_path, &projection_bytes)?;
+    let projection_guard = PreparedNetworkConfig {
+        path: projection_path,
+        hash: sha256_hex_bytes(&projection_bytes),
+        binding: prepared.binding.clone(),
+        committed: false,
+        _parents: projection_parents,
+    };
+    validate_xray_config_with_core(
+        Path::new(&runtime.core_path),
+        &projection_guard.path,
+        &projection_guard.hash,
+    )?;
     Ok(prepared)
 }
 
@@ -879,24 +891,6 @@ fn try_self_restart_xray_runtime(
     {
         let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
         return Err(Box::new((runtime, "NETWORK_CHANGED_DURING_RESTART".into())));
-    }
-    if runtime.network_mode == "tun" {
-        if let Err(error) = confirm_tun_routes_ready(app) {
-            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
-            return Err(Box::new((runtime, error)));
-        }
-    }
-    // Recheck after all blocking route/physical queries, immediately before
-    // publication. Earlier port readiness is not a continuing process lease.
-    let publish = owned_runtime_ports_ready(&mut child).and_then(|ready| {
-        if !ready {
-            return Err("CORE_PORT_TIMEOUT: listeners lost before publication".into());
-        }
-        check_current_operation(state)
-    });
-    if let Err(error) = publish {
-        let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
-        return Err(Box::new((runtime, error)));
     }
     runtime.child = child;
     runtime.started_at = unix_now_string();
@@ -1195,8 +1189,9 @@ pub(crate) fn start_runtime_watchdog(app: AppHandle) {
                 .map(|guard| guard.is_some())
                 .unwrap_or(false);
 
-            // Occupied ports alone never confer process ownership. This path
-            // reports the conflict; no PID/path-based termination is permitted.
+            // Если приложение уже считает VPN остановленным, но локальные порты Xray
+            // всё ещё заняты, значит остался зависший orphan-процесс. Добиваем только
+            // процессы нашего core/config из runtime-папки, чужие VPN-клиенты не трогаем.
             if !has_managed_runtime && !has_starting_runtime && !runtime_busy_ports().is_empty() {
                 let Ok(_serialization) = state.operation_lock.try_lock() else {
                     continue;
@@ -1222,46 +1217,4 @@ pub(crate) fn start_runtime_watchdog(app: AppHandle) {
             }
         }
     });
-}
-
-#[cfg(all(test, target_os = "windows"))]
-mod readiness_tests {
-    use super::*;
-    #[test]
-    fn owned_child_exit_during_query_is_never_published_as_ready() {
-        let mut command = Command::new("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
-        command.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Start-Sleep -Seconds 20",
-        ]);
-        hide_child_console(&mut command);
-        let mut child = OwnedXrayProcess::attach(command.spawn().unwrap()).unwrap();
-        assert!(!checked_child_readiness(&mut child, |_| Ok(false)).unwrap());
-        assert!(checked_child_readiness(&mut child, |_| Ok(true)).unwrap());
-        let result = checked_child_readiness(&mut child, |own| {
-            own.kill().unwrap();
-            own.wait().unwrap();
-            Ok(true)
-        });
-        assert!(result.unwrap_err().starts_with("CORE_EXITED_EARLY"));
-        assert!(checked_child_readiness(&mut child, |_| panic!(
-            "do not query for an exited child"
-        ))
-        .is_err());
-    }
-    #[test]
-    fn cancelled_adapter_wait_does_not_query_or_sleep_until_the_six_second_timeout() {
-        let started = Instant::now();
-        assert_eq!(
-            wait_for_tun_interface(
-                "not-an-actual-adapter",
-                || Err("OPERATION_CANCELLED".into())
-            )
-            .unwrap_err(),
-            "OPERATION_CANCELLED"
-        );
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
 }

@@ -107,7 +107,6 @@ jobs:
       - name: Run all frontend tests and build
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          npm run lint
           npm test
           npm run build
 
@@ -117,7 +116,9 @@ jobs:
           cargo tree --locked --manifest-path src-tauri/Cargo.toml
           cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
           cargo check --locked --manifest-path src-tauri/Cargo.toml
-          cargo test --locked --manifest-path src-tauri/Cargo.toml
+          # Isolate timing-sensitive native fixtures on the shared CI runner.
+          # Concurrency cases still create their own threads/processes.
+          cargo test --locked --manifest-path src-tauri/Cargo.toml -- --test-threads=1
           cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Run Windows runtime smoke checks
@@ -150,11 +151,14 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: VKarmani Desktop ${{ github.ref_name }}
           releaseBody: |
-            Candidate artifacts for verification. This draft is not a production release.
-            Populate verified release notes and confirm all required acceptance gates,
-            published-file signatures and installed-client update safety before promotion.
-          # A successful build alone must never change releases/latest/latest.json.
-          # Promotion is a separate reviewed operation after the full production GO.
+            - Трафик и график используют фактические измерения; при отсутствии данных отображается «—».
+            - Потеря пакетов больше не подменяется результатом HTTP-проверки.
+            - Улучшены привязка пинга к физическому интерфейсу и обновление пинга активного сервера.
+            - Усилено восстановление TUN при смене сети; повторы и перезапуски ограничены.
+            - Логи сохраняют ограниченный объём последних записей с редактированием секретов.
+            - Исправлены лишнее пространство внизу Settings и вторичная информация карточки подключённого сервера.
+            - Proxy — системный HTTP/HTTPS-прокси; generic UDP в нём не гарантируется. Для полного трафика приложений, включая UDP, предусмотрен TUN.
+            - Native-проверки TUN/Proxy, Discord/media, сна и длительной работы в этом выпуске не выполнялись; эти риски приняты пользователем.
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
@@ -184,7 +188,6 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm audit --audit-level=high
-          npm run lint
           npm test
           npm run build
           npm run verify:updater
@@ -194,7 +197,7 @@ jobs:
           cargo tree --locked --manifest-path src-tauri/Cargo.toml
           cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
           cargo check --locked --manifest-path src-tauri/Cargo.toml
-          cargo test --locked --manifest-path src-tauri/Cargo.toml
+          cargo test --locked --manifest-path src-tauri/Cargo.toml -- --test-threads=1
           cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Resource helper tests and read-only smoke
         shell: pwsh

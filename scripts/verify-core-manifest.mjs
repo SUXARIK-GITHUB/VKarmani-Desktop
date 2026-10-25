@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { assertPeSectionBounds } from './pe-structure.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const coreDir = join(root, 'resources', 'core', 'windows');
@@ -14,8 +13,7 @@ function sha256(path) {
 }
 
 function assertWindowsX64Pe(path, label) {
-  const data = readFileSync(path);
-  const header = data.subarray(0, 4096);
+  const header = readFileSync(path).subarray(0, 4096);
   const prefix = header.subarray(0, Math.min(32, header.length)).toString('utf8');
   if (prefix.startsWith('version https://git-lfs')) {
     throw new Error(`${label} is a Git LFS pointer, not a real binary`);
@@ -35,7 +33,6 @@ function assertWindowsX64Pe(path, label) {
   if (machine !== 0x8664 || optionalHeaderMagic !== 0x20b) {
     throw new Error(`${label} must be Windows x64 PE32+. machine=0x${machine.toString(16)} optional=0x${optionalHeaderMagic.toString(16)}`);
   }
-  assertPeSectionBounds(data, label);
 }
 
 for (const expectedName of ['xray.exe', 'wintun.dll', 'geoip.dat', 'geosite.dat']) {

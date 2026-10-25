@@ -2,20 +2,8 @@ import { normalizeStoredRules } from '../utils/appPolicies';
 import type { AppSettings, SplitTunnelEntry, VpnServer } from '../types/vpn';
 import { defaultRoutingExclusions, sanitizeRoutingExclusions } from '../utils/routingExclusions';
 import { encodeProfileCache, decodeProfileCache } from './profileCache';
-import { validateSessionHistory, type SessionHistoryEntry } from '../utils/sessionHistory';
 import { commitNativeChange, exportNativeStateLegacy, inspectNativeState, invokeStateProtocol, NativeStorageError, peekNativeState, readNativeState, recoverNativeState, storageFailure } from './nativeState';
 export { NativeStorageError } from './nativeState';
-
-let previewHistory: SessionHistoryEntry[] = [];
-export async function loadSessionHistory(): Promise<SessionHistoryEntry[]> {
-  return validateSessionHistory(canUseTauriSecureStorage
-    ? await loadNativeClientStateValue<unknown>('sessionHistory') : previewHistory);
-}
-export async function saveSessionHistory(entries: SessionHistoryEntry[]): Promise<void> {
-  const validated=validateSessionHistory(entries);
-  if (!canUseTauriSecureStorage) { previewHistory=validated; return; }
-  if (!await saveNativeClientStateValue('sessionHistory',validated)) throw new NativeStorageError('STATE_WRITE_PENDING','Сохранение истории подключений не подтверждено.');
-}
 
 const ACCESS_KEY_STORAGE = 'vkarmani.access-key';
 const ACCESS_KEY_FORM_STORAGE = 'vkarmani.form.access-key';
@@ -57,11 +45,8 @@ export const defaultSettings: AppSettings = {
 };
 
 export function normalizeStoredSettings(value: unknown, hasLegacyRules = false): AppSettings {
-  if (value === null || value === undefined) {
+  if (!value || typeof value !== 'object') {
     return { ...defaultSettings, tunRoutingMode: hasLegacyRules ? 'selected' : 'all' };
-  }
-  if (typeof value !== 'object' || Array.isArray(value)) {
-    return { ...defaultSettings, tunRoutingMode: 'selected', tunRoutingModeInvalid: true };
   }
 
   const candidate = value as Partial<AppSettings>;
@@ -84,14 +69,7 @@ export function normalizeStoredSettings(value: unknown, hasLegacyRules = false):
   ];
 
   const next: AppSettings = { ...defaultSettings, tunRoutingMode: hasLegacyRules ? 'selected' : 'all' };
-  const validPolicy = candidate.tunRoutingMode === 'all' || candidate.tunRoutingMode === 'selected' || candidate.tunRoutingMode === 'exclude';
-  if (validPolicy) next.tunRoutingMode = candidate.tunRoutingMode!;
-  if (candidate.tunRoutingModeInvalid === true || (Object.prototype.hasOwnProperty.call(candidate, 'tunRoutingMode') && !validPolicy)) {
-    // Do not broaden corrupt settings to all, or lose quarantine on save/reload.
-    // Proxy stays usable; TUN requires an explicit policy selection in Settings.
-    next.tunRoutingMode = 'selected';
-    next.tunRoutingModeInvalid = true;
-  }
+  if (candidate.tunRoutingMode === 'all' || candidate.tunRoutingMode === 'selected' || candidate.tunRoutingMode === 'exclude') next.tunRoutingMode = candidate.tunRoutingMode;
 
   for (const key of booleanKeys) {
     if (typeof candidate[key] === 'boolean') {
@@ -218,6 +196,9 @@ if (canUseTauriSecureStorage && typeof window !== 'undefined') {
   } catch { /* Native state remains available when a mirror is inaccessible. */ }
 }
 let bootstrapState: Promise<void> | null = null;
+// A failed initial native restore cannot authorize the 0.13.76 autosave effects
+// to replace durable values with render defaults. Restart/recovery reloads them.
+let nativeRestoreFailed = false;
 function initializeNativeState(): Promise<void> {
   if (!bootstrapState) {
     bootstrapState = (async () => {
@@ -228,7 +209,7 @@ function initializeNativeState(): Promise<void> {
         await commitNativeChange('legacy', 'webView', legacyMirrorAtBoot);
       }
       legacyMirrorAtBoot = null;
-    })().catch(error => { bootstrapState = null; throw error; });
+    })().catch(error => { nativeRestoreFailed = true; throw error; });
   }
   return bootstrapState;
 }
@@ -299,7 +280,14 @@ async function invokeStorageRaw<T>(command: string, args: Record<string, unknown
 
 async function invokeTauri<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   const timeoutMs = STORAGE_COMMAND_TIMEOUTS_MS[command] ?? 8000;
-  return withStorageTimeout(invokeStorageRaw<T>(command, args), timeoutMs, command);
+  try {
+    return await withStorageTimeout(invokeStorageRaw<T>(command, args), timeoutMs, command);
+  } catch (error) {
+    // A renderer deadline is not cancellation of the still-running native read.
+    // Its late success must never authorize queued render defaults.
+    if (command.startsWith('load_')) nativeRestoreFailed = true;
+    throw error;
+  }
 }
 
 type PendingWrite = { command: string; args: Record<string, unknown>; session?: string };
@@ -319,7 +307,7 @@ function reportStorageFailure(key: string, failure: NativeStorageError) {
 }
 
 function queueStateWrite(key: string, command: string, args: Record<string, unknown>): Promise<boolean> {
-  if (writesQuiesced) return Promise.resolve(false);
+  if (writesQuiesced || nativeRestoreFailed) return Promise.resolve(false);
   const profileWrite = key === 'protected/lastKnownServers' || key === 'public/lastKnownServers';
   pendingWrites.set(key, { command, args, session: profileWrite ? peekNativeState()?.payload.sessionGeneration : undefined });
   if (!writeDrain) {
@@ -361,6 +349,7 @@ function queueStateWrite(key: string, command: string, args: Record<string, unkn
 }
 
 export async function flushPersistentWrites(): Promise<void> {
+  if (nativeRestoreFailed) throw new NativeStorageError('STATE_RESTORE_BLOCKED', 'Исходное состояние не загружено; сохранение заблокировано.', false);
   const deadline = performance.now() + 12000;
   while (writeDrain) {
     const remaining = deadline - performance.now();
@@ -387,7 +376,7 @@ export async function loadPersistentSnapshot() {
   await initializeNativeState();
   const native = await readNativeState();
   const values = native.payload.public;
-  const entries = normalizeStoredRules(values[NATIVE_SPLIT_TUNNEL_KEY]);
+  const entries = normalizeCompatibleRules(values[NATIVE_SPLIT_TUNNEL_KEY]);
   const favorites = values[NATIVE_FAVORITES_KEY];
   return {
     settings: normalizeStoredSettings(
@@ -411,6 +400,7 @@ export async function reloadPersistentSnapshot() {
     await initializeNativeState();
     const restored = await loadPersistentSnapshot();
     writeFailures.clear();
+    nativeRestoreFailed = false;
     return restored;
   } finally { writesQuiesced = false; }
 }
@@ -597,7 +587,7 @@ export function loadStoredAccessKey() {
 }
 
 export async function loadStoredAccessKeySecure() {
-  const legacyValue = loadLegacyAccessKeyFromLocalStorage().trim();
+  const legacyValue = canUseTauriSecureStorage ? '' : loadLegacyAccessKeyFromLocalStorage().trim();
 
   if (!canUseTauriSecureStorage) {
     return canUseWebPreviewAccessKeyStorage() ? legacyValue : '';
@@ -666,6 +656,7 @@ export async function clearStoredAccessKey() {
 }
 
 export function loadSettings() {
+  if (canUseTauriSecureStorage) return { ...defaultSettings };
   if (typeof window === 'undefined') {
     return defaultSettings;
   }
@@ -699,6 +690,7 @@ export async function loadSettingsBackup() {
 }
 
 export function loadSplitTunnelEntries() {
+  if (canUseTauriSecureStorage) return [] as SplitTunnelEntry[];
   if (typeof window === 'undefined') {
     return [] as SplitTunnelEntry[];
   }
@@ -722,13 +714,26 @@ export function saveSplitTunnelEntries(value: SplitTunnelEntry[]) {
   void saveNativeClientStateValue(NATIVE_SPLIT_TUNNEL_KEY, value);
 }
 
+function normalizeCompatibleRules(value: unknown): SplitTunnelEntry[] {
+  const entries = normalizeStoredRules(value);
+  if (!Array.isArray(value)) return entries;
+  // The076 editor knows only its own rule fields. Retain newer metadata on the
+  // same rule so hydration/autosave cannot silently strip it from v2.
+  return entries.map((entry, index) => {
+    const original: unknown = value[index];
+    return original && typeof original === 'object' && !Array.isArray(original)
+      ? { ...original, ...entry } : entry;
+  });
+}
+
 export async function loadSplitTunnelEntriesBackup() {
   const value = await loadNativeClientStateValue<unknown>(NATIVE_SPLIT_TUNNEL_KEY);
-  return value === null || value === undefined ? null : normalizeStoredRules(value);
+  return value === null || value === undefined ? null : normalizeCompatibleRules(value);
 }
 
 
 export function loadFavoriteServerIds() {
+  if (canUseTauriSecureStorage) return [] as string[];
   if (typeof window === 'undefined') {
     return [] as string[];
   }
@@ -762,6 +767,7 @@ export async function loadFavoriteServerIdsBackup() {
 }
 
 export function loadSelectedServerId() {
+  if (canUseTauriSecureStorage) return '';
   if (typeof window === 'undefined') {
     return '';
   }
@@ -809,6 +815,7 @@ function assertProfileCacheEpoch(epoch: number) {
 }
 
 export function loadLastKnownServers() {
+  if (canUseTauriSecureStorage) return [] as VpnServer[];
   if (typeof window === 'undefined') {
     return [] as VpnServer[];
   }
@@ -857,15 +864,7 @@ export async function loadLastKnownServersBackup() {
 
   const value = await loadNativeClientStateValue<unknown>(NATIVE_LAST_KNOWN_SERVERS_KEY);
   assertProfileCacheEpoch(epoch);
-  let nativeNormalized = normalizeStoredServers(value);
-  let fromWebView = false;
-  if (!nativeNormalized.length && canUseTauriSecureStorage) {
-    try {
-      const legacy = window.localStorage.getItem(LAST_KNOWN_SERVERS_STORAGE);
-      nativeNormalized = normalizeStoredServers(legacy ? JSON.parse(legacy) : null);
-      fromWebView = true;
-    } catch { /* A malformed mirror cannot replace the authoritative store. */ }
-  }
+  const nativeNormalized = normalizeStoredServers(value);
   if (!nativeNormalized.length) {
     return null;
   }
@@ -876,7 +875,7 @@ export async function loadLastKnownServersBackup() {
       throw new NativeStorageError('STATE_MIGRATION_FAILED', 'Кэш профилей не перенесён в защищённое хранилище. Оригинал сохранён.');
     }
     assertProfileCacheEpoch(epoch);
-    if (!fromWebView && !await saveNativeClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, nativeSafeServers)) {
+    if (!await saveNativeClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, nativeSafeServers)) {
       throw new NativeStorageError('STATE_MIGRATION_FAILED', 'Защищённая копия сохранена; очистка старого кэша не завершена.');
     }
     assertProfileCacheEpoch(epoch);

@@ -110,9 +110,6 @@ pub(crate) fn tray_runtime_flags(app: &AppHandle) -> (bool, bool, bool, bool, bo
 }
 
 pub(crate) fn refresh_tray_menu(app: &AppHandle) {
-    if startup_is_safe(app) {
-        return;
-    }
     let (connected, proxy_active, authorized, update_available, update_busy) =
         tray_runtime_flags(app);
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
@@ -137,39 +134,28 @@ pub(crate) fn refresh_tray_menu(app: &AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    crash_receipts::install_crash_hook();
-    crash_receipts::crash_phase(crash_receipts::CrashPhase::Builder);
-    let environment = match crate::elevation::startup_environment() {
-        Ok(environment) => environment,
-        Err(failure) => {
-            eprintln!("ELEVATION_STARTUP_ABORTED {}", failure.code);
-            return;
-        }
-    };
-    // Debug and release share AppData, ports and TUN resources. Both must own
-    // the same instance lock. Pending elevation waits before this builder.
+    // Keep single-instance protection only for release builds. In dev mode we intentionally
+    // allow local restarts from the BAT launcher without getting an `unused_mut` warning.
+    #[cfg(debug_assertions)]
+    let builder = tauri::Builder::default();
+
+    #[cfg(not(debug_assertions))]
     let builder =
         tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let _ = append_interface_event(
+                app,
+                "Повторный запуск: активируем уже открытое окно VKarmani.",
+            );
             reveal_main_window(app);
             let _ = app.emit("vkarmani://tray-action", "show");
         }));
 
     builder
-        .manage(environment)
         .manage(AppState::default())
         .setup(|app| {
-            *app.state::<AppState>().startup.lock().map_err(|_|"STARTUP_GUARD_UNAVAILABLE")? = StartupSupervisor::initialize(app.handle());
-            if startup_is_safe(app.handle()) {
-                // No user-state load/migration, recovery, updater or watchdog.
-                // Recovery mode owns no runtime and can quit without a v2 ACK.
-                reveal_main_window(app.handle());
-                return Ok(());
-            }
             let _ = interface_logs_dir(app.handle());
             let _ = routing_logs_dir(app.handle());
             let _ = ensure_log_tree(app.handle());
-            crash_receipts::configure_crash_sink(app.handle());
-            crash_receipts::crash_phase(crash_receipts::CrashPhase::StartupRecovery);
             let _ = cleanup_tun_routes_for_app(app.handle(), TUN_INTERFACE_NAME, &[]);
             let _ = cleanup_runtime_config_files(app.handle());
             let state = app.state::<AppState>();
@@ -183,7 +169,6 @@ pub fn run() {
                 app.handle(),
                 "Routing/runtime лог инициализирован. Ожидание действий пользователя.",
             );
-            crash_receipts::crash_phase(crash_receipts::CrashPhase::Tray);
             let menu = build_tray_menu(app.handle(), false, false, false, false, false)?;
 
             let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID);
@@ -257,9 +242,8 @@ pub fn run() {
                     }
                     "quit" => {
                         let _ = append_interface_event(app, "Tray: выход из приложения.");
-                        if begin_state_handoff(app, HandoffAction::Quit).is_err() {
-                            reveal_main_window(app);
-                        }
+                        cleanup_application(app, "tray_quit");
+                        app.exit(0)
                     }
                     _ => {}
                 })
@@ -278,33 +262,16 @@ pub fn run() {
             reveal_main_window(app.handle());
             let _ = append_interface_event(app.handle(), "Главное окно активировано при запуске.");
 
-            crash_receipts::crash_phase(crash_receipts::CrashPhase::Updater);
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
-            crash_receipts::crash_phase(crash_receipts::CrashPhase::Runtime);
             Ok(())
         })
-        .invoke_handler(|invoke| {
-            let app=invoke.message.webview().app_handle().clone();
-            if startup_commands_blocked(&app) && !startup_command_allowed(invoke.message.command()) {
-                invoke.resolver.reject(serde_json::json!({"code":"STARTUP_SAFE_MODE_REQUIRED","category":"startup","retryable":false}));
-                return true;
-            }
-            let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
-            startup_status,
-            startup_admit_app,
-            startup_acknowledge_ready,
-            startup_retry_next_launch,
-            startup_exit,
+        .invoke_handler(tauri::generate_handler![
             bootstrap_info,
             load_state_snapshot,
             commit_state_patch,
             recover_state_snapshot,
             export_state_legacy,
-            acknowledge_state_handoff,
-            cancel_state_handoff,
-            seal_state_for_update,
-            approve_state_update_exit,
             save_access_key_secure,
             load_access_key_secure,
             clear_access_key_secure,
@@ -315,8 +282,6 @@ pub fn run() {
             load_sensitive_client_state_value,
             clear_sensitive_client_state_value,
             runtime_status,
-            diagnostics_snapshot,
-            runtime_observation,
             set_session_authorized,
             set_tray_update_state,
             request_connect,
@@ -336,12 +301,10 @@ pub fn run() {
             proxy_status,
             set_system_proxy,
             fetch_remote_text,
-            fetch_remote_subscription,
             revoke_hwid_device,
             public_ip_snapshot,
             connectivity_probe,
             repair_runtime_environment,
-            prepare_runtime_repair,
             server_ping,
             traffic_snapshot,
             traffic_session_start,
@@ -351,24 +314,12 @@ pub fn run() {
             native_app_info,
             pick_executable_path,
             restart_application
-        ];
-            handler(invoke)
-        })
+        ])
         .build(tauri::generate_context!())
         .expect("error while building VKarmani Desktop")
         .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                if startup_commands_blocked(app) { startup_note_clean_exit(app); return; }
-                if !app
-                    .state::<AppState>()
-                    .exit_approved
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    api.prevent_exit();
-                    let _ = begin_state_handoff(app, HandoffAction::Quit);
-                } else {
-                    startup_note_clean_exit(app);
-                }
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                cleanup_application(app, "exit_requested");
             }
         });
 }

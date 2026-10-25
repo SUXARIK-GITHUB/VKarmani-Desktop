@@ -106,7 +106,6 @@ pub(crate) fn is_allowed_client_state_key(key: &str) -> bool {
             | "favoriteServerIds"
             | "selectedServerId"
             | "lastKnownServers"
-            | "sessionHistory"
     )
 }
 
@@ -114,66 +113,136 @@ pub(crate) fn is_allowed_sensitive_client_state_key(key: &str) -> bool {
     matches!(key, "lastKnownServers")
 }
 
-// Cached legacy renderers may read, but cannot mutate v2 without CAS.
-#[tauri::command]
-pub(crate) async fn load_client_state_value(
-    key: String,
-    app: AppHandle,
-) -> Result<Option<String>, StateStorageError> {
-    if !is_allowed_client_state_key(&key) {
-        return Err(legacy_write_rejected());
-    }
-    let snapshot = load_state_snapshot(app).await?;
-    Ok(snapshot
-        .payload
-        .public_state
-        .get(&key)
-        .map(Value::to_string))
+pub(crate) fn read_client_state_map(
+    app: &AppHandle,
+) -> Result<serde_json::Map<String, Value>, String> {
+    Ok(crate::compat_storage::snapshot(app)?.payload.public_state)
 }
-#[tauri::command]
-pub(crate) async fn load_sensitive_client_state_value(
+
+fn save_client_state_value_blocking(
     key: String,
+    value: String,
     app: AppHandle,
-) -> Result<Option<String>, StateStorageError> {
-    if !is_allowed_sensitive_client_state_key(&key) {
-        return Err(legacy_write_rejected());
-    }
-    let snapshot = load_state_snapshot(app).await?;
-    Ok(snapshot.payload.protected.get(&key).map(Value::to_string))
+) -> Result<(), String> {
+    let _ = (key, value, app);
+    Err(crate::compat_storage::reject_legacy_write())
 }
+
+fn load_client_state_value_blocking(key: String, app: AppHandle) -> Result<Option<String>, String> {
+    let normalized_key = key.trim();
+    if !is_allowed_client_state_key(normalized_key) {
+        return Err("Недопустимый ключ клиентского состояния.".into());
+    }
+
+    let map = read_client_state_map(&app)?;
+    Ok(map
+        .get(normalized_key)
+        .and_then(|value| serde_json::to_string(value).ok()))
+}
+
+fn clear_client_state_value_blocking(key: String, app: AppHandle) -> Result<(), String> {
+    let _ = (key, app);
+    Err(crate::compat_storage::reject_legacy_write())
+}
+
 #[tauri::command]
 pub(crate) async fn save_client_state_value(
     key: String,
     value: String,
     app: AppHandle,
-) -> Result<(), StateStorageError> {
-    let _ = (key, value, app);
-    Err(legacy_write_rejected())
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_client_state_value_blocking(key, value, app))
+        .await
+        .map_err(|error| format!("Сохранение настроек клиента было прервано: {error}"))?
 }
+
 #[tauri::command]
-pub(crate) async fn clear_client_state_value(
+pub(crate) async fn load_client_state_value(
     key: String,
     app: AppHandle,
-) -> Result<(), StateStorageError> {
-    let _ = (key, app);
-    Err(legacy_write_rejected())
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || load_client_state_value_blocking(key, app))
+        .await
+        .map_err(|error| format!("Загрузка настроек клиента была прервана: {error}"))?
 }
+
+#[tauri::command]
+pub(crate) async fn clear_client_state_value(key: String, app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || clear_client_state_value_blocking(key, app))
+        .await
+        .map_err(|error| format!("Очистка настроек клиента была прервана: {error}"))?
+}
+
+fn read_sensitive_client_state_map(
+    app: &AppHandle,
+) -> Result<serde_json::Map<String, Value>, String> {
+    Ok(crate::compat_storage::snapshot(app)?.payload.protected)
+}
+
+fn save_sensitive_client_state_value_blocking(
+    key: String,
+    value: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let _ = (key, value, app);
+    Err(crate::compat_storage::reject_legacy_write())
+}
+
+fn load_sensitive_client_state_value_blocking(
+    key: String,
+    app: AppHandle,
+) -> Result<Option<String>, String> {
+    let normalized_key = key.trim();
+    if !is_allowed_sensitive_client_state_key(normalized_key) {
+        return Err("Недопустимый ключ защищённого клиентского состояния.".into());
+    }
+
+    let map = read_sensitive_client_state_map(&app)?;
+    Ok(map
+        .get(normalized_key)
+        .and_then(|value| serde_json::to_string(value).ok()))
+}
+
+fn clear_sensitive_client_state_value_blocking(key: String, app: AppHandle) -> Result<(), String> {
+    let _ = (key, app);
+    Err(crate::compat_storage::reject_legacy_write())
+}
+
 #[tauri::command]
 pub(crate) async fn save_sensitive_client_state_value(
     key: String,
     value: String,
     app: AppHandle,
-) -> Result<(), StateStorageError> {
-    let _ = (key, value, app);
-    Err(legacy_write_rejected())
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        save_sensitive_client_state_value_blocking(key, value, app)
+    })
+    .await
+    .map_err(|error| format!("Сохранение защищённого кэша клиента было прервано: {error}"))?
 }
+
+#[tauri::command]
+pub(crate) async fn load_sensitive_client_state_value(
+    key: String,
+    app: AppHandle,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        load_sensitive_client_state_value_blocking(key, app)
+    })
+    .await
+    .map_err(|error| format!("Загрузка защищённого кэша клиента была прервана: {error}"))?
+}
+
 #[tauri::command]
 pub(crate) async fn clear_sensitive_client_state_value(
     key: String,
     app: AppHandle,
-) -> Result<(), StateStorageError> {
-    let _ = (key, app);
-    Err(legacy_write_rejected())
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        clear_sensitive_client_state_value_blocking(key, app)
+    })
+    .await
+    .map_err(|error| format!("Очистка защищённого кэша клиента была прервана: {error}"))?
 }
 #[cfg(target_os = "windows")]
 pub(crate) fn encrypt_access_key(value: &str) -> Result<String, String> {
@@ -270,30 +339,43 @@ pub(crate) fn decrypt_access_key(value: &str) -> Result<String, String> {
     Err("Защищённое хранилище требует Windows DPAPI; plaintext fallback запрещён.".into())
 }
 
-pub(crate) fn load_access_key_secure_blocking(app: AppHandle) -> Result<Option<String>, String> {
-    app_durable_store(&app)
-        .and_then(|store| store.load())
-        .map(|snapshot| snapshot.payload.access_key)
-        .map_err(|error| format!("{}: {}", error.code, error.message))
-}
-#[tauri::command]
-pub(crate) async fn save_access_key_secure(
-    value: String,
-    app: AppHandle,
-) -> Result<(), StateStorageError> {
+fn save_access_key_secure_blocking(value: String, app: AppHandle) -> Result<(), String> {
     let _ = (value, app);
-    Err(legacy_write_rejected())
+    Err(crate::compat_storage::reject_legacy_write())
 }
-#[tauri::command]
-pub(crate) async fn clear_access_key_secure(app: AppHandle) -> Result<(), StateStorageError> {
+
+pub(crate) fn load_access_key_secure_blocking(app: AppHandle) -> Result<Option<String>, String> {
+    crate::compat_storage::snapshot(&app)?
+        .payload
+        .access_key
+        .map(|value| normalize_access_key_for_native(&value))
+        .transpose()
+}
+
+fn clear_access_key_secure_blocking(app: AppHandle) -> Result<(), String> {
     let _ = app;
-    Err(legacy_write_rejected())
+    Err(crate::compat_storage::reject_legacy_write())
 }
+
 #[tauri::command]
-pub(crate) async fn load_access_key_secure(
-    app: AppHandle,
-) -> Result<Option<String>, StateStorageError> {
-    Ok(load_state_snapshot(app).await?.payload.access_key)
+pub(crate) async fn save_access_key_secure(value: String, app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_access_key_secure_blocking(value, app))
+        .await
+        .map_err(|error| format!("Сохранение ключа доступа было прервано: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn load_access_key_secure(app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || load_access_key_secure_blocking(app))
+        .await
+        .map_err(|error| format!("Загрузка ключа доступа была прервана: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn clear_access_key_secure(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || clear_access_key_secure_blocking(app))
+        .await
+        .map_err(|error| format!("Очистка ключа доступа была прервана: {error}"))?
 }
 #[tauri::command]
 pub(crate) fn bootstrap_info() -> BootstrapInfo {
@@ -330,7 +412,7 @@ pub(crate) fn ensure_native_session_authorized(
         .lock()
         .map_err(|_| "Не удалось проверить состояние авторизации.".to_string())?;
     if !is_authorized {
-        return Err("SESSION_UNAUTHORIZED: Сначала войдите по ключу VKarmani, затем запускайте подключение.".into());
+        return Err("Сначала войдите по ключу VKarmani, затем запускайте подключение.".into());
     }
 
     authorize_native_subscription(app, state, false, None)
@@ -452,49 +534,6 @@ pub(crate) async fn set_session_authorized(
 }
 
 #[tauri::command]
-pub(crate) async fn runtime_observation(app: AppHandle) -> Result<RuntimeStatus, String> {
-    // Connection recovery must not use the UI refresh coalescer (which may
-    // return no snapshot), nor runtime_status's liveness/recovery side effects.
-    tauri::async_runtime::spawn_blocking(move || read_runtime_status(&app, app.state::<AppState>()))
-        .await
-        .map_err(|_| "RUNTIME_OBSERVATION_UNAVAILABLE".into())
-}
-#[tauri::command]
-pub(crate) async fn diagnostics_snapshot(
-    app: AppHandle,
-) -> Result<crate::diagnostic_facts::DiagnosticSnapshot, String> {
-    let permit = DiagnosticReadPermit::acquire()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let _permit = permit;
-        crate::diagnostic_facts::collect(&app, app.state::<AppState>())
-    })
-    .await
-    .map_err(|_| "DIAGNOSTICS_READ_FAILED".to_string())
-}
-
-static DIAGNOSTICS_IN_FLIGHT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-struct DiagnosticReadPermit;
-impl DiagnosticReadPermit {
-    fn acquire() -> Result<Self, String> {
-        DIAGNOSTICS_IN_FLIGHT
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .map(|_| Self)
-            .map_err(|_| "DIAGNOSTICS_BUSY".into())
-    }
-}
-impl Drop for DiagnosticReadPermit {
-    fn drop(&mut self) {
-        DIAGNOSTICS_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
-    }
-}
-
-#[tauri::command]
 pub(crate) async fn runtime_status(app: AppHandle) -> RuntimeStatus {
     let app_for_task = app.clone();
     match tauri::async_runtime::spawn_blocking(move || {
@@ -547,29 +586,31 @@ pub(crate) fn wait_for_xray_runtime_ready(
 
             if joined_excerpt.to_ascii_lowercase().contains("wintun.dll") {
                 return Err(format!(
-                    "CORE_EXITED_EARLY: Xray-core не смог запустить TUN: отсутствует или не загружается wintun.dll рядом с xray.exe. Проверьте {}.",
+                    "Xray-core не смог запустить TUN: отсутствует или не загружается wintun.dll рядом с xray.exe. Проверьте {}.",
                     core_working_dir.display()
                 ));
             }
 
             if !joined_excerpt.is_empty() {
                 return Err(format!(
-                    "CORE_EXITED_EARLY: Xray-core завершился сразу после запуска. Exit code: {:?}. Последние строки xray-runtime.log: {}",
+                    "Xray-core завершился сразу после запуска. Exit code: {:?}. Последние строки xray-runtime.log: {}",
                     code,
                     joined_excerpt
                 ));
             }
 
             return Err(format!(
-                "CORE_EXITED_EARLY: Xray-core завершился сразу после запуска. Exit code: {:?}. Проверьте xray-runtime.log.",
+                "Xray-core завершился сразу после запуска. Exit code: {:?}. Проверьте xray-runtime.log.",
                 code
             ));
         }
 
-        let owned_ready = owned_runtime_ports_ready(child)?;
-        let ports_state = format!("ownedListeners={owned_ready}");
+        let http_ready = tcp_port_open("127.0.0.1", HTTP_PORT, 80);
+        let socks_ready = tcp_port_open("127.0.0.1", SOCKS_PORT, 80);
+        let api_ready = tcp_port_open("127.0.0.1", XRAY_API_PORT, 80);
+        let ports_state = format!("http={http_ready} socks={socks_ready} api={api_ready}");
 
-        if owned_ready {
+        if http_ready && socks_ready && api_ready {
             let _ =
                 append_runtime_event(app, &format!("Xray локальные порты готовы: {ports_state}."));
             return Ok(());
@@ -583,7 +624,7 @@ pub(crate) fn wait_for_xray_runtime_ready(
                 format!("Последние строки xray-runtime.log: {log_excerpt}")
             };
             return Err(format!(
-                "CORE_PORT_TIMEOUT: Xray запущен, но локальные порты не стали готовы за {} мс ({ports_state}). {details}",
+                "Xray запущен, но локальные порты не стали готовы за {} мс ({ports_state}). {details}",
                 timeout.as_millis()
             ));
         }
@@ -610,18 +651,17 @@ pub(crate) async fn request_connect(
     split_tunnel_entries: Option<Vec<SplitTunnelEntryPayload>>,
     routing_exclusions: Option<RoutingExclusionSettingsPayload>,
     app: AppHandle,
-) -> Result<RuntimeStatus, NativeFailure> {
+) -> Result<RuntimeStatus, String> {
     let (runtime_template, verified_fingerprint) = verified_template_identity(
         &runtime_template,
         &canonical_template_json,
         server_fingerprint.as_deref(),
-    )
-    .map_err(|e| NativeFailure::from_error(&e, RuntimeCommand::Connect))?;
+    )?;
     let requested_generation = app
         .state::<AppState>()
         .operation_generation
         .load(std::sync::atomic::Ordering::Acquire);
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || {
         request_connect_blocking(ConnectRequest {
             server_id,
             server_label,
@@ -638,8 +678,7 @@ pub(crate) async fn request_connect(
         })
     })
     .await
-    .map_err(|_| NativeFailure::task_failed())?;
-    result.map_err(|e| NativeFailure::from_error(&e, RuntimeCommand::Connect))
+    .map_err(|error| format!("Подключение Xray было прервано: {error}"))?
 }
 
 pub(crate) fn validate_xray_config_with_core(
@@ -673,38 +712,7 @@ pub(crate) fn validate_xray_config_with_core(
 
     run_command_with_timeout(command, Duration::from_secs(8), "xray config test")
         .map(|_| ())
-        .map_err(|error| crate::native_error::config_validation_error(&error))
-}
-
-pub(crate) fn validate_config_projection(
-    core: &Path,
-    config_path: &Path,
-    config: &Value,
-) -> Result<(), String> {
-    let projection = config_preflight_projection(config)?;
-    let bytes = serde_json::to_vec(&projection).map_err(|_| "CONFIG_PREFLIGHT_SERIALIZE")?;
-    let path = config_path.with_extension("preflight.json");
-    let parents = lock_runtime_parent_paths(&path)?;
-    write_new_runtime_config(&path, &bytes)?;
-    struct Prepared {
-        path: PathBuf,
-        hash: String,
-        _parents: Vec<File>,
-    }
-    impl Drop for Prepared {
-        fn drop(&mut self) {
-            // Never remove a replaced/unknown file as a successful cleanup.
-            if read_verified_runtime_config(&self.path, &self.hash).is_ok() {
-                let _ = fs::remove_file(&self.path);
-            }
-        }
-    }
-    let prepared = Prepared {
-        path,
-        hash: sha256_hex_bytes(&bytes),
-        _parents: parents,
-    };
-    validate_xray_config_with_core(core, &prepared.path, &prepared.hash)
+        .map_err(|error| format!("Xray-core не принял runtime-конфиг. Подключение остановлено до запуска процесса: {error}"))
 }
 
 fn remove_startup_runtime_config(app: &AppHandle, config_path: &Path, reason: &str) {
@@ -746,20 +754,6 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         app,
         requested_generation,
     } = request;
-    // Reject malformed supplied modes before authorization/storage reads,
-    // operation admission or core discovery. TUN requires an explicit policy;
-    // missing non-policy legacy fields keep their defaults.
-    let mode = NetworkMode::parse(network_mode.as_deref())?;
-    let normalized_network_mode = mode.as_str().to_string();
-    let policy_mode = mode
-        .require_process_enforcement(tun_routing_mode.as_deref())
-        .map_err(|error| crate::native_error::ConnectStage::Preflight.wrap(&error))?;
-    let normalized_ip_stack = NetworkIpStack::parse(ip_stack.as_deref())?
-        .as_str()
-        .to_string();
-    if normalized_network_mode == "tun" && normalized_ip_stack == "ipv6" {
-        return Err("TUN_IPV6_UNSUPPORTED: IPv6 режим сейчас доступен только для Proxy. TUN оставлен IPv4-only, чтобы не получить IPv6 loop/leak при переключении маршрутов Windows. Выберите IPv4 или используйте Proxy режим.".into());
-    }
     let state = app.state::<AppState>();
     if state
         .stop_requested
@@ -773,8 +767,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         return Err("Сейчас поддерживается только Xray runtime family.".into());
     }
     validate_runtime_template(&runtime_template)?;
-    let mut _operation_guard =
-        begin_open_runtime_operation(&state, Duration::from_secs(8), "connect")?;
+    let mut _operation_guard = acquire_operation_lock(&state, Duration::from_secs(8), "connect")?;
     if state
         .operation_generation
         .load(std::sync::atomic::Ordering::Acquire)
@@ -786,8 +779,32 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     let core_path = resolve_core_path(&app).ok_or_else(|| core_not_found_message(&app))?;
     ensure_core_launchable(&core_path)?;
 
+    let normalized_network_mode = match network_mode
+        .unwrap_or_else(|| "proxy".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "tun" => "tun".to_string(),
+        _ => "proxy".to_string(),
+    };
+
+    let normalized_ip_stack = match ip_stack
+        .unwrap_or_else(|| "ipv4".to_string())
+        .trim()
+        .to_lowercase()
+        .as_str()
+    {
+        "ipv6" | "6" => "ipv6".to_string(),
+        _ => "ipv4".to_string(),
+    };
+
+    if normalized_network_mode == "tun" && normalized_ip_stack == "ipv6" {
+        return Err("IPv6 режим сейчас доступен только для Proxy. TUN оставлен IPv4-only, чтобы не получить IPv6 loop/leak при переключении маршрутов Windows. Выберите IPv4 или используйте Proxy режим.".into());
+    }
+
     let reconnect_requested = reconnect.unwrap_or(false);
 
+    let policy_mode = tun_routing_mode.as_deref().unwrap_or("selected");
     let stored_entries = split_tunnel_entries.unwrap_or_default();
     let active_split_tunnel_entries = if normalized_network_mode == "tun" {
         active_policy_entries(&stored_entries, policy_mode)
@@ -809,8 +826,8 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     }
 
     #[cfg(target_os = "windows")]
-    if normalized_network_mode == "tun" {
-        NetworkMode::Tun.require_elevation(is_process_elevated()?)?;
+    if normalized_network_mode == "tun" && !is_process_elevated()? {
+        return Err("TUN режим требует запуска VKarmani с правами администратора, иначе Windows не даст создать маршруты. Откройте настройки клиента и включите запуск от администратора или перезапустите приложение вручную от имени администратора.".into());
     }
 
     let request_hash = sha256_hex_bytes(
@@ -905,15 +922,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         routing_exclusions.as_ref(),
         Some(runtime_trace_path.as_path()),
     )
-    .map_err(|error| {
-        crate::diagnostic_facts::record_connect_failure(
-            &app,
-            crate::native_error::ConnectStage::Preflight,
-            &normalized_network_mode,
-            &error,
-            None,
-        )
-    })?;
+    .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
 
     #[cfg(target_os = "windows")]
     if let Some(route) = physical_route.as_ref() {
@@ -925,21 +934,6 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         .map_err(|error| format!("Не удалось сериализовать config: {error}"))?;
     let config_hash = sha256_hex_bytes(config_text.as_bytes());
     _operation_guard.check()?;
-    // Reject invalid provider transports/config while the prior runtime is
-    // still alive. Never construct a second TUN during this preflight.
-    validate_config_projection(&core_path, &config_path, &config).map_err(|error| {
-        crate::diagnostic_facts::record_connect_failure(
-            &app,
-            crate::native_error::ConnectStage::Preflight,
-            &normalized_network_mode,
-            &error,
-            None,
-        )
-    })?;
-    _operation_guard.check()?;
-    if let Some(expected) = physical_route.as_ref() {
-        require_physical_binding(expected, current_physical_binding())?;
-    }
     _operation_guard.stage("stopping")?;
     stop_managed_or_starting_runtime(
         &app,
@@ -949,11 +943,6 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     )?;
     let config_written = std::cell::Cell::new(false);
     let mut failed_connect = FailedConnectRollback::new(|| {
-        crate::diagnostic_facts::record_pending_failure_if_missing(
-            &app,
-            &normalized_network_mode,
-            None,
-        );
         let _ = restore_saved_proxy_state(&app, &state, "connect_failed_after_stop");
         if config_written.get() {
             remove_startup_runtime_config(&app, &config_path, "connect_failed_after_stop");
@@ -975,27 +964,13 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
             &format!("Локальные порты не освободились с первой попытки, выполняю повторную очистку Xray перед стартом нового сервера: {first_release_error}"),
         );
         wait_for_runtime_ports_release(Duration::from_secs(4)).map_err(|second_release_error| {
-            crate::diagnostic_facts::record_connect_failure(
-                &app,
-                crate::native_error::ConnectStage::PortRelease,
-                &normalized_network_mode,
-                &format!("CORE_PORT_CONFLICT: {first_release_error}; {second_release_error}"),
-                None,
-            )
+            format!("{first_release_error}; повторная очистка Xray не освободила порты: {second_release_error}")
         })?;
     }
     if reconnect_requested {
         let _ = append_runtime_event(&app, "Старый Xray остановлен, локальные порты освобождены, запускаем выбранный сервер без наложения процессов.");
     }
-    ensure_runtime_ports_available().map_err(|error| {
-        crate::diagnostic_facts::record_connect_failure(
-            &app,
-            crate::native_error::ConnectStage::PortRelease,
-            &normalized_network_mode,
-            &error,
-            None,
-        )
-    })?;
+    ensure_runtime_ports_available()?;
 
     validate_or_create_log(&runtime_trace_path).map_err(|error| format!("CONNECT_LOG: {error}"))?;
     _operation_guard.stage("validating")?;
@@ -1003,18 +978,12 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         .map_err(|error| format!("Не удалось записать config: {error}"))?;
     config_written.set(true);
 
-    validate_xray_config_with_core(&core_path, &config_path, &config_hash).map_err(|error| {
-        let error = crate::diagnostic_facts::record_connect_failure(
-            &app,
-            crate::native_error::ConnectStage::ConfigValidation,
-            &normalized_network_mode,
-            &error,
-            None,
-        );
-        let _ = append_runtime_event(&app, &error);
-        remove_startup_runtime_config(&app, &config_path, "config_validation_failed");
-        error
-    })?;
+    validate_xray_config_with_core(&core_path, &config_path, &config_hash).inspect_err(
+        |error| {
+            let _ = append_runtime_event(&app, error);
+            remove_startup_runtime_config(&app, &config_path, "config_validation_failed");
+        },
+    )?;
     if let Err(error) = _operation_guard.check() {
         remove_startup_runtime_config(&app, &config_path, "operation_cancelled");
         return Err(error);
@@ -1156,13 +1125,6 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     let child = match spawn_xray_runtime_child(&core_path, &config_path, &log_path, &config_hash) {
         Ok(child) => child,
         Err(error) => {
-            let error = crate::diagnostic_facts::record_connect_failure(
-                &app,
-                crate::native_error::ConnectStage::Spawn,
-                &normalized_network_mode,
-                &error,
-                None,
-            );
             remove_startup_runtime_config(&app, &config_path, "xray_spawn_failed");
             return Err(error);
         }
@@ -1191,13 +1153,6 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         core_working_dir,
         &normalized_network_mode,
     ) {
-        let error = crate::diagnostic_facts::record_connect_failure(
-            &app,
-            crate::native_error::ConnectStage::Listeners,
-            &normalized_network_mode,
-            &error,
-            Some(&mut child),
-        );
         let _ = append_runtime_event(
             &app,
             &format!(
@@ -1214,42 +1169,17 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
 
     if normalized_network_mode == "tun" {
         _operation_guard.stage("configuring-routes")?;
-        if let Some(expected) = physical_route.as_ref() {
-            require_physical_binding(expected, current_physical_binding())?;
-        }
-        let mut observed_error = None;
-        configure_tun_routes_observed(&app, TUN_INTERFACE_NAME, &outbound_ips, |error| {
-            observed_error = Some(crate::diagnostic_facts::record_connect_failure(
-                &app,
-                crate::native_error::ConnectStage::Routes,
-                &normalized_network_mode,
-                error,
-                Some(&mut child),
-            ));
-        })
-        .map_err(|error| {
-            let error = observed_error.unwrap_or_else(|| {
-                crate::diagnostic_facts::record_connect_failure(
-                    &app,
-                    crate::native_error::ConnectStage::Routes,
-                    &normalized_network_mode,
-                    &error,
-                    Some(&mut child),
-                )
-            });
+        configure_tun_routes(&app, TUN_INTERFACE_NAME, &outbound_ips).map_err(|error| {
             clear_starting_runtime(&state, child_pid);
             let _ = cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &outbound_ips);
             let _ = restore_saved_proxy_state(&app, &state, "tun_routes_failed");
             let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
             remove_startup_runtime_config(&app, &config_path, "tun_routes_failed");
-            crate::native_error::contextual_runtime_error(
-                &error,
-                "Не удалось подготовить Windows-маршруты для TUN режима",
-            )
+            format!("Не удалось подготовить Windows-маршруты для TUN режима: {error}")
         })?;
         let _ = append_runtime_event(
             &app,
-            &format!("Owned IPv4/IPv6 split routes applied; default policy={}; explicit DIRECT exclusions retained.", if split_tunnel_plan.default_vpn { "VPN" } else { "DIRECT" }),
+            "Owned IPv4/IPv6 split routes applied; unselected traffic DIRECT.",
         );
         std::thread::sleep(Duration::from_millis(250));
         let _ = append_runtime_event(
@@ -1261,13 +1191,6 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     if let Some(status) = child.try_wait().map_err(|error| {
         format!("Не удалось проверить Xray перед завершением подключения: {error}")
     })? {
-        let failure = crate::diagnostic_facts::record_connect_failure(
-            &app,
-            crate::native_error::ConnectStage::Publish,
-            &normalized_network_mode,
-            "CORE_EXITED_EARLY",
-            Some(&mut child),
-        );
         clear_starting_runtime(&state, child_pid);
         let code = status.code();
         if let Ok(mut exit_guard) = state.last_exit_code.lock() {
@@ -1276,39 +1199,12 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         let _ = cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &outbound_ips);
         let _ = restore_saved_proxy_state(&app, &state, "connect_final_check_failed");
         remove_startup_runtime_config(&app, &config_path, "xray_stopped_before_ready_final_check");
-        return Err(failure);
-    }
-
-    if let Some(expected) = physical_route.as_ref() {
-        require_physical_binding(expected, current_physical_binding())
-            .and_then(|_| confirm_tun_routes_ready(&app))
-            .map_err(|error| {
-                crate::diagnostic_facts::record_connect_failure(
-                    &app,
-                    crate::native_error::ConnectStage::Publish,
-                    &normalized_network_mode,
-                    &error,
-                    Some(&mut child),
-                )
-            })?;
-    }
-    if !owned_runtime_ports_ready(&mut child).map_err(|error| {
-        crate::diagnostic_facts::record_connect_failure(
-            &app,
-            crate::native_error::ConnectStage::Publish,
-            &normalized_network_mode,
-            &error,
-            Some(&mut child),
-        )
-    })? {
-        return Err(crate::diagnostic_facts::record_connect_failure(
-            &app,
-            crate::native_error::ConnectStage::Publish,
-            &normalized_network_mode,
-            "CORE_PORT_TIMEOUT: runtime listeners lost before publication",
-            Some(&mut child),
+        return Err(format!(
+            "Xray остановился до завершения подключения. Exit code: {:?}. Подключение не было помечено активным.",
+            code
         ));
     }
+
     _operation_guard.stage("publishing")?;
 
     if let Ok(mut guard) = state.active_server_label.lock() {
@@ -1338,11 +1234,6 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
             started_at: unix_now_string(),
             telemetry_epoch: next_telemetry_epoch(),
             network_mode: normalized_network_mode.clone(),
-            tun_routing_mode: if normalized_network_mode == "tun" {
-                Some(policy_mode.to_owned())
-            } else {
-                None
-            },
             tun_interface_name: if normalized_network_mode == "tun" {
                 Some(TUN_INTERFACE_NAME.to_string())
             } else {
@@ -1370,16 +1261,17 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     refresh_tray_menu(&app);
 
     _operation_guard.commit();
+    let status = build_runtime_status(&app, app.state::<AppState>());
     drop(_operation_guard);
-    Ok(build_runtime_status(&app, app.state::<AppState>()))
+    Ok(status)
 }
 
 #[tauri::command]
 pub(crate) async fn rollback_failed_connect(
     expected_config_path: String,
     app: AppHandle,
-) -> Result<RuntimeStatus, NativeFailure> {
-    let result = tauri::async_runtime::spawn_blocking(move || {
+) -> Result<RuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let mut operation =
             acquire_operation_lock(&state, Duration::from_secs(6), "failed-connect-rollback")?;
@@ -1398,26 +1290,23 @@ pub(crate) async fn rollback_failed_connect(
         stop_managed_or_starting_runtime(&app, &state, true, "failed-connect-rollback")?;
         restore_saved_proxy_state(&app, &state, "failed-connect-rollback")?;
         operation.commit();
-        drop(operation);
         Ok(build_runtime_status(&app, app.state::<AppState>()))
     })
     .await
-    .map_err(|_| NativeFailure::task_failed())?;
-    result.map_err(|e: String| NativeFailure::from_error(&e, RuntimeCommand::Rollback))
+    .map_err(|_| "Откат подключения был прерван".to_string())?
 }
 
 #[tauri::command]
-pub(crate) async fn request_disconnect(app: AppHandle) -> Result<RuntimeStatus, NativeFailure> {
+pub(crate) async fn request_disconnect(app: AppHandle) -> Result<RuntimeStatus, String> {
     app.state::<AppState>()
         .stop_requested
         .store(true, std::sync::atomic::Ordering::Release);
     app.state::<AppState>()
         .operation_generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    let result = tauri::async_runtime::spawn_blocking(move || request_disconnect_blocking(app))
+    tauri::async_runtime::spawn_blocking(move || request_disconnect_blocking(app))
         .await
-        .map_err(|_| NativeFailure::task_failed())?;
-    result.map_err(|e: String| NativeFailure::from_error(&e, RuntimeCommand::Disconnect))
+        .map_err(|error| format!("Отключение Xray было прервано: {error}"))?
 }
 
 pub(crate) fn request_disconnect_blocking(app: AppHandle) -> Result<RuntimeStatus, String> {
@@ -1617,31 +1506,103 @@ pub(crate) async fn open_external_url(url: String) -> Result<(), String> {
         .map_err(|error| format!("Открытие внешней ссылки было прервано: {error}"))?
 }
 
-pub(crate) fn ensure_admin_launch_blocking(app: AppHandle) -> Result<bool, StateStorageError> {
-    crate::elevation::relaunch(&app).map_err(|failure| StateStorageError::new(
-        failure.code, "Повышение прав не подтверждено. Настройки не сбрасывались; автоматический повтор не выполняется.", true))
+fn ensure_admin_launch_blocking(app: AppHandle) -> Result<bool, String> {
+    #[cfg(all(not(debug_assertions), target_os = "windows"))]
+    {
+        if is_process_elevated()? {
+            return Ok(false);
+        }
+
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("Не удалось определить путь к приложению: {error}"))?;
+
+        let args = std::env::args()
+            .skip(1)
+            .map(|item| ps_quote(&item))
+            .collect::<Vec<_>>();
+        let args_block = if args.is_empty() {
+            String::new()
+        } else {
+            format!(" -ArgumentList @('{}')", args.join("','"))
+        };
+
+        let script = format!(
+            "Start-Process -FilePath '{}'{} -Verb RunAs",
+            ps_quote(&executable.to_string_lossy()),
+            args_block
+        );
+
+        run_powershell(&script)?;
+        cleanup_application(&app, "admin_relaunch");
+        app.exit(0);
+        Ok(true)
+    }
+
+    #[cfg(not(all(not(debug_assertions), target_os = "windows")))]
+    {
+        let _ = app;
+        Ok(false)
+    }
 }
 
 #[tauri::command]
 pub(crate) async fn ensure_admin_launch(app: AppHandle) -> Result<bool, String> {
-    #[cfg(all(not(debug_assertions), target_os = "windows"))]
+    tauri::async_runtime::spawn_blocking(move || ensure_admin_launch_blocking(app))
+        .await
+        .map_err(|error| format!("Проверка запуска от администратора была прервана: {error}"))?
+}
+
+fn set_launch_on_startup_blocking(enabled: bool, app: AppHandle) -> Result<bool, String> {
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
     {
-        if !is_process_elevated()? {
-            begin_state_handoff(&app, HandoffAction::Elevate).map_err(|error| error.message)?;
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("Не удалось определить путь к приложению: {error}"))?;
+        let executable = format!("\"{}\"", executable.to_string_lossy());
+        let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
+        if enabled {
+            let mut command = Command::new(system_program("reg")?);
+            command.args([
+                "add",
+                run_key,
+                "/v",
+                STARTUP_REGISTRY_VALUE,
+                "/t",
+                "REG_SZ",
+                "/d",
+                &executable,
+                "/f",
+            ]);
+            run_command_with_timeout(command, Duration::from_secs(4), "enable startup")?;
+        } else {
+            let mut command = Command::new(system_program("reg")?);
+            command.args(["delete", run_key, "/v", STARTUP_REGISTRY_VALUE, "/f"]);
+            let _ = run_command_with_timeout(command, Duration::from_secs(4), "disable startup");
         }
+
+        let _ = append_interface_event(
+            &app,
+            if enabled {
+                "Автозапуск приложения включён для текущего пользователя."
+            } else {
+                "Автозапуск приложения отключён для текущего пользователя."
+            },
+        );
+        Ok(enabled)
     }
-    let _ = app;
-    Ok(false)
+
+    #[cfg(any(not(target_os = "windows"), debug_assertions))]
+    {
+        let _ = (enabled, app);
+        Ok(false)
+    }
 }
 
 #[tauri::command]
-pub(crate) async fn set_launch_on_startup(
-    enabled: bool,
-    app: AppHandle,
-) -> Result<bool, crate::autostart::AutostartError> {
-    tauri::async_runtime::spawn_blocking(move || crate::autostart::configure(enabled, app))
+pub(crate) async fn set_launch_on_startup(enabled: bool, app: AppHandle) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || set_launch_on_startup_blocking(enabled, app))
         .await
-        .map_err(|_| crate::autostart::task_failed())?
+        .map_err(|error| format!("Изменение автозапуска было прервано: {error}"))?
 }
 #[tauri::command]
 pub(crate) async fn proxy_status() -> Result<ProxyStatus, String> {
@@ -1655,13 +1616,12 @@ pub(crate) async fn set_system_proxy(
     enabled: bool,
     expected_config_path: Option<String>,
     app: AppHandle,
-) -> Result<ProxyStatus, NativeFailure> {
-    let result = tauri::async_runtime::spawn_blocking(move || {
+) -> Result<ProxyStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
         set_system_proxy_blocking(enabled, expected_config_path, app)
     })
     .await
-    .map_err(|_| NativeFailure::task_failed())?;
-    result.map_err(|e: String| NativeFailure::from_error(&e, RuntimeCommand::Proxy))
+    .map_err(|error| format!("Изменение Windows proxy было прервано: {error}"))?
 }
 
 pub(crate) fn set_system_proxy_blocking(
@@ -1671,7 +1631,7 @@ pub(crate) fn set_system_proxy_blocking(
 ) -> Result<ProxyStatus, String> {
     let state = app.state::<AppState>();
     let mut _operation_guard =
-        begin_open_runtime_operation(&state, Duration::from_secs(6), "runtime-operation")?;
+        acquire_operation_lock(&state, Duration::from_secs(6), "runtime-operation")?;
     if let Some(expected) = expected_config_path.as_deref() {
         let runtime = state
             .runtime
@@ -1683,21 +1643,18 @@ pub(crate) fn set_system_proxy_blocking(
         )?;
     }
 
-    if enabled {
-        let mut slot = state
-            .runtime
-            .lock()
-            .map_err(|_| "PROBE_RUNTIME_UNAVAILABLE")?;
-        let runtime = slot.as_mut().ok_or("PROBE_RUNTIME_UNAVAILABLE")?;
-        // A live process alone does not prove the owned HTTP/SOCKS/API
-        // listeners survived since connect. Reject before writing WinINet.
-        if !owned_runtime_ports_ready(&mut runtime.child)? {
-            return Err(
-                "CORE_PORT_TIMEOUT: cannot enable proxy before owned listener readiness".into(),
-            );
-        }
+    let is_connected = state
+        .runtime
+        .lock()
+        .map(|mut runtime| {
+            runtime
+                .as_mut()
+                .is_some_and(|runtime| matches!(runtime.child.try_wait(), Ok(None)))
+        })
+        .unwrap_or(false);
+    if enabled && !is_connected {
+        return Err("Сначала запустите runtime, затем включайте системный proxy.".into());
     }
-    _operation_guard.check()?;
 
     let status = if enabled {
         enable_owned_windows_proxy(&app)?
@@ -1733,56 +1690,51 @@ pub(crate) fn set_system_proxy_blocking(
 }
 
 #[tauri::command]
-pub(crate) async fn repair_runtime_environment(
-    app: AppHandle,
-    plan_id: String,
-) -> Result<RuntimeStatus, crate::repair_plan::RepairError> {
-    let result =
-        tauri::async_runtime::spawn_blocking(move || crate::repair_plan::execute(app, plan_id))
-            .await
-            .map_err(|_| crate::repair_plan::public_error("REPAIR_EXECUTION_UNCONFIRMED"))?;
-    result.map_err(|e| crate::repair_plan::public_error(&e))
+pub(crate) async fn repair_runtime_environment(app: AppHandle) -> Result<RuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || repair_runtime_environment_blocking(app))
+        .await
+        .map_err(|error| format!("Восстановление runtime окружения было прервано: {error}"))?
+}
+
+pub(crate) fn repair_runtime_environment_blocking(app: AppHandle) -> Result<RuntimeStatus, String> {
+    let state = app.state::<AppState>();
+    let mut _operation_guard =
+        acquire_operation_lock(&state, Duration::from_secs(6), "runtime-operation")?;
+
+    let is_connected = state.connected.lock().map(|value| *value).unwrap_or(false);
+    if is_connected {
+        return Err(
+            "Сначала отключите VPN, затем запускайте восстановление runtime окружения.".into(),
+        );
+    }
+
+    restore_saved_proxy_state(&app, &state, "manual_runtime_repair")?;
+    cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &[])?;
+    let _ = cleanup_runtime_config_files(&app);
+    let _ = append_runtime_event(
+        &app,
+        "Выполнено ручное восстановление runtime окружения: proxy/routes/runtime-config cleanup.",
+    );
+    refresh_tray_menu(&app);
+    _operation_guard.commit();
+    drop(_operation_guard);
+    Ok(build_runtime_status(&app, state))
 }
 
 #[tauri::command]
-pub(crate) async fn connectivity_probe(app: AppHandle) -> Result<ConnectivityProbe, String> {
-    tauri::async_runtime::spawn_blocking(move || connectivity_probe_blocking(app))
+pub(crate) async fn connectivity_probe() -> Result<ConnectivityProbe, String> {
+    tauri::async_runtime::spawn_blocking(connectivity_probe_blocking)
         .await
         .map_err(|error| format!("Проверка маршрута была прервана: {error}"))?
 }
 
-fn probe_runtime_identity(app: &AppHandle) -> Result<(u32, u64), String> {
-    let snapshot = read_runtime_status(app, app.state::<AppState>());
-    match (
-        snapshot.tunnel_active,
-        snapshot.xray_pid,
-        snapshot.operation,
-    ) {
-        (true, Some(pid), None) => Ok((pid, snapshot.runtime_revision)),
-        _ => Err(
-            "PROBE_RUNTIME_UNAVAILABLE: no stable owned runtime; no VPN egress was tested".into(),
-        ),
-    }
-}
-
-pub(crate) fn connectivity_probe_blocking(app: AppHandle) -> Result<ConnectivityProbe, String> {
-    let identity = probe_runtime_identity(&app)?;
-    #[cfg(windows)]
-    if !crate::diagnostic_facts::runtime_ports_ready(identity.0)? {
-        return Err(
-            "CORE_PORT_TIMEOUT: owned listeners are not ready; no VPN egress was tested".into(),
-        );
-    }
+pub(crate) fn connectivity_probe_blocking() -> Result<ConnectivityProbe, String> {
     let checked_at = unix_now_string();
     let http_port_open = tcp_port_open("127.0.0.1", HTTP_PORT, 1200);
     let socks_port_open = tcp_port_open("127.0.0.1", SOCKS_PORT, 1200);
 
     if !http_port_open {
-        if probe_runtime_identity(&app)? != identity {
-            return Err("PROBE_RUNTIME_CHANGED: runtime changed during listener observation; result discarded".into());
-        }
         return Ok(ConnectivityProbe {
-            kind: "xray-http",
             success: false,
             checked_at,
             http_port_open,
@@ -1802,28 +1754,17 @@ pub(crate) fn connectivity_probe_blocking(app: AppHandle) -> Result<Connectivity
     )?;
 
     let started = Instant::now();
-    let public_ip = fetch_public_ip(&client).ok();
-    if probe_runtime_identity(&app)? != identity {
-        return Err(
-            "PROBE_RUNTIME_CHANGED: runtime changed during the HTTP probe; result discarded".into(),
-        );
-    }
-    #[cfg(windows)]
-    if !crate::diagnostic_facts::runtime_ports_ready(identity.0)? {
-        return Err("PROBE_RUNTIME_CHANGED: owned listeners changed during the HTTP probe; result discarded".into());
-    }
-    let success = public_ip.is_some();
+    let public_ip = fetch_public_ip(&client)?;
 
     Ok(ConnectivityProbe {
-        kind: "xray-http",
-        success,
+        success: true,
         checked_at,
         http_port_open,
         socks_port_open,
-        public_ip,
-        latency_ms: success.then(|| started.elapsed().as_millis()),
+        public_ip: Some(public_ip),
+        latency_ms: Some(started.elapsed().as_millis()),
         packet_loss_pct: None,
-        message: if success { "HTTP egress through the owned local Xray responded; this is not a TUN, UDP or DNS leak test." } else { "Owned HTTP/SOCKS listener observations are separate: HTTPS egress through Xray failed. Check the selected server; TUN/UDP/DNS were not tested." }.into(),
+        message: "Маршрут через локальный Xray runtime отвечает.".into(),
     })
 }
 
@@ -1876,7 +1817,6 @@ pub(crate) fn server_ping_blocking(
         format!("direct TCP unavailable; successful=0/3; failures=3; reason={failure}; packetLoss=unmeasured")
     };
     Ok(ConnectivityProbe {
-        kind: "server-direct",
         success: count > 0,
         checked_at: unix_now_string(),
         http_port_open: false,
@@ -2163,24 +2103,21 @@ pub(crate) fn parse_powershell_process_list(raw: &str) -> Vec<RunningAppInfo> {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn prepare_running_app_inventory(
+pub(crate) fn dedupe_and_limit_running_apps(
     apps: Vec<RunningAppInfo>,
     limit: usize,
-) -> Result<Vec<RunningAppInfo>, String> {
+) -> Vec<RunningAppInfo> {
     let mut seen = std::collections::HashSet::<String>::new();
     let mut unique = apps
         .into_iter()
         .filter(|app| !app.name.trim().is_empty())
         .filter(|app| {
-            let identity = app
+            let key = app
                 .path
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
-                .map(|value| value.trim().replace('\\', "/").to_lowercase())
-                .unwrap_or_else(|| app.name.to_lowercase());
-            // Keep process instances for the renderer's canonical executable
-            // grouping/counts; inaccessible paths cannot become broad exe rules.
-            let key = format!("{}:{identity}", app.pid);
+                .map(|value| value.to_lowercase())
+                .unwrap_or_else(|| format!("{}:{}", app.name.to_lowercase(), app.pid));
             seen.insert(key)
         })
         .collect::<Vec<_>>();
@@ -2214,24 +2151,12 @@ pub(crate) fn prepare_running_app_inventory(
             .then_with(|| left.pid.cmp(&right.pid))
     });
 
-    if unique.len() > limit {
-        return Err("APP_INVENTORY_LIMIT: application list exceeds the bounded inventory; no partial list returned".into());
-    }
-    Ok(unique)
+    unique.truncate(limit);
+    unique
 }
 
 #[cfg(target_os = "windows")]
 pub(crate) fn list_running_apps_blocking() -> Result<Vec<RunningAppInfo>, String> {
-    match crate::process_inventory::native_running_apps() {
-        Ok(apps) => return Ok(apps),
-        Err(error) if error.starts_with("APP_INVENTORY_LIMIT") => return Err(error),
-        Err(_) => {}
-    }
-    list_running_apps_fallback()
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn list_running_apps_fallback() -> Result<Vec<RunningAppInfo>, String> {
     let powershell_script = r#"
 $ErrorActionPreference = 'SilentlyContinue'
 $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -2288,7 +2213,7 @@ $items | Sort-Object @{Expression={ if ([string]::IsNullOrWhiteSpace($_.title)) 
     ) {
         let apps = parse_powershell_process_list(&raw);
         if !apps.is_empty() {
-            return prepare_running_app_inventory(apps, 4096);
+            return Ok(dedupe_and_limit_running_apps(apps, 200));
         }
     }
 
@@ -2317,7 +2242,7 @@ $items | Sort-Object @{Expression={ if ([string]::IsNullOrWhiteSpace($_.title)) 
         }
     };
 
-    prepare_running_app_inventory(apps, 4096)
+    Ok(dedupe_and_limit_running_apps(apps, 200))
 }
 
 #[cfg(target_os = "windows")]
@@ -2584,9 +2509,12 @@ pub(crate) async fn pick_executable_path() -> Result<Option<String>, String> {
 }
 #[tauri::command]
 pub(crate) fn restart_application(app: AppHandle) -> Result<(), String> {
-    begin_state_handoff(&app, HandoffAction::Restart)
-        .map(|_| ())
-        .map_err(|error| error.message)
+    let state = app.state::<AppState>();
+    crate::restart_lifecycle::restart_after_owned_cleanup(
+        &state.restart_requested,
+        || request_disconnect_blocking(app.clone()).map(|_| ()),
+        || app.request_restart(),
+    )
 }
 
 fn read_runtime_log_blocking(app: AppHandle, lines: Option<usize>) -> Result<Vec<String>, String> {
@@ -2607,17 +2535,6 @@ pub(crate) async fn read_runtime_log(
 mod ping_budget_tests {
     use super::*;
     #[test]
-    fn diagnostics_admission_stays_owned_until_native_reader_finishes() {
-        let permit = DiagnosticReadPermit::acquire().unwrap();
-        assert!(
-            std::thread::spawn(|| DiagnosticReadPermit::acquire().is_err())
-                .join()
-                .unwrap()
-        );
-        drop(permit);
-        assert!(DiagnosticReadPermit::acquire().is_ok());
-    }
-    #[test]
     fn renderer_cancellation_cannot_accumulate_unbounded_native_ping_tasks() {
         let permits = (0..4)
             .map(|_| PingPermit::acquire().unwrap())
@@ -2627,38 +2544,5 @@ mod ping_budget_tests {
         let permit = PingPermit::acquire().unwrap();
         drop(permit);
         assert_eq!(PING_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire), 0);
-    }
-}
-
-#[cfg(all(test, target_os = "windows"))]
-mod application_inventory_tests {
-    use super::*;
-
-    fn process(pid: u32, path: Option<&str>) -> RunningAppInfo {
-        RunningAppInfo {
-            pid,
-            name: "app.exe".into(),
-            path: path.map(str::to_string),
-            title: None,
-        }
-    }
-
-    #[test]
-    fn inventory_retains_process_instances_and_rejects_silent_truncation() {
-        let apps = || {
-            vec![
-                process(1, Some("C:\\App.exe")),
-                process(1, Some("c:/app.exe")),
-                process(2, Some("C:/App.exe")),
-                process(3, None),
-                process(4, None),
-            ]
-        };
-        let prepared = prepare_running_app_inventory(apps(), 4).unwrap();
-        assert_eq!(prepared.len(), 4);
-        assert!(prepared.iter().any(|app| app.pid == 2));
-        assert!(prepare_running_app_inventory(apps(), 3)
-            .unwrap_err()
-            .starts_with("APP_INVENTORY_LIMIT"));
     }
 }

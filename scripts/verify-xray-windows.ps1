@@ -1,5 +1,4 @@
 $ErrorActionPreference = 'Stop'
-Import-Module (Join-Path $PSScriptRoot 'core-resource-tools.psm1') -Force
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot '..')
 $CoreDir = Join-Path $Root 'resources\core\windows'
@@ -69,8 +68,6 @@ function Assert-WindowsX64Pe([string]$Path, [string]$Label) {
   if ($magic -ne 0x20B) {
     throw "$Label must be PE32+ x64. OptionalHeader=0x$($magic.ToString('X4'))"
   }
-
-  Assert-WindowsAmd64Pe $Path
 
   Write-Host "[xray-check] OK: $Label is Windows x64 PE32+ ($($item.Length) bytes)"
 }

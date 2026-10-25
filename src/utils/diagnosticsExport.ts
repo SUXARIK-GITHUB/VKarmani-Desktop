@@ -10,16 +10,6 @@ import type {
   UpdateInfo
 } from '../types/vpn';
 import { redactSensitiveText } from './redaction';
-import {publicDiagnosticFacts} from './diagnosticFacts';
-import {diagnosticChecks} from './diagnosticChecks';
-import {isPublicNativeCode,publicFailureDetails} from './nativeErrors';
-
-export function safePublicDigest(value:unknown,session:RemnawaveSession|null):string {
-  if(typeof value!=='string'||!/^[a-f0-9]{64}$/i.test(value))return '';
-  const credentials=[session?.accessKey,session?.userId,session?.shortUuid,session?.subscriptionUrl];
-  if(credentials.some(secret=>secret?.toLowerCase().includes(value.toLowerCase())))return '[redacted]';
-  return value.toLowerCase();
-}
 
 export interface SafeDiagnosticsExportInput {
   appVersion: string;
@@ -34,7 +24,6 @@ export interface SafeDiagnosticsExportInput {
   nativeLogLines: string[];
   trafficSnapshot?: TrafficSnapshot | null;
   trafficSampleCount?: number;
-  diagnosticObservation?:RuntimeStatus|null;
 }
 
 function toSafeSettings(settings: AppSettings) {
@@ -103,30 +92,26 @@ export function createSafeDiagnosticsPayload(input: SafeDiagnosticsExportInput):
     appVersion: text(input.appVersion),
     runtime: runtime && {bridge:runtime.bridge,coreFound:runtime.coreInstalled,active:runtime.tunnelActive,mode:runtime.networkMode,pid:runtime.xrayPid,revision:runtime.runtimeRevision,configHash:runtime.runtimeConfigHash,operation:operation(runtime.operation),lastOperation:operation(runtime.lastOperation),proxyOwnership:text(runtime.proxyOwnership),routeOwnership:text(runtime.routeOwnership),ownedRouteCount:runtime.ownedRoutes?.length ?? 0,reconnectAttempt:runtime.reconnectAttempt,lastExitCode:runtime.lastExitCode},
     proxy: {enabled:input.proxyStatus.enabled,autoDetect:input.proxyStatus.autoDetect,hasPac:Boolean(input.proxyStatus.autoConfigUrl),method:input.proxyStatus.method},
-    probe: input.connectivityProbe && {kind:['server-direct','xray-http','unavailable'].includes(input.connectivityProbe.kind??'')?input.connectivityProbe.kind:'unavailable',success:input.connectivityProbe.success,httpPortOpen:input.connectivityProbe.kind==='xray-http'?input.connectivityProbe.httpPortOpen:null,socksPortOpen:input.connectivityProbe.kind==='xray-http'?input.connectivityProbe.socksPortOpen:null,vpnEgress:'NOT_TESTED',dnsLeak:'NOT_TESTED',latencyMs:input.connectivityProbe.latencyMs,checkedAt:text(input.connectivityProbe.checkedAt),message:text(input.connectivityProbe.message)},
+    probe: input.connectivityProbe && {success:input.connectivityProbe.success,httpPortOpen:input.connectivityProbe.httpPortOpen,socksPortOpen:input.connectivityProbe.socksPortOpen,latencyMs:input.connectivityProbe.latencyMs,checkedAt:text(input.connectivityProbe.checkedAt),message:text(input.connectivityProbe.message)},
     traffic: {source:input.trafficSnapshot?.source ?? 'unavailable',checkedAt:text(input.trafficSnapshot?.checkedAt),runtimeId:text(input.trafficSnapshot?.runtimeId),sessionId:input.trafficSnapshot?.sessionId,receivedBytes:input.trafficSnapshot?.source === 'unavailable' ? null : input.trafficSnapshot?.receivedBytes,sentBytes:input.trafficSnapshot?.source === 'unavailable' ? null : input.trafficSnapshot?.sentBytes,unavailableReason:text(input.trafficSnapshot?.unavailableReason),sampleCount:input.trafficSampleCount ?? 0,baseline:'first measured counters; gaps and source transitions are not estimated'},
     packetLoss: {source:'unavailable',value:null,reason:'No end-to-end packet-loss sampler; HTTP/TCP failures and interface discards are different metrics.'},
     subscription: {state:runtime?.subscriptionState ?? 'unconfirmed',source:input.session?.source,refreshAfter:runtime?.subscriptionRefreshAfter},
     profileSync: {status:input.profileSyncInfo.status,source:input.profileSyncInfo.source,configCount:input.profileSyncInfo.configCount,readyCount:input.profileSyncInfo.readyCount,message:text(input.profileSyncInfo.message)},
     update: {status:input.updateInfo.status,currentVersion:text(input.updateInfo.currentVersion),available:input.updateInfo.available,version:text(input.updateInfo.version)},
     settings: toSafeSettings(input.settings),
-    diagnosticsReadOnly:input.diagnosticObservation?{facts:publicDiagnosticFacts(input.diagnosticObservation.diagnosticFacts),checks:diagnosticChecks(input.diagnosticObservation,input.settings.language)}:null,
     logs: [...(input.diagnostics?.logLines ?? []), ...input.nativeLogLines].slice(-160).map(text)
   };
   // Sanitize serialization too, covering enum/hash/numeric fields from untrusted IPC.
   const seen = new WeakSet<object>();
   let nodes = 0;
-  function scrub(value: unknown, depth = 0, field = ''): unknown {
+  function scrub(value: unknown, depth = 0): unknown {
     if (++nodes > 4000 || depth > 8) return '[bounded]';
-    if (typeof value === 'string') {
-      if(field==='code'&&isPublicNativeCode(value)||field==='cause'&&publicFailureDetails({code:'CORE_CONFIG_REJECTED',cause:value}).cause===value)return value;
-      return field==='configHash' ? safePublicDigest(value,input.session) : text(value);
-    }
+    if (typeof value === 'string') return text(value);
     if (!value || typeof value !== 'object') return value;
     if (seen.has(value)) return '[cycle]';
     seen.add(value);
     if (Array.isArray(value)) return value.slice(0, 160).map(v => scrub(v, depth + 1));
-    return Object.fromEntries(Object.entries(value).filter(([key]) => !/access.?key|user.?id|password|cookie|authorization|credential|token|secret|plaintext/i.test(key)).map(([key,val]) => [key,scrub(val,depth + 1,key)]));
+    return Object.fromEntries(Object.entries(value).filter(([key]) => !/access.?key|user.?id|password|cookie|authorization|credential|token|secret|plaintext/i.test(key)).map(([key,val]) => [key,scrub(val,depth + 1)]));
   }
   return JSON.stringify(scrub(report), null, 2);
 }

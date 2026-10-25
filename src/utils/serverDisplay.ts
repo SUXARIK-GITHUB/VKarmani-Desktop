@@ -2,10 +2,6 @@ const FLAG_RE = /[\u{1F1E6}-\u{1F1FF}]{2}/u;
 
 const COUNTRY_NAME_TO_CODE: Record<string, string> = {
   eu: 'EU',
-  by: 'BY',
-  belarus: 'BY',
-  беларусь: 'BY',
-  белоруссия: 'BY',
   nl: 'NL',
   netherland: 'NL',
   netherlands: 'NL',
@@ -112,7 +108,6 @@ const COUNTRY_NAME_TO_CODE: Record<string, string> = {
 };
 
 const COUNTRY_CODE_TO_NAME: Record<string, string> = {
-  BY: 'Belarus',
   NL: 'Netherlands',
   DE: 'Germany',
   RU: 'Russia',
@@ -208,6 +203,7 @@ export function looksLikeHost(value?: string | null) {
 export function inferCountryCode({
   country,
   rawLabel,
+  host,
   explicitCode
 }: {
   country?: string | null;
@@ -219,9 +215,6 @@ export function inferCountryCode({
   if (normalizedExplicit && /^[A-Z]{2}$/.test(normalizedExplicit)) {
     return normalizedExplicit;
   }
-
-  const countryFromMetadata = COUNTRY_NAME_TO_CODE[normalizeCountryKey(country ?? '')];
-  if (countryFromMetadata) return countryFromMetadata;
 
   const labelFlag = rawLabel?.match(FLAG_RE)?.[0];
   const flagCode = labelFlag ? flagEmojiToCountryCode(labelFlag) : undefined;
@@ -253,6 +246,11 @@ export function inferCountryCode({
     }
   }
 
+  const tld = host?.trim().split('.').pop()?.toUpperCase();
+  if (tld && /^[A-Z]{2}$/.test(tld)) {
+    return tld;
+  }
+
   return undefined;
 }
 
@@ -263,8 +261,6 @@ export function getServerCountryCode(server: {
   host?: string | null;
   flag?: string | null;
 }) {
-  const explicitCode = server.countryCode?.trim().toUpperCase();
-  if (explicitCode && /^[A-Z]{2}$/.test(explicitCode)) return explicitCode;
   const normalizedFlag = server.flag?.trim();
 
   if (normalizedFlag && /^[A-Z]{2}$/i.test(normalizedFlag)) {
@@ -300,8 +296,6 @@ export function resolveServerFlag({
   host?: string | null;
   explicitCode?: string | null;
 }) {
-  const code = (countryCode || explicitCode)?.trim().toUpperCase();
-  if (code && /^[A-Z]{2}$/.test(code)) return flagEmojiFromCountryCode(code);
   const normalizedFlag = flag?.trim();
 
   if (normalizedFlag && normalizedFlag !== '🌐') {
@@ -315,6 +309,7 @@ export function resolveServerFlag({
     }
   }
 
+  const code = countryCode || explicitCode;
   const countryCodeResolved = inferCountryCode({ country, rawLabel, host, explicitCode: code });
   return flagEmojiFromCountryCode(countryCodeResolved);
 }
@@ -364,19 +359,6 @@ export function getServerSecondaryLabel(
   }
 
   return city;
-}
-
-export function getServerSubtitle(server: {
-  description?: string | null;
-  protocol?: string | null;
-  transportLabel?: string | null;
-  runtimeTemplate?: { protocol?: string; transport?: string } | null;
-}) {
-  const description = server.description?.trim();
-  if (description) return description;
-  const protocol = server.runtimeTemplate?.protocol?.toUpperCase() || server.protocol?.toUpperCase() || 'XRAY';
-  const transport = server.transportLabel?.toUpperCase() || server.runtimeTemplate?.transport?.toUpperCase();
-  return `${protocol}${transport ? ` | ${transport}` : ''}`;
 }
 
 export function getServerDisplayLabel(

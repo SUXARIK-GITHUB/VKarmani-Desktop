@@ -1,5 +1,5 @@
+use super::durable::{DurableSnapshot, DurableStore, StateCommit, StatePatch};
 use super::*;
-use crate::durable_state::{DurableSnapshot, DurableStore, StateCommit, StatePatch};
 
 pub(crate) fn app_durable_store(app: &AppHandle) -> Result<DurableStore, StateStorageError> {
     let root = app.path().app_local_data_dir().map_err(|_| {

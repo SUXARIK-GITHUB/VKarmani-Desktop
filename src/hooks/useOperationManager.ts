@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { OperationOwnership } from '../utils/operationOwnership';
-import {nativeMutations} from '../services/nativeTransport';
 
 export type OperationName = string;
 
@@ -14,7 +13,7 @@ const DEFAULT_CONFLICTS: ConflictMap = {
   reconnect: ['connect', 'disconnect', 'reconnect', 'updateInstall', 'logout', 'repairRuntime'],
   updateCheck: ['updateCheck', 'updateInstall'],
   updateInstall: ['updateCheck', 'updateInstall', 'connect', 'disconnect', 'reconnect', 'proxy', 'logout', 'repairRuntime'],
-  proxy: ['proxy', 'connect', 'disconnect', 'reconnect', 'updateInstall', 'logout', 'repairRuntime'],
+  proxy: ['proxy', 'updateInstall', 'repairRuntime'],
   probe: ['probe'],
   syncProfile: ['syncProfile'],
   splitApps: ['splitApps'],
@@ -41,7 +40,6 @@ const DEFAULT_OPERATION_TIMEOUTS_MS: OperationTimeoutMap = {
   repairRuntime: 40000,
   logout: 26000
 };
-const MUTATING_OPERATIONS=new Set(['connect','disconnect','reconnect','proxy','repairRuntime','logout','updateInstall']);
 
 export function useOperationManager(customConflicts: ConflictMap = DEFAULT_CONFLICTS) {
   const conflicts = useMemo(() => customConflicts, [customConflicts]);
@@ -49,15 +47,13 @@ export function useOperationManager(customConflicts: ConflictMap = DEFAULT_CONFL
   const ownership = useRef(new OperationOwnership());
   const mounted=useRef(true);
   const timers=useRef(new Set<number>());
-  useEffect(()=>{const ownedTimers=timers.current;mounted.current=true;return()=>{mounted.current=false;for(const timer of ownedTimers)window.clearTimeout(timer);ownedTimers.clear();};},[]);
+  useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;for(const timer of timers.current)window.clearTimeout(timer);timers.current.clear();};},[]);
   const publish=useCallback(()=>{const next=ownership.current.snapshot();busyActionsRef.current=next;if(mounted.current)setBusyActions(next);},[]);
   const busyActionsRef = useRef<Record<OperationName, boolean>>({});
-  useEffect(()=>{window.addEventListener('vkarmani:native-mutation-changed',publish);return()=>window.removeEventListener('vkarmani:native-mutation-changed',publish);},[publish]);
 
   const isBusy = useCallback((operation: OperationName) => Boolean(busyActionsRef.current[operation]), []);
 
   const hasConflict = useCallback((operation: OperationName) => {
-    if(MUTATING_OPERATIONS.has(operation)&&nativeMutations.pending())return true;
     const blockedByOperation = new Set<OperationName>([operation, ...(conflicts[operation] ?? [])]);
 
     return Object.keys(busyActionsRef.current).some((activeOperation) => (
@@ -66,7 +62,6 @@ export function useOperationManager(customConflicts: ConflictMap = DEFAULT_CONFL
   }, [conflicts]);
 
   const run = useCallback(async <T,>(operation: OperationName, task: () => Promise<T>): Promise<T | null> => {
-    if(MUTATING_OPERATIONS.has(operation)&&nativeMutations.pending())return null;
     const token=ownership.current.acquire(operation,conflicts);
     if(token===null)return null;
     publish();
@@ -77,9 +72,7 @@ export function useOperationManager(customConflicts: ConflictMap = DEFAULT_CONFL
     try {
       if (typeof window !== 'undefined') {
         watchdog = window.setTimeout(() => {
-          // A deadline is observational: only the task's actual settlement can
-          // release its owner. The native registry also survives IPC deadlines.
-          if(mounted.current)window.dispatchEvent(new CustomEvent('vkarmani:operation-overdue',{detail:{operation}}));
+          if(ownership.current.release(operation,token))publish();
         }, timeoutMs + 2500);
         timers.current.add(watchdog);
       }
