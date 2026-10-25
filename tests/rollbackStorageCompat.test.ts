@@ -15,6 +15,35 @@ beforeEach(() => {
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 describe('076 UI with authoritative encrypted v2 storage', () => {
+  it.each([null, '', 'future', 42, {}, [], ['all']])('blocks invalid present TUN policy %j without broadening it or overwriting originals', async tunRoutingMode => {
+    backend.snapshot.payload.public.settings = { tunnelMode: 'tun', autoConnect: true, tunRoutingMode, futureOption: { keep: true } };
+    const original = structuredClone(backend.snapshot);
+    const storage = await import('../src/services/storage');
+    await expect(storage.loadSettingsBackup()).rejects.toMatchObject({ code: 'STATE_SETTINGS_INVALID', category: 'storage' });
+    storage.saveSettings(storage.defaultSettings);
+    storage.saveSplitTunnelEntries([]);
+    await expect(storage.flushPersistentWrites()).rejects.toMatchObject({ code: 'STATE_RESTORE_BLOCKED' });
+    expect(backend.snapshot).toEqual(original);
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual(['load_state_snapshot']);
+  });
+  it('blocks a persisted invalid-policy quarantine marker even alongside a valid mode', async () => {
+    backend.snapshot.payload.public.settings = { tunRoutingMode: 'selected', tunRoutingModeInvalid: true, autoConnect: true };
+    const storage = await import('../src/services/storage');
+    await expect(storage.loadPersistentSnapshot()).rejects.toMatchObject({ code: 'STATE_SETTINGS_INVALID' });
+    await expect(storage.flushPersistentWrites()).rejects.toMatchObject({ code: 'STATE_RESTORE_BLOCKED' });
+  });
+  it.each(['all', 'selected', 'exclude'])('preserves explicit %s policy with no rules', async tunRoutingMode => {
+    backend.snapshot.payload.public.settings = { tunnelMode: 'tun', autoConnect: true, tunRoutingMode };
+    const storage = await import('../src/services/storage');
+    expect((await storage.loadSettingsBackup())?.tunRoutingMode).toBe(tunRoutingMode);
+    expect((await storage.loadPersistentSnapshot()).settings).toMatchObject({ tunRoutingMode, autoConnect: true });
+  });
+  it.each([false, true])('retains absent-mode legacy migration with rules=%s', async hasRules => {
+    backend.snapshot.payload.public.settings = { language: 'en' };
+    backend.snapshot.payload.public.splitTunnelEntries = hasRules ? [{ id: 'legacy', kind: 'app', value: 'app.exe', policy: 'VPN', enabled: true }] : [];
+    const storage = await import('../src/services/storage');
+    expect((await storage.loadPersistentSnapshot()).settings).toMatchObject({ tunRoutingMode: hasRules ? 'selected' : 'all', autoConnect: false, language: 'en' });
+  });
   it('keeps newer per-rule metadata when the076 editor hydrates and saves supported fields', async () => {
     backend.snapshot.payload.public.splitTunnelEntries = [{id:'rule-a',kind:'app',value:'app.exe',enabled:true,policy:'VPN',schemaVersion:2,futureMetadata:{keep:true}}];
     const storage = await import('../src/services/storage');

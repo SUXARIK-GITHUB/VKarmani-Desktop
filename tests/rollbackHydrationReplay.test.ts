@@ -5,6 +5,32 @@ import { NativeStateFake } from './helpers/nativeStateFake';
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
 afterEach(() => vi.unstubAllGlobals());
+
+it.each(['ensureAdminLaunch', 'setNativeLaunchOnStartup'])('defers %s until native settings restoration succeeds', async command => {
+  const source = ts.createSourceFile('App.tsx', readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let effect: ts.CallExpression | undefined;
+  const visit = (node: ts.Node) => {
+    if (ts.isCallExpression(node) && node.expression.getText(source) === 'useEffect'
+      && node.arguments[0]?.getText(source).includes(`void ${command}(`)) effect = node;
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  expect(effect).toBeDefined();
+  const call = vi.fn().mockResolvedValue(undefined);
+  const attempted = { current: false };
+  const js = ts.transpileModule('const effect=' + effect!.arguments[0].getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
+  const run = (ready: boolean) => new Function('bindings', 'const {persistentStateReady,settings,hasTriedAdminLaunch,isTauriRuntime,ensureAdminLaunch,setNativeLaunchOnStartup}=bindings;' + js + ';effect();')({
+    persistentStateReady: ready, settings: { runAsAdmin: true, launchOnStartup: false }, hasTriedAdminLaunch: attempted,
+    isTauriRuntime: true, ensureAdminLaunch: call, setNativeLaunchOnStartup: call
+  });
+  run(false);
+  expect(call).not.toHaveBeenCalled();
+  expect(attempted.current).toBe(false);
+  expect(effect!.arguments[1].getText(source)).toContain('persistentStateReady');
+  run(true);
+  expect(call).toHaveBeenCalledExactlyOnceWith(command === 'ensureAdminLaunch');
+});
+
 it('executes the actual App hydration effect twice with cleanup without enabling default autosave', async () => {
   vi.resetModules(); invoke.mockReset(); const backend = new NativeStateFake();
   backend.snapshot.payload.public = { settings: {language:'en',themeGlow:false}, favoriteServerIds:['fav'], selectedServerId:'selected', splitTunnelEntries:[] };
