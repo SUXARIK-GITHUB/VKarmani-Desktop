@@ -34,6 +34,11 @@ if (fs.existsSync(packageLockPath)) {
 const tauriConfPath = path.join(root, 'src-tauri', 'tauri.conf.json');
 const tauriConf = JSON.parse(fs.readFileSync(tauriConfPath, 'utf8'));
 tauriConf.version = version;
+if (tauriConf.bundle?.windows?.wix?.version !== undefined) {
+  // An explicit WiX override supersedes Tauri's SemVer conversion. Keeping an
+  // old override makes a new MSI retain the previous ProductVersion.
+  tauriConf.bundle.windows.wix.version = `${version.match(/^\d+\.\d+\.\d+/)[0]}.0`;
+}
 fs.writeFileSync(tauriConfPath, `${JSON.stringify(tauriConf, null, 2)}\n`);
 console.log(`[version] src-tauri/tauri.conf.json -> ${version}`);
 

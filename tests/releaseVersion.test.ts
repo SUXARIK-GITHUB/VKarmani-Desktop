@@ -22,6 +22,7 @@ it('synchronizes release versions without changing dependency or resource identi
     expect(json('package-lock.json').version).toBe('0.99.123');
     expect(json('package-lock.json').packages[''].version).toBe('0.99.123');
     expect(json('src-tauri/tauri.conf.json').version).toBe('0.99.123');
+    expect(json('src-tauri/tauri.conf.json').bundle.windows.wix.version).toBe('0.99.123.0');
     const oldCore = JSON.parse(before.get(files[5])!.replace(/^\uFEFF/, ''));
     expect(json(files[5])).toEqual({ ...oldCore, version: '0.99.123' });
     const oldLock = JSON.parse(before.get(files[1])!);
@@ -35,6 +36,9 @@ it('synchronizes release versions without changing dependency or resource identi
     const first = files.map(name => readFileSync(path.join(root, name)));
     run();
     files.forEach((name, index) => expect(readFileSync(path.join(root, name))).toEqual(first[index]));
+    execFileSync(process.execPath, [script, '0.99.124-rc.1'], { cwd: root });
+    expect(json('src-tauri/tauri.conf.json').version).toBe('0.99.124-rc.1');
+    expect(json('src-tauri/tauri.conf.json').bundle.windows.wix.version).toBe('0.99.124.0');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
