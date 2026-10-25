@@ -8,6 +8,7 @@ import { SettingsTab } from './components/SettingsTab';
 import { SidebarNav } from './components/SidebarNav';
 import { SplitTunnelModal } from './components/SplitTunnelModal';
 import { StartupSkeleton } from './components/StartupSkeleton';
+import { StorageRecoveryNotice } from './components/StorageRecoveryNotice';
 import { SupportTab } from './components/SupportTab';
 import { ToastViewport } from './components/ToastViewport';
 import { TabErrorBoundary } from './components/TabErrorBoundary';
@@ -52,13 +53,13 @@ import {
   clearLastKnownServers,
   clearStoredAccessKey,
   loadFavoriteServerIds,
-  loadFavoriteServerIdsBackup,
   loadSelectedServerId,
-  loadSelectedServerIdBackup,
   loadSettings,
-  loadSettingsBackup,
   loadSplitTunnelEntries,
-  loadSplitTunnelEntriesBackup,
+  loadPersistentSnapshot,
+  inspectPersistentRecovery,
+  reloadPersistentSnapshot,
+  NativeStorageError,
   loadLastKnownServers,
   loadLastKnownServersBackup,
   loadStoredAccessKey,
@@ -70,6 +71,7 @@ import {
   saveSplitTunnelEntries,
   saveStoredAccessKey
 } from './services/storage';
+import { storageFailure } from './services/nativeState';
 import { checkForUpdates, installAvailableUpdate } from './services/updater';
 import type { PendingServerSwitch } from './types/appState';
 import type {
@@ -98,7 +100,7 @@ const integrationMeta = getIntegrationMeta();
 
 
 
-export default function App() {
+export default function App({ safeStart = false }: { safeStart?: boolean } = {}) {
   const [accessKey, setAccessKey] = useState(() => loadStoredAccessKey());
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
   const language = settings.language;
@@ -142,6 +144,11 @@ export default function App() {
   const [isSyncingProfile, setIsSyncingProfile] = useState(false);
   const operationManager = useOperationManager();
   const [persistentStateReady, setPersistentStateReady] = useState(!isTauriRuntime);
+  const [recoveryMode, setRecoveryMode] = useState(safeStart);
+  const [storageIssue, setStorageIssue] = useState<NativeStorageError | null>(null);
+  const [storageRecoveryBusy, setStorageRecoveryBusy] = useState(false);
+  const [storageRecoveryToken, setStorageRecoveryToken] = useState<string | null>(null);
+  const storageRecoveryLock = useRef(false);
   const [isBootstrapping, setIsBootstrapping] = useState(true);
   const { toasts, pushToast } = useToastManager(settings.notifications);
   const [isAppInfoOpen, setIsAppInfoOpen] = useState(false);
@@ -297,6 +304,44 @@ export default function App() {
     void setNativeTrayUpdateState(Boolean(updateInfo.available), updateBusy);
   }, [updateInfo.available, updateInfo.status]);
 
+  function applyRestoredPersistentState(restored: Awaited<ReturnType<typeof loadPersistentSnapshot>>) {
+    settingsRef.current = restored.settings; setSettings(restored.settings);
+    splitTunnelEntriesRef.current = restored.entries; setSplitTunnelEntries(restored.entries);
+    favoriteServerIdsRef.current = restored.favorites; setFavoriteServerIds(restored.favorites);
+    selectedServerIdRef.current = restored.selected; setSelectedServerId(restored.selected);
+    setPersistentStateReady(true);
+  }
+
+  function reportPersistentFailure(error: unknown) {
+    setStorageIssue(storageFailure(error)); setRecoveryMode(true);
+  }
+
+  async function handleStorageRecovery(confirmBackup = false) {
+    if (storageRecoveryLock.current) return;
+    storageRecoveryLock.current = true; setStorageRecoveryBusy(true); setRecoveryMode(true);
+    try {
+      if (!confirmBackup) {
+        const preview = await inspectPersistentRecovery();
+        if (preview.readOnly && preview.token) { setStorageRecoveryToken(preview.token); return; }
+      } else if (!storageRecoveryToken) {
+        throw new NativeStorageError('STATE_RECOVERY_CHANGED', 'Требуется повторный просмотр резервной копии.', false);
+      }
+      const restored = await reloadPersistentSnapshot(confirmBackup ? storageRecoveryToken! : undefined);
+      applyRestoredPersistentState(restored);
+      setStorageIssue(null); setStorageRecoveryToken(null);
+    } catch (error) {
+      reportPersistentFailure(error); setStorageRecoveryToken(null);
+    } finally {
+      storageRecoveryLock.current = false; setStorageRecoveryBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    const handler = (event: Event) => reportPersistentFailure((event as CustomEvent).detail);
+    window.addEventListener('vkarmani:storage-error', handler);
+    return () => window.removeEventListener('vkarmani:storage-error', handler);
+  }, []);
+
   useEffect(() => {
     if (!isTauriRuntime) {
       setPersistentStateReady(true);
@@ -307,44 +352,13 @@ export default function App() {
     persistentRestoreStarted.current = true;
     let cancelled = false;
 
-    void Promise.allSettled([
-      loadSettingsBackup(),
-      loadSplitTunnelEntriesBackup(),
-      loadFavoriteServerIdsBackup(),
-      loadSelectedServerIdBackup()
-    ]).then(([settingsResult, splitResult, favoritesResult, selectedResult]) => {
+    void loadPersistentSnapshot().then(restored => {
       if (cancelled) {
         return;
       }
-
-      if ([settingsResult, splitResult, favoritesResult, selectedResult].some(result => result.status === 'rejected')) {
-        pushToast(tr(language, 'Не удалось восстановить сохранённые данные. Автосохранение заблокировано; оригиналы сохранены.', 'Stored data could not be restored. Autosave is blocked; originals are preserved.'), 'error');
-        void writeNativeInterfaceLog('STATE_RESTORE_BLOCKED: saved data was not loaded; autosave remains disabled.');
-        return;
-      }
-
-      if (settingsResult.status === 'fulfilled' && settingsResult.value) {
-        settingsRef.current = settingsResult.value;
-        setSettings(settingsResult.value);
-      }
-
-      if (splitResult.status === 'fulfilled' && splitResult.value) {
-        splitTunnelEntriesRef.current = splitResult.value;
-        setSplitTunnelEntries(splitResult.value);
-      }
-
-      if (favoritesResult.status === 'fulfilled' && favoritesResult.value) {
-        favoriteServerIdsRef.current = favoritesResult.value;
-        setFavoriteServerIds(favoritesResult.value);
-      }
-
-      if (selectedResult.status === 'fulfilled' && selectedResult.value) {
-        selectedServerIdRef.current = selectedResult.value;
-        setSelectedServerId(selectedResult.value);
-      }
-      if (!cancelled) {
-        setPersistentStateReady(true);
-      }
+      applyRestoredPersistentState(restored);
+    }).catch(error => {
+      if (!cancelled) reportPersistentFailure(error);
     });
 
     return () => {
@@ -364,7 +378,7 @@ export default function App() {
           const normalizedStoredKey = storedKey.trim();
           setAccessKey(normalizedStoredKey);
 
-          if (settingsRef.current.autoConnectFavorite && !hasTriedFavoriteAutoConnect.current) {
+          if (!recoveryMode && settingsRef.current.autoConnectFavorite && !hasTriedFavoriteAutoConnect.current) {
             hasTriedFavoriteAutoConnect.current = true;
             void authorizeWithAccessKey(normalizedStoredKey, true);
           }
@@ -377,7 +391,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [persistentStateReady]);
+  }, [persistentStateReady, recoveryMode]);
 
 
   useEffect(() => {
@@ -436,21 +450,21 @@ export default function App() {
   }, [activeTab]);
 
   useEffect(() => {
-    if (!persistentStateReady || !settings.runAsAdmin || hasTriedAdminLaunch.current) {
+    if (recoveryMode || !persistentStateReady || !settings.runAsAdmin || hasTriedAdminLaunch.current) {
       return;
     }
 
     hasTriedAdminLaunch.current = true;
     void ensureAdminLaunch(settings.runAsAdmin).catch(() => undefined);
-  }, [settings.runAsAdmin, persistentStateReady]);
+  }, [settings.runAsAdmin, persistentStateReady, recoveryMode]);
 
   useEffect(() => {
-    if (!isTauriRuntime || !persistentStateReady) {
+    if (recoveryMode || !isTauriRuntime || !persistentStateReady) {
       return;
     }
 
     void setNativeLaunchOnStartup(settings.launchOnStartup).catch(() => undefined);
-  }, [settings.launchOnStartup, persistentStateReady]);
+  }, [settings.launchOnStartup, persistentStateReady, recoveryMode]);
 
   useEffect(() => {
     if (!settings.showDiagnostics && activeTab === 'diagnostics') {
@@ -1955,6 +1969,10 @@ export default function App() {
   }
 
   async function authorizeWithAccessKey(rawAccessKey: string, connectFavoriteAfterLaunch = false) {
+    if (isTauriRuntime && !persistentStateReady) {
+      reportPersistentFailure(storageIssue ?? new NativeStorageError('STATE_RESTORE_BLOCKED', 'Сначала требуется прочитать сохранённые данные.', false));
+      return;
+    }
     const normalizedAccessKey = rawAccessKey.trim();
 
     if (!normalizedAccessKey) {
@@ -2038,7 +2056,7 @@ export default function App() {
         }));
       }
 
-      if (connectFavoriteAfterLaunch) {
+      if (!recoveryMode && connectFavoriteAfterLaunch) {
         const favoriteServer = favoriteServerIdsRef.current
           .map((id) => serverPool.find((server: VpnServer) => server.id === id && server.runtimeTemplate) ?? serverPool.find((server: VpnServer) => server.id === id))
           .find((server): server is VpnServer => Boolean(server));
@@ -2053,7 +2071,7 @@ export default function App() {
         }
       }
 
-      if ((currentSettings.autoConnect || connectFavoriteAfterLaunch) && preferredServerForAutoConnect) {
+      if (!recoveryMode && (currentSettings.autoConnect || connectFavoriteAfterLaunch) && preferredServerForAutoConnect) {
         void handleConnectionToggle(preferredServerForAutoConnect);
       }
     } catch (error) {
@@ -2677,13 +2695,13 @@ export default function App() {
 
 
   useEffect(() => {
-    if (!persistentStateReady || !settings.autoUpdate || hasAutoCheckedUpdates.current) {
+    if (recoveryMode || !persistentStateReady || !settings.autoUpdate || hasAutoCheckedUpdates.current) {
       return;
     }
 
     hasAutoCheckedUpdates.current = true;
     void handleCheckUpdates(true, settings.autoInstallUpdates);
-  }, [settings.autoUpdate, settings.autoInstallUpdates, settings.releaseChannel, persistentStateReady]);
+  }, [settings.autoUpdate, settings.autoInstallUpdates, settings.releaseChannel, persistentStateReady, recoveryMode]);
 
   function toggleSetting(key: keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode' | 'ipStack' | 'routingExclusions' | 'tunRoutingMode'>) {
     setSettings((current: AppSettings) => {
@@ -2819,9 +2837,11 @@ export default function App() {
             onInstallUpdate={updateInfo.available ? () => void handleInstallUpdate() : undefined}
             onRequestHideToTray={() => void requestWindowHide()}
           />
+          <StorageRecoveryNotice language={language} code={storageIssue?.code} busy={storageRecoveryBusy} safeStart={recoveryMode} confirmBackup={Boolean(storageRecoveryToken)} onInspect={() => void handleStorageRecovery()} onConfirm={() => void handleStorageRecovery(true)} onCancel={() => setStorageRecoveryToken(null)} />
           <AuthScreen
             accessKey={accessKey}
             authLoading={authLoading}
+            storageBlocked={!persistentStateReady}
             errorText={errorText}
             integrationMeta={integrationMeta}
             language={language}
@@ -2967,6 +2987,7 @@ export default function App() {
         </main>
       </div>
 
+      <StorageRecoveryNotice language={language} code={storageIssue?.code} busy={storageRecoveryBusy} safeStart={recoveryMode} confirmBackup={Boolean(storageRecoveryToken)} onInspect={() => void handleStorageRecovery()} onConfirm={() => void handleStorageRecovery(true)} onCancel={() => setStorageRecoveryToken(null)} />
       <AppInfoModal
         open={isAppInfoOpen}
         language={language}

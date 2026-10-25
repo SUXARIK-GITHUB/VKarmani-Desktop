@@ -41,6 +41,7 @@ import {
 import { parseXrayJsonSubscriptionToServers } from './remnawave/subscriptionParser';
 import { assertNativeRuntimeServerMatches, nativeConnectFailurePreservesRuntime } from './connectionGuards';
 import { buildServerRuntimeFingerprint } from '../utils/serverIdentity';
+import { flushPersistentWrites } from './storage';
 
 const delay = (value: number) => new Promise<void>((resolve) => window.setTimeout(resolve, value));
 const previewDelay = (value: number) => isTauriRuntime ? Promise.resolve() : delay(value);
@@ -1214,6 +1215,10 @@ export class RemnawaveClient {
     if (!exists) {
       throw new Error('Сервер не найден в активном профиле. Сначала обновите профиль или выберите другой узел.');
     }
+
+    // Saving is an admission gate. A failed/pending write must not replace a
+    // working native connection or enter partial-start rollback.
+    if (isTauriRuntime) await flushPersistentWrites();
 
     this.cachedServers = this.cachedServers.some(item => item.id === exists.id)
       ? this.cachedServers.map(item => item.id === exists.id ? exists : item)
