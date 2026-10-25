@@ -42,6 +42,7 @@ import { parseXrayJsonSubscriptionToServers } from './remnawave/subscriptionPars
 import { assertNativeRuntimeServerMatches, nativeConnectFailurePreservesRuntime } from './connectionGuards';
 import { buildServerRuntimeFingerprint } from '../utils/serverIdentity';
 import { flushPersistentWrites } from './storage';
+import { isTunProcessRoutingBlocked } from '../utils/appPolicies';
 
 const delay = (value: number) => new Promise<void>((resolve) => window.setTimeout(resolve, value));
 const previewDelay = (value: number) => isTauriRuntime ? Promise.resolve() : delay(value);
@@ -1218,7 +1219,12 @@ export class RemnawaveClient {
 
     // Saving is an admission gate. A failed/pending write must not replace a
     // working native connection or enter partial-start rollback.
-    if (isTauriRuntime) await flushPersistentWrites();
+    if (isTauriRuntime) {
+      if (options.tunnelMode === 'tun' && isTunProcessRoutingBlocked(options.splitTunnelEntries ?? [], options.tunRoutingMode ?? 'selected')) {
+        throw new Error('TUN_PROCESS_ENFORCEMENT_UNAVAILABLE: выберите «Все приложения» без активных правил «Напрямую» или Proxy. Маршрутизация отдельных приложений и служб временно заблокирована; правила сохранены. / Choose All applications without active Direct rules, or Proxy. App and service routing is temporarily blocked; saved rules are preserved.');
+      }
+      await flushPersistentWrites();
+    }
 
     this.cachedServers = this.cachedServers.some(item => item.id === exists.id)
       ? this.cachedServers.map(item => item.id === exists.id ? exists : item)

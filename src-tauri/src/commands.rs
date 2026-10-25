@@ -754,6 +754,12 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         app,
         requested_generation,
     } = request;
+    ensure_tun_process_enforcement(
+        network_mode.as_deref(),
+        tun_routing_mode.as_deref(),
+        split_tunnel_entries.as_deref().unwrap_or_default(),
+    )
+    .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
     let state = app.state::<AppState>();
     if state
         .stop_requested

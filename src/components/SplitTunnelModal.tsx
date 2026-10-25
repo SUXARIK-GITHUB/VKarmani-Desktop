@@ -135,12 +135,10 @@ export function SplitTunnelModal({
 
         <div className="vk-modal-scroll">
           <p className="split-tunnel-help">
-            {tunRoutingMode === 'selected'
-              ? tr(language, 'Через VPN идут выбранные приложения и службы. Остальные подключаются напрямую.', 'Selected applications and services use the VPN. Others connect directly.')
-              : tr(language, 'Приложения используют VPN, кроме правил «Напрямую». Сохранённые правила «Через VPN» используются только в режиме выбранных приложений.', 'Applications use the VPN except Direct rules. Saved Through VPN rules apply only in selected-app mode.')} {' '}
+            {tr(language, 'Маршрутизация отдельных приложений и служб в TUN временно заблокирована. Для подключения выберите «Все приложения» без активных правил «Напрямую». Правила сохранены.', 'App and service routing in TUN is temporarily blocked. Choose All applications without active Direct rules to connect. Saved rules are preserved.')} {' '}
             {tr(language, 'Полный путь выбирает один файл, а имя .exe — все приложения с таким именем.', 'A full path targets one file; an .exe name targets all applications with that name.')}
           </p>
-          {tunnelMode === 'proxy' && <p className="split-tunnel-help policy-warning">{tr(language, 'Эти правила работают в режиме TUN. В режиме Proxy приложение с собственными настройками прокси может подключаться через него.', 'These rules apply in TUN mode. In Proxy mode, an application with its own proxy settings may still use that proxy.')}</p>}
+          {tunnelMode === 'proxy' && <p className="split-tunnel-help policy-warning">{tr(language, 'Правила приложений не управляют режимом Proxy. Приложение с собственными настройками прокси может подключаться через него.', 'App rules do not control Proxy mode. An application with its own proxy settings may still use that proxy.')}</p>}
           <div className="policy-toolbar">
             <label className="split-field"><span>{tr(language, 'Поиск правил, программ и служб', 'Search rules, applications and services')}</span><input value={appSearch} onChange={event => setAppSearch(event.target.value)} placeholder={tr(language, 'Имя или путь…', 'Name or path…')} /></label>
             <div className="split-field"><span>{tr(language, 'Новое правило', 'New rule')}</span><PolicyChoice label={tr(language, 'Новое правило', 'New rule')} value={policy} onChange={setPolicy} options={policyOptions} /></div>

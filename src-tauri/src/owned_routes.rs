@@ -59,6 +59,29 @@ fn valid_owned_route(route: &OwnedRoute) -> bool {
             .is_ok_and(|ip| route.next_hop == if ip.is_ipv4() { "0.0.0.0" } else { "::" })
 }
 
+fn same_owned_route(expected: &OwnedRoute, current: &OwnedRoute) -> bool {
+    // Windows ifIndex can change. LUID and every route ownership field must
+    // still match; an index alone never grants permission to delete a route.
+    current.interface_index > 0
+        && expected.interface_luid == current.interface_luid
+        && expected.destination == current.destination
+        && expected.prefix == current.prefix
+        && expected.next_hop == current.next_hop
+        && expected.metric == current.metric
+        && expected.protocol == current.protocol
+}
+
+fn validate_owned_interface(
+    expected_luid: u64,
+    actual_luid: u64,
+    alias: &str,
+) -> Result<(), String> {
+    if expected_luid == 0 || expected_luid != actual_luid || alias != TUN_INTERFACE_NAME {
+        return Err("ROUTE_INTERFACE_CHANGED: cleanup отказался от другого адаптера.".into());
+    }
+    Ok(())
+}
+
 fn cleanup_routes(
     backend: &mut impl RouteBackend,
     journal: &mut RouteJournal,
@@ -67,7 +90,7 @@ fn cleanup_routes(
         let entry = &journal.entries[index];
         match backend.read(&entry.route)? {
             None => {},
-            Some(current) if current == entry.route && entry.applied => {
+            Some(current) if same_owned_route(&entry.route, &current) && entry.applied => {
                 backend.delete(&entry.route)?;
                 if backend.read(&entry.route)?.is_some() {
                     return Err("ROUTE_CLEANUP_UNCONFIRMED: маршрут остался после удаления.".into());
@@ -106,13 +129,27 @@ fn install_routes(
             backend.save(journal)?;
             return Err(error);
         }
-        if backend.read(route)?.as_ref() != Some(route) {
+        // Create succeeded in this live process. Keep that proof for rollback
+        // even if the following read fails; the durable intent stays unowned
+        // until readback and save both succeed.
+        journal.entries.last_mut().expect("route intent").applied = true;
+        if !backend
+            .read(route)?
+            .as_ref()
+            .is_some_and(|current| same_owned_route(route, current))
+        {
             return Err("ROUTE_CREATE_UNCONFIRMED: запись не совпала с запросом.".into());
         }
-        journal.entries.last_mut().expect("route intent").applied = true;
         if let Err(error) = backend.save(journal) {
             // This process knows Create succeeded; after a crash an intent alone is not proof.
-            if backend.read(route)?.as_ref() == Some(route) && backend.delete(route).is_ok() {
+            if backend
+                .read(route)?
+                .as_ref()
+                .is_some_and(|current| same_owned_route(route, current))
+                && backend.delete(route).is_ok()
+                && matches!(backend.read(route), Ok(None))
+            {
+                // An acknowledged delete alone is not proof of absence.
                 journal.entries.pop();
                 let _ = backend.save(journal);
             }
@@ -126,7 +163,7 @@ fn install_routes(
 mod windows {
     use super::*;
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, ERROR_NOT_FOUND},
+        Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND},
         NetworkManagement::{IpHelper::*, Ndis::NET_LUID_LH},
         Networking::WinSock::*,
         System::Threading::{
@@ -151,6 +188,29 @@ mod windows {
             unsafe { row.InterfaceLuid.Value },
             String::from_utf16_lossy(&row.Alias[..end]),
         ))
+    }
+    fn verify_owned_interface(luid: u64) -> Result<(), String> {
+        let mut row: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };
+        row.InterfaceLuid = NET_LUID_LH { Value: luid };
+        let status = unsafe { GetIfEntry2(&mut row) };
+        if status == ERROR_FILE_NOT_FOUND {
+            // Absence does not authorize deletion by a recycled old ifIndex.
+            // The route reader must independently confirm absence by LUID.
+            return Ok(());
+        }
+        if status != 0 {
+            return Err(format!("ROUTE_INTERFACE_UNAVAILABLE: Win32 {status}."));
+        }
+        let end = row
+            .Alias
+            .iter()
+            .position(|c| *c == 0)
+            .unwrap_or(row.Alias.len());
+        validate_owned_interface(
+            luid,
+            unsafe { row.InterfaceLuid.Value },
+            &String::from_utf16_lossy(&row.Alias[..end]),
+        )
     }
     pub(super) fn find_index(alias: &str) -> Result<u32, String> {
         let wide: Vec<u16> = alias.encode_utf16().chain(Some(0)).collect();
@@ -198,7 +258,8 @@ mod windows {
         value.InterfaceLuid = NET_LUID_LH {
             Value: route.interface_luid,
         };
-        value.InterfaceIndex = route.interface_index;
+        // LUID is authoritative. Never fall back to a possibly recycled index.
+        value.InterfaceIndex = 0;
         value.DestinationPrefix.Prefix = address(&route.destination)?;
         value.DestinationPrefix.PrefixLength = route.prefix;
         value.NextHop = address(&route.next_hop)?;
@@ -261,19 +322,12 @@ mod windows {
         })
     }
     pub(super) fn load(backend: &WindowsRoutes) -> Result<Option<RouteJournal>, String> {
-        if !backend.path.exists() {
+        let Some(encrypted) = crate::compat_storage::read_state_file(&backend.path, 32768)
+            .map_err(|error| format!("ROUTE_JOURNAL_READ_FAILED: original preserved: {error}"))?
+        else {
             return Ok(None);
-        }
-        if fs::metadata(&backend.path)
-            .map_err(|_| "Route journal metadata".to_string())?
-            .len()
-            > 32768
-        {
-            return Err("Route journal too large".into());
-        }
-        let text = decrypt_access_key(
-            &fs::read_to_string(&backend.path).map_err(|_| "Route journal read".to_string())?,
-        )?;
+        };
+        let text = decrypt_access_key(&encrypted)?;
         let journal: RouteJournal =
             serde_json::from_str(&text).map_err(|_| "Route journal corrupt".to_string())?;
         if journal.version != 1
@@ -303,15 +357,9 @@ mod windows {
                 return Err("ROUTE_OWNER_UNKNOWN: невозможно проверить предыдущий process.".into());
             }
         }
-        // An absent adapter implies absent active routes. A different LUID/alias is never authority.
+        // Lookup by the stored LUID, never by a stale/recycled index.
         for entry in &journal.entries {
-            if let Ok((luid, alias)) = interface_identity(entry.route.interface_index) {
-                if luid != entry.route.interface_luid || alias != TUN_INTERFACE_NAME {
-                    return Err(
-                        "ROUTE_INTERFACE_CHANGED: cleanup отказался от другого адаптера.".into(),
-                    );
-                }
-            }
+            verify_owned_interface(entry.route.interface_luid)?;
         }
         Ok(Some(journal))
     }
@@ -364,6 +412,73 @@ mod windows {
             FreeMibTable(table.cast());
         }
     }
+    #[test]
+    fn route_journal_reader_refuses_linked_journal_without_trusting_it() {
+        let root = std::env::temp_dir().join(format!(
+            "vkarmani-route-reader-{}",
+            crate::compat_storage::durable::random_state_id().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let original = root.join("original.dpapi");
+        let linked = root.join("owned-tun-routes-v1.dpapi");
+        let journal = RouteJournal {
+            version: 1,
+            owner_pid: std::process::id(),
+            entries: vec![],
+        };
+        let encrypted = encrypt_access_key(&serde_json::to_string(&journal).unwrap()).unwrap();
+        fs::write(&original, &encrypted).unwrap();
+        fs::hard_link(&original, &linked).unwrap();
+        let result = load(&WindowsRoutes {
+            path: linked.clone(),
+        });
+        let preserved = fs::read_to_string(&original).unwrap();
+        fs::remove_file(linked).unwrap();
+        fs::remove_file(original).unwrap();
+        fs::remove_dir(root).unwrap();
+        assert!(
+            result.is_err(),
+            "linked recovery journal must be refused, not trusted or absent"
+        );
+        assert_eq!(preserved, encrypted);
+    }
+    #[test]
+    fn route_journal_missing_locked_corrupt_and_oversize_remain_distinct() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "vkarmani-route-errors-{}",
+            crate::compat_storage::durable::random_state_id().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let backend = WindowsRoutes {
+            path: root.join("owned-tun-routes-v1.dpapi"),
+        };
+        assert!(load(&backend).unwrap().is_none());
+        let journal = RouteJournal {
+            version: 1,
+            owner_pid: std::process::id(),
+            entries: vec![],
+        };
+        let encrypted = encrypt_access_key(&serde_json::to_string(&journal).unwrap()).unwrap();
+        fs::write(&backend.path, &encrypted).unwrap();
+        assert_eq!(load(&backend).unwrap().unwrap().version, 1);
+        let locked = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&backend.path)
+            .unwrap();
+        let error = load(&backend).unwrap_err();
+        drop(locked);
+        assert!(error.starts_with("ROUTE_JOURNAL_READ_FAILED"));
+        assert_eq!(fs::read_to_string(&backend.path).unwrap(), encrypted);
+        for invalid in [String::new(), "not-dpapi".into(), "x".repeat(32769)] {
+            fs::write(&backend.path, &invalid).unwrap();
+            assert!(load(&backend).is_err());
+            assert_eq!(fs::read_to_string(&backend.path).unwrap(), invalid);
+        }
+        fs::remove_file(backend.path).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 }
 
 pub(crate) fn cleanup_tun_routes_for_app(
@@ -406,7 +521,7 @@ fn route_journal_status(backend: &mut impl RouteBackend, journal: &RouteJournal)
     }
     for entry in &journal.entries {
         match backend.read(&entry.route) {
-            Ok(Some(route)) if route == entry.route => {}
+            Ok(Some(route)) if same_owned_route(&entry.route, &route) => {}
             Ok(None) => return "missing",
             Ok(Some(_)) => return "changed",
             Err(_) => return "unavailable",
@@ -452,9 +567,18 @@ mod tests {
         fail_create: Option<usize>,
         fail_save: bool,
         fail_delete: bool,
+        reads: usize,
+        fail_read_on: Option<usize>,
+        saves: usize,
+        fail_save_on: Option<usize>,
+        delete_ack_without_removal: bool,
     }
     impl RouteBackend for Fake {
         fn read(&mut self, route: &OwnedRoute) -> Result<Option<OwnedRoute>, String> {
+            self.reads += 1;
+            if self.fail_read_on == Some(self.reads) {
+                return Err("injected read".into());
+            }
             Ok(self
                 .routes
                 .iter()
@@ -476,11 +600,21 @@ mod tests {
                 return Err("injected delete".into());
             }
             self.deletes += 1;
-            self.routes.retain(|x| x != r);
+            if !self.delete_ack_without_removal {
+                // IP Helper selects a route by LUID/prefix/next hop, not by
+                // the transient interface index, metric or protocol.
+                self.routes.retain(|x| {
+                    x.destination != r.destination
+                        || x.prefix != r.prefix
+                        || x.next_hop != r.next_hop
+                        || x.interface_luid != r.interface_luid
+                });
+            }
             Ok(())
         }
         fn save(&mut self, j: &RouteJournal) -> Result<(), String> {
-            if self.fail_save {
+            self.saves += 1;
+            if self.fail_save || self.fail_save_on == Some(self.saves) {
                 return Err("injected disk".into());
             }
             self.journal = Some(j.clone());
@@ -535,6 +669,120 @@ mod tests {
         let text = serde_json::to_string(&r).unwrap();
         assert!(text.contains("\"18446744073709551615\""));
         assert_eq!(serde_json::from_str::<OwnedRoute>(&text).unwrap(), r);
+    }
+    #[test]
+    fn successful_create_remains_owned_when_first_readback_fails() {
+        let mut f = Fake {
+            fail_read_on: Some(2),
+            ..Fake::default()
+        };
+        let mut j = journal();
+        assert_eq!(
+            install_routes(&mut f, &mut j, &[route("0.0.0.0")]).unwrap_err(),
+            "injected read"
+        );
+        assert_eq!(f.routes.len(), 1);
+        // The durable intent alone is still insufficient after a crash. The
+        // live process, however, observed Create succeed and can roll it back.
+        assert!(!f.journal.as_ref().unwrap().entries[0].applied);
+        f.routes[0].metric = 99;
+        assert!(cleanup_routes(&mut f, &mut j)
+            .unwrap_err()
+            .starts_with("ROUTE_OWNER_CHANGED"));
+        assert_eq!(f.deletes, 0);
+        f.routes[0].metric = 6;
+        cleanup_routes(&mut f, &mut j).unwrap();
+        assert!(f.routes.is_empty());
+        assert!(f.journal.is_none());
+    }
+    #[test]
+    fn rollback_delete_ack_requires_absence_before_discarding_ownership() {
+        let mut f = Fake {
+            fail_save_on: Some(2),
+            delete_ack_without_removal: true,
+            ..Fake::default()
+        };
+        let mut j = journal();
+        assert!(install_routes(&mut f, &mut j, &[route("0.0.0.0")]).is_err());
+        assert_eq!(f.routes.len(), 1);
+        assert_eq!(j.entries.len(), 1);
+        assert!(j.entries[0].applied);
+        assert!(cleanup_routes(&mut f, &mut j)
+            .unwrap_err()
+            .starts_with("ROUTE_CLEANUP_UNCONFIRMED"));
+        assert_eq!(j.entries.len(), 1);
+        f.delete_ack_without_removal = false;
+        cleanup_routes(&mut f, &mut j).unwrap();
+        assert!(f.routes.is_empty());
+        assert!(f.journal.is_none());
+    }
+    #[test]
+    fn failed_persistence_with_confirmed_delete_can_discard_live_ownership() {
+        let mut f = Fake {
+            fail_save_on: Some(2),
+            ..Fake::default()
+        };
+        let mut j = journal();
+        assert_eq!(
+            install_routes(&mut f, &mut j, &[route("0.0.0.0")]).unwrap_err(),
+            "injected disk"
+        );
+        assert!(f.routes.is_empty());
+        assert!(j.entries.is_empty());
+        cleanup_routes(&mut f, &mut j).unwrap();
+        assert!(f.journal.is_none());
+    }
+    #[test]
+    fn same_luid_route_survives_index_change_but_not_changed_owner_fields() {
+        let mut f = Fake::default();
+        let mut j = journal();
+        install_routes(&mut f, &mut j, &[route("0.0.0.0")]).unwrap();
+        f.routes[0].interface_index = 99;
+        assert_eq!(route_journal_status(&mut f, &j), "confirmed");
+        f.routes[0].protocol = 99;
+        assert!(cleanup_routes(&mut f, &mut j)
+            .unwrap_err()
+            .starts_with("ROUTE_OWNER_CHANGED"));
+        assert_eq!(f.deletes, 0);
+        f.routes[0].protocol = 3;
+        cleanup_routes(&mut f, &mut j).unwrap();
+        assert!(f.routes.is_empty());
+        assert!(f.journal.is_none());
+    }
+    #[test]
+    fn route_owner_requires_every_tuple_field_and_exact_interface_alias() {
+        let expected = route("0.0.0.0");
+        assert!(validate_owned_interface(
+            expected.interface_luid,
+            expected.interface_luid,
+            TUN_INTERFACE_NAME
+        )
+        .is_ok());
+        assert!(validate_owned_interface(
+            expected.interface_luid,
+            expected.interface_luid + 1,
+            TUN_INTERFACE_NAME
+        )
+        .is_err());
+        assert!(validate_owned_interface(
+            expected.interface_luid,
+            expected.interface_luid,
+            "foreign-tun"
+        )
+        .is_err());
+        for mutate in [
+            |r: &mut OwnedRoute| r.interface_luid += 1,
+            |r: &mut OwnedRoute| r.metric += 1,
+            |r: &mut OwnedRoute| r.protocol += 1,
+            |r: &mut OwnedRoute| r.prefix += 1,
+            |r: &mut OwnedRoute| r.destination = "128.0.0.0".into(),
+            |r: &mut OwnedRoute| r.next_hop = "192.0.2.1".into(),
+            |r: &mut OwnedRoute| r.interface_index = 0,
+        ] {
+            let mut changed = expected.clone();
+            mutate(&mut changed);
+            assert!(!same_owned_route(&expected, &changed));
+        }
     }
     #[test]
     fn successful_exact_restore_100_cycles_no_foreign_routes_deleted() {

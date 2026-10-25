@@ -11,8 +11,25 @@ import { remnawaveClient } from '../src/services/remnawave';
 import { buildServerRuntimeFingerprint } from '../src/utils/serverIdentity';
 const [server] = parse(JSON.stringify(auto));
 const status = () => ({ lastPreparedServerId: server.id, lastPreparedServerFingerprint: buildServerRuntimeFingerprint(server), configPath: 'owned-B.json' });
-beforeEach(() => { vi.clearAllMocks(); native.flush.mockResolvedValue(undefined); native.proxy.mockResolvedValue({ enabled: true }); native.rollback.mockResolvedValue({ tunnelActive: false }); });
+beforeEach(() => { vi.resetAllMocks(); native.flush.mockResolvedValue(undefined); native.proxy.mockResolvedValue({ enabled: true }); native.rollback.mockResolvedValue({ tunnelActive: false }); });
 describe('native connect cleanup is scoped to the exact returned runtime', () => {
+  it.each(['selected', 'all', 'exclude'] as const)('refuses unenforced application routing in %s before native work', async tunRoutingMode => {
+    native.connect.mockResolvedValueOnce(status());
+    await expect(remnawaveClient.connect(server, { tunnelMode: 'tun', tunRoutingMode,
+      splitTunnelEntries: [{ id: 'private-rule', kind: 'app', value: 'C:/Private/app.exe', enabled: true, policy: tunRoutingMode === 'selected' ? 'VPN' : 'DIRECT' }] }))
+      .rejects.toThrow('TUN_PROCESS_ENFORCEMENT_UNAVAILABLE');
+    expect(native.connect).not.toHaveBeenCalled(); expect(native.proxy).not.toHaveBeenCalled();
+    expect(native.rollback).not.toHaveBeenCalled(); expect(native.disconnect).not.toHaveBeenCalled();
+  });
+  it.each(['all', 'exclude'] as const)('keeps ordinary %s TUN available with inactive VPN rules and disabled DIRECT intent', async tunRoutingMode => {
+    native.connect.mockResolvedValueOnce(status());
+    const entries = [{ id: 'vpn', kind: 'app' as const, value: 'app.exe', enabled: true, policy: 'VPN' as const },
+      { id: 'direct', kind: 'service' as const, value: 'PrivateService', enabled: false, policy: 'DIRECT' as const }];
+    await remnawaveClient.connect(server, { tunnelMode: 'tun', tunRoutingMode, splitTunnelEntries: entries });
+    expect(native.connect).toHaveBeenCalledWith(server, 'tun', [entries[0]], 'ipv4', false, undefined, tunRoutingMode);
+    expect(entries[1]).toMatchObject({ enabled: false, policy: 'DIRECT', value: 'PrivateService' });
+    expect(native.disconnect).not.toHaveBeenCalled(); expect(native.rollback).not.toHaveBeenCalled();
+  });
   it.each(['STATE_WRITE_PENDING', 'STATE_CONFLICT', 'STATE_RESTORE_BLOCKED'])('preserves the existing connection when saving is unconfirmed: %s', async code => {
     native.flush.mockRejectedValueOnce(new Error(code));
     await expect(remnawaveClient.connect(server, { reconnect: true, useSystemProxy: true })).rejects.toThrow(code);

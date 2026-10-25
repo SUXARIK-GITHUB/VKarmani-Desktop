@@ -21,7 +21,7 @@ import { useToastManager } from './hooks/useToastManager';
 import { useSyncedRef } from './hooks/useSyncedRef';
 import { buildDiagnosticsFilename, createSafeDiagnosticsPayload, downloadTextFile } from './utils/diagnosticsExport';
 import { sleep } from './utils/async';
-import { activePolicyEntries, isSelectedTunPolicyEmpty, insertRule, rulesOverlap } from './utils/appPolicies';
+import { activePolicyEntries, isSelectedTunPolicyEmpty, isTunProcessRoutingBlocked, insertRule, rulesOverlap } from './utils/appPolicies';
 import { appendTrafficSample, buildTrafficBars, formatTrafficBytes, validTrafficSnapshot, type TrafficSample } from './utils/traffic';
 import { assertNativeRuntimeServerMatches, runtimeConfirmsTargetServer } from './services/connectionGuards';
 import { pickPreferredServer, rankServersForDisplay } from './utils/serverSorting';
@@ -976,8 +976,8 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       ? tr(language, 'Сначала синхронизируйте профиль и выберите сервер.', 'Sync the profile and choose a server first.')
       : !selectedServer.runtimeTemplate
         ? tr(language, 'У выбранного сервера ещё нет runtime-конфига.', 'The selected server has no runtime config yet.')
-        : settings.tunnelMode === 'tun' && isSelectedTunPolicyEmpty(splitTunnelEntries, settings.tunRoutingMode)
-          ? tr(language, 'Для TUN добавьте хотя бы одну программу или службу.', 'Add at least one app or service for TUN.')
+        : settings.tunnelMode === 'tun' && isTunProcessRoutingBlocked(splitTunnelEntries, settings.tunRoutingMode)
+          ? tr(language, 'Маршрутизация программ временно заблокирована. Выберите «Все приложения» без активных правил «Напрямую» или Proxy.', 'App routing is temporarily blocked. Choose All applications without active Direct rules, or Proxy.')
           : ''
     : '';
   const canConnectSelectedServer = connectionState !== 'idle' || !connectionDisabledReason;
