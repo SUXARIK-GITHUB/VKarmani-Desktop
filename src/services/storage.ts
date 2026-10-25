@@ -376,7 +376,7 @@ export async function loadPersistentSnapshot() {
   await initializeNativeState();
   const native = await readNativeState();
   const values = native.payload.public;
-  const entries = normalizeStoredRules(values[NATIVE_SPLIT_TUNNEL_KEY]);
+  const entries = normalizeCompatibleRules(values[NATIVE_SPLIT_TUNNEL_KEY]);
   const favorites = values[NATIVE_FAVORITES_KEY];
   return {
     settings: normalizeStoredSettings(
@@ -714,9 +714,21 @@ export function saveSplitTunnelEntries(value: SplitTunnelEntry[]) {
   void saveNativeClientStateValue(NATIVE_SPLIT_TUNNEL_KEY, value);
 }
 
+function normalizeCompatibleRules(value: unknown): SplitTunnelEntry[] {
+  const entries = normalizeStoredRules(value);
+  if (!Array.isArray(value)) return entries;
+  // The076 editor knows only its own rule fields. Retain newer metadata on the
+  // same rule so hydration/autosave cannot silently strip it from v2.
+  return entries.map((entry, index) => {
+    const original: unknown = value[index];
+    return original && typeof original === 'object' && !Array.isArray(original)
+      ? { ...original, ...entry } : entry;
+  });
+}
+
 export async function loadSplitTunnelEntriesBackup() {
   const value = await loadNativeClientStateValue<unknown>(NATIVE_SPLIT_TUNNEL_KEY);
-  return value === null || value === undefined ? null : normalizeStoredRules(value);
+  return value === null || value === undefined ? null : normalizeCompatibleRules(value);
 }
 
 

@@ -15,6 +15,15 @@ beforeEach(() => {
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 describe('076 UI with authoritative encrypted v2 storage', () => {
+  it('keeps newer per-rule metadata when the076 editor hydrates and saves supported fields', async () => {
+    backend.snapshot.payload.public.splitTunnelEntries = [{id:'rule-a',kind:'app',value:'app.exe',enabled:true,policy:'VPN',schemaVersion:2,futureMetadata:{keep:true}}];
+    const storage = await import('../src/services/storage');
+    const entries = await storage.loadSplitTunnelEntriesBackup();
+    expect(entries).toHaveLength(1);
+    storage.saveSplitTunnelEntries(entries!.map(entry=>({...entry,enabled:false})));
+    await storage.flushPersistentWrites();
+    expect(backend.snapshot.payload.public.splitTunnelEntries).toMatchObject([{id:'rule-a',enabled:false,futureMetadata:{keep:true}}]);
+  });
   it('rejects caller timeout and keeps autosave blocked after the underlying read succeeds late', async () => {
     vi.useFakeTimers();
     Object.assign(window, { setTimeout, clearTimeout });
