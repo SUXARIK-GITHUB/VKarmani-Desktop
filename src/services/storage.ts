@@ -2,20 +2,6 @@ import { normalizeStoredRules } from '../utils/appPolicies';
 import type { AppSettings, SplitTunnelEntry, VpnServer } from '../types/vpn';
 import { defaultRoutingExclusions, sanitizeRoutingExclusions } from '../utils/routingExclusions';
 import { encodeProfileCache, decodeProfileCache } from './profileCache';
-import { validateSessionHistory, type SessionHistoryEntry } from '../utils/sessionHistory';
-import { commitNativeChange, exportNativeStateLegacy, inspectNativeState, invokeStateProtocol, NativeStorageError, peekNativeState, readNativeState, recoverNativeState, storageFailure } from './nativeState';
-export { NativeStorageError } from './nativeState';
-
-let previewHistory: SessionHistoryEntry[] = [];
-export async function loadSessionHistory(): Promise<SessionHistoryEntry[]> {
-  return validateSessionHistory(canUseTauriSecureStorage
-    ? await loadNativeClientStateValue<unknown>('sessionHistory') : previewHistory);
-}
-export async function saveSessionHistory(entries: SessionHistoryEntry[]): Promise<void> {
-  const validated=validateSessionHistory(entries);
-  if (!canUseTauriSecureStorage) { previewHistory=validated; return; }
-  if (!await saveNativeClientStateValue('sessionHistory',validated)) throw new NativeStorageError('STATE_WRITE_PENDING','Сохранение истории подключений не подтверждено.');
-}
 
 const ACCESS_KEY_STORAGE = 'vkarmani.access-key';
 const ACCESS_KEY_FORM_STORAGE = 'vkarmani.form.access-key';
@@ -57,11 +43,8 @@ export const defaultSettings: AppSettings = {
 };
 
 export function normalizeStoredSettings(value: unknown, hasLegacyRules = false): AppSettings {
-  if (value === null || value === undefined) {
+  if (!value || typeof value !== 'object') {
     return { ...defaultSettings, tunRoutingMode: hasLegacyRules ? 'selected' : 'all' };
-  }
-  if (typeof value !== 'object' || Array.isArray(value)) {
-    return { ...defaultSettings, tunRoutingMode: 'selected', tunRoutingModeInvalid: true };
   }
 
   const candidate = value as Partial<AppSettings>;
@@ -84,14 +67,7 @@ export function normalizeStoredSettings(value: unknown, hasLegacyRules = false):
   ];
 
   const next: AppSettings = { ...defaultSettings, tunRoutingMode: hasLegacyRules ? 'selected' : 'all' };
-  const validPolicy = candidate.tunRoutingMode === 'all' || candidate.tunRoutingMode === 'selected' || candidate.tunRoutingMode === 'exclude';
-  if (validPolicy) next.tunRoutingMode = candidate.tunRoutingMode!;
-  if (candidate.tunRoutingModeInvalid === true || (Object.prototype.hasOwnProperty.call(candidate, 'tunRoutingMode') && !validPolicy)) {
-    // Do not broaden corrupt settings to all, or lose quarantine on save/reload.
-    // Proxy stays usable; TUN requires an explicit policy selection in Settings.
-    next.tunRoutingMode = 'selected';
-    next.tunRoutingModeInvalid = true;
-  }
+  if (candidate.tunRoutingMode === 'all' || candidate.tunRoutingMode === 'selected' || candidate.tunRoutingMode === 'exclude') next.tunRoutingMode = candidate.tunRoutingMode;
 
   for (const key of booleanKeys) {
     if (typeof candidate[key] === 'boolean') {
@@ -207,32 +183,6 @@ const canUseTauriSecureStorage = Boolean(
   tauriWindow && (tauriWindow.__TAURI_INTERNALS__ || tauriWindow.__TAURI__)
 );
 
-let legacyMirrorAtBoot: Record<string, string> | null = null;
-if (canUseTauriSecureStorage && typeof window !== 'undefined') {
-  legacyMirrorAtBoot = {};
-  try {
-    for (const key of [SETTINGS_STORAGE, SPLIT_TUNNEL_STORAGE, FAVORITE_SERVERS_STORAGE, SELECTED_SERVER_STORAGE, LAST_KNOWN_SERVERS_STORAGE, ACCESS_KEY_STORAGE, ACCESS_KEY_FORM_STORAGE, ACCESS_KEY_FALLBACK_STORAGE]) {
-      const value = window.localStorage.getItem(key);
-      if (value !== null) legacyMirrorAtBoot[key] = value;
-    }
-  } catch { /* Native state remains available when a mirror is inaccessible. */ }
-}
-let bootstrapState: Promise<void> | null = null;
-function initializeNativeState(): Promise<void> {
-  if (!bootstrapState) {
-    bootstrapState = (async () => {
-      const current = await readNativeState();
-      if (legacyMirrorAtBoot && Object.keys(legacyMirrorAtBoot).length && current.payload.legacyWebView === null) {
-        // Retain the original mirror encrypted before any hydration/autosave
-        // can replace it. It is evidence, never an automatic native override.
-        await commitNativeChange('legacy', 'webView', legacyMirrorAtBoot);
-      }
-      legacyMirrorAtBoot = null;
-    })().catch(error => { bootstrapState = null; throw error; });
-  }
-  return bootstrapState;
-}
-
 
 function safeLocalStorageSet(key: string, value: string) {
   if (typeof window === 'undefined') {
@@ -292,131 +242,10 @@ function withStorageTimeout<T>(operation: Promise<T>, timeoutMs: number, command
   }) as Promise<T>;
 }
 
-async function invokeStorageRaw<T>(command: string, args: Record<string, unknown> = {}, expectedSession?: string): Promise<T> {
-  await initializeNativeState();
-  return invokeStateProtocol<T>(command, args, expectedSession);
-}
-
 async function invokeTauri<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
+  const { invoke } = await import('@tauri-apps/api/core');
   const timeoutMs = STORAGE_COMMAND_TIMEOUTS_MS[command] ?? 8000;
-  return withStorageTimeout(invokeStorageRaw<T>(command, args), timeoutMs, command);
-}
-
-type PendingWrite = { command: string; args: Record<string, unknown>; session?: string };
-// One active native IPC write and one latest pending value per known state key.
-// A frontend timeout must never release the uncancellable native write lease.
-const pendingWrites = new Map<string, PendingWrite>();
-const writeFailures = new Map<string, NativeStorageError>();
-const writeObservers = new Map<string, Promise<boolean>>();
-let writeDrain: Promise<void> | null = null;
-let writesQuiesced = false;
-
-function reportStorageFailure(key: string, failure: NativeStorageError) {
-  writeFailures.set(key, failure);
-  if (typeof CustomEvent !== 'undefined' && typeof window.dispatchEvent === 'function') {
-    window.dispatchEvent(new CustomEvent('vkarmani:storage-error', { detail: failure }));
-  }
-}
-
-function queueStateWrite(key: string, command: string, args: Record<string, unknown>): Promise<boolean> {
-  if (writesQuiesced) return Promise.resolve(false);
-  const profileWrite = key === 'protected/lastKnownServers' || key === 'public/lastKnownServers';
-  pendingWrites.set(key, { command, args, session: profileWrite ? peekNativeState()?.payload.sessionGeneration : undefined });
-  if (!writeDrain) {
-    writeDrain = (async () => {
-      try {
-        while (pendingWrites.size) {
-          const [nextKey, write] = pendingWrites.entries().next().value!;
-          pendingWrites.delete(nextKey);
-          try {
-            await invokeStorageRaw(write.command, write.args, write.session);
-            writeFailures.delete(nextKey);
-          } catch (error) {
-            const failure = storageFailure(error);
-            if (failure.code === 'STATE_SESSION_CHANGED') writeFailures.delete(nextKey);
-            else reportStorageFailure(nextKey, failure);
-          }
-        }
-      } finally {
-        writeDrain = null;
-        writeObservers.clear();
-      }
-    })();
-  }
-  // Reuse one deadline observer per key, including its settled timeout result.
-  // A stalled native IPC must not retain a new uncancellable Promise callback
-  // for every subsequent settings edit.
-  const existing = writeObservers.get(key);
-  if (existing) return existing;
-  const observedDrain = writeDrain;
-  const observer = withStorageTimeout(observedDrain, STORAGE_COMMAND_TIMEOUTS_MS[command] ?? 8000, command)
-    .then(() => !writeFailures.has(key), () => {
-      if (writeDrain === observedDrain) {
-        reportStorageFailure(key, new NativeStorageError('STATE_WRITE_PENDING', 'Сохранение ещё не подтверждено. Дождитесь завершения перед выходом.'));
-      }
-      return false;
-    });
-  writeObservers.set(key, observer);
-  return observer;
-}
-
-export async function flushPersistentWrites(): Promise<void> {
-  const deadline = performance.now() + 12000;
-  while (writeDrain) {
-    const remaining = deadline - performance.now();
-    if (remaining <= 0) throw new NativeStorageError('STATE_WRITE_PENDING', 'Сохранение состояния ещё не завершено.');
-    try {
-      await withStorageTimeout(writeDrain, remaining, 'flush-state');
-    } catch (error) {
-      throw storageFailure(error);
-    }
-  }
-  const failure = writeFailures.values().next().value;
-  if (failure) throw failure;
-}
-
-export async function quiescePersistentWrites() {
-  writesQuiesced = true;
-  await flushPersistentWrites();
-  const current = await readNativeState();
-  return { generation: current.generation, revision: current.revision };
-}
-export function resumePersistentWrites() { writesQuiesced = false; }
-
-export async function loadPersistentSnapshot() {
-  await initializeNativeState();
-  const native = await readNativeState();
-  const values = native.payload.public;
-  const entries = normalizeStoredRules(values[NATIVE_SPLIT_TUNNEL_KEY]);
-  const favorites = values[NATIVE_FAVORITES_KEY];
-  return {
-    settings: normalizeStoredSettings(
-      Object.prototype.hasOwnProperty.call(values, NATIVE_SETTINGS_KEY) && values[NATIVE_SETTINGS_KEY] === null
-        ? { tunRoutingModeInvalid: true } : values[NATIVE_SETTINGS_KEY], entries.length > 0),
-    entries,
-    favorites: Array.isArray(favorites) ? [...new Set(favorites.map(value => String(value ?? '').trim()).filter(Boolean))] : [],
-    selected: typeof values[NATIVE_SELECTED_SERVER_KEY] === 'string' ? String(values[NATIVE_SELECTED_SERVER_KEY]).trim() : ''
-  };
-}
-
-// User-confirmed reload/recovery, never an automatic conflict rebase.
-export async function reloadPersistentSnapshot() {
-  writesQuiesced = true;
-  try {
-    pendingWrites.clear();
-    if (writeDrain) await withStorageTimeout(writeDrain, 12000, 'reload-state');
-    await inspectNativeState(true);
-    await recoverNativeState();
-    bootstrapState = null;
-    await initializeNativeState();
-    const restored = await loadPersistentSnapshot();
-    writeFailures.clear();
-    return restored;
-  } finally { writesQuiesced = false; }
-}
-export async function prepareLegacyRollbackExport() {
-  await flushPersistentWrites();
-  return exportNativeStateLegacy();
+  return withStorageTimeout(invoke<T>(command, args), timeoutMs, command);
 }
 
 async function saveNativeClientStateValue(key: string, value: unknown): Promise<boolean> {
@@ -425,10 +254,11 @@ async function saveNativeClientStateValue(key: string, value: unknown): Promise<
   }
 
   try {
-    return await queueStateWrite('public/' + key, 'save_client_state_value', {
+    await invokeTauri('save_client_state_value', {
       key,
       value: JSON.stringify(value)
     });
+    return true;
   } catch {
     return false;
   }
@@ -446,8 +276,8 @@ async function loadNativeClientStateValue<T>(key: string): Promise<T | null> {
     }
 
     return JSON.parse(rawValue) as T;
-  } catch (error) {
-    throw storageFailure(error);
+  } catch {
+    return null;
   }
 }
 
@@ -457,10 +287,11 @@ async function saveNativeSensitiveClientStateValue(key: string, value: unknown):
   }
 
   try {
-    return await queueStateWrite('protected/' + key, 'save_sensitive_client_state_value', {
+    await invokeTauri('save_sensitive_client_state_value', {
       key,
       value: JSON.stringify(value)
     });
+    return true;
   } catch {
     return false;
   }
@@ -478,8 +309,8 @@ async function loadNativeSensitiveClientStateValue<T>(key: string): Promise<T | 
     }
 
     return JSON.parse(rawValue) as T;
-  } catch (error) {
-    throw storageFailure(error);
+  } catch {
+    return null;
   }
 }
 
@@ -489,7 +320,8 @@ async function clearNativeSensitiveClientStateValue(key: string): Promise<boolea
   }
 
   try {
-    return await queueStateWrite('protected/' + key, 'clear_sensitive_client_state_value', { key });
+    await invokeTauri('clear_sensitive_client_state_value', { key });
+    return true;
   } catch {
     return false;
   }
@@ -610,17 +442,23 @@ export async function loadStoredAccessKeySecure() {
       return stored.trim();
     }
   } catch (error) {
-    // An unreadable authoritative file must not be replaced by a stale WebView
-    // credential or mistaken for an invalid subscription. Keep the legacy
-    // original until an explicit, successful protected migration can occur.
-    throw storageFailure(error);
+    // If an old plaintext value exists, allow this session to recover it once,
+    // but remove it immediately so the native app does not keep secrets in localStorage.
+    if (legacyValue) {
+      clearLegacyAccessKeyFromLocalStorage();
+      return legacyValue;
+    }
+
+    throw error;
   }
 
   if (legacyValue) {
-    if (!await queueStateWrite('access-key', 'save_access_key_secure', { value: legacyValue })) {
-      throw new NativeStorageError('STATE_MIGRATION_FAILED', 'Не удалось завершить перенос ключа в защищённое хранилище.');
+    try {
+      await invokeTauri('save_access_key_secure', { value: legacyValue });
+    } finally {
+      clearLegacyAccessKeyFromLocalStorage();
     }
-    clearLegacyAccessKeyFromLocalStorage();
+
     return legacyValue;
   }
 
@@ -637,13 +475,15 @@ export async function saveStoredAccessKey(value: string): Promise<boolean> {
 
   if (canUseTauriSecureStorage) {
     try {
-      const persisted = await queueStateWrite('access-key', 'save_access_key_secure', { value: normalized });
-      if (persisted) clearLegacyAccessKeyFromLocalStorage();
-      return persisted;
+      await invokeTauri('save_access_key_secure', { value: normalized });
+      return true;
     } catch {
       // Do not block the active login session if DPAPI is temporarily unavailable.
       // The key simply will not be persisted instead of falling back to plaintext storage.
       return false;
+    } finally {
+      // DPAPI is the only persistent storage for secrets in the native app.
+      clearLegacyAccessKeyFromLocalStorage();
     }
   }
 
@@ -657,8 +497,10 @@ export async function saveStoredAccessKey(value: string): Promise<boolean> {
 
 export async function clearStoredAccessKey() {
   if (canUseTauriSecureStorage) {
-    if (!await queueStateWrite('access-key', 'clear_access_key_secure', {})) {
-      throw new NativeStorageError('STATE_CLEAR_FAILED', 'Не удалось удалить сохранённый ключ. Выход не завершён.');
+    try {
+      await invokeTauri('clear_access_key_secure');
+    } catch {
+      // Clear local fallback anyway; secure storage can be repaired on next save.
     }
   }
 
@@ -672,16 +514,13 @@ export function loadSettings() {
 
   try {
     const rawValue = window.localStorage.getItem(SETTINGS_STORAGE);
-    if (rawValue === null) {
+    if (!rawValue) {
       return normalizeStoredSettings(null, loadSplitTunnelEntries().length > 0);
     }
 
-    const parsed: unknown = JSON.parse(rawValue);
-    return normalizeStoredSettings(parsed === null ? { tunRoutingModeInvalid: true } : parsed, loadSplitTunnelEntries().length > 0);
+    return normalizeStoredSettings(JSON.parse(rawValue) as unknown, loadSplitTunnelEntries().length > 0);
   } catch {
-    // Unreadable/present corrupt state is not an empty first-run profile.
-    // Keep the original bytes and require an explicit TUN policy choice.
-    return normalizeStoredSettings({ tunRoutingModeInvalid: true });
+    return normalizeStoredSettings(null, loadSplitTunnelEntries().length > 0);
   }
 }
 
@@ -695,7 +534,7 @@ export async function loadSettingsBackup() {
   const value = await loadNativeClientStateValue<unknown>(NATIVE_SETTINGS_KEY);
   const entries = await loadNativeClientStateValue<unknown>(NATIVE_SPLIT_TUNNEL_KEY);
   const hasLegacyRules = normalizeStoredRules(entries).length > 0;
-  return value !== null && value !== undefined || hasLegacyRules ? normalizeStoredSettings(value, hasLegacyRules) : null;
+  return value || hasLegacyRules ? normalizeStoredSettings(value, hasLegacyRules) : null;
 }
 
 export function loadSplitTunnelEntries() {
@@ -801,13 +640,6 @@ async function saveProtectedProfiles(servers: VpnServer[]) {
   }
 }
 
-let profileCacheEpoch = 0;
-function assertProfileCacheEpoch(epoch: number) {
-  if (epoch !== profileCacheEpoch) {
-    throw new NativeStorageError('STATE_OPERATION_CANCELLED', 'Восстановление кэша отменено после очистки сессии.');
-  }
-}
-
 export function loadLastKnownServers() {
   if (typeof window === 'undefined') {
     return [] as VpnServer[];
@@ -818,8 +650,13 @@ export function loadLastKnownServers() {
     const normalized = rawValue ? normalizeStoredServers(JSON.parse(rawValue) as unknown) : [] as VpnServer[];
     const safeServers = stripSensitiveServerRuntimeList(normalized);
 
-    // Render-time reads do not mutate legacy originals. The async restore
-    // confirms DPAPI persistence before retiring a plaintext migration source.
+    // Миграция старого plaintext-кэша: если в localStorage когда-либо попал
+    // runtimeTemplate/rawUri, сразу перезаписываем этот ключ безопасной версией.
+    if (normalized.some((server) => server.runtimeTemplate || server.rawUri)) {
+      void saveProtectedProfiles(normalized);
+      safeLocalStorageSet(LAST_KNOWN_SERVERS_STORAGE, JSON.stringify(safeServers));
+    }
+
     return safeServers;
   } catch {
     return [] as VpnServer[];
@@ -843,44 +680,28 @@ export function saveLastKnownServers(value: VpnServer[]) {
 }
 
 export async function loadLastKnownServersBackup() {
-  const epoch = profileCacheEpoch;
   const secureValue = await loadNativeSensitiveClientStateValue<unknown>(NATIVE_LAST_KNOWN_SERVERS_KEY);
-  assertProfileCacheEpoch(epoch);
   let secureNormalized: VpnServer[] = [];
   if (secureValue) {
     try { secureNormalized = normalizeStoredServers(decodeProfileCache(secureValue)); }
-    catch { throw new NativeStorageError('STATE_CORRUPT', 'Защищённый кэш профилей повреждён. Оригинал сохранён.', false); }
+    catch { return null; } // Corrupt secure cache never resurrects plaintext runtime.
   }
   if (secureNormalized.length) {
     return secureNormalized;
   }
 
   const value = await loadNativeClientStateValue<unknown>(NATIVE_LAST_KNOWN_SERVERS_KEY);
-  assertProfileCacheEpoch(epoch);
-  let nativeNormalized = normalizeStoredServers(value);
-  let fromWebView = false;
-  if (!nativeNormalized.length && canUseTauriSecureStorage) {
-    try {
-      const legacy = window.localStorage.getItem(LAST_KNOWN_SERVERS_STORAGE);
-      nativeNormalized = normalizeStoredServers(legacy ? JSON.parse(legacy) : null);
-      fromWebView = true;
-    } catch { /* A malformed mirror cannot replace the authoritative store. */ }
-  }
+  const nativeNormalized = normalizeStoredServers(value);
   if (!nativeNormalized.length) {
     return null;
   }
 
   const nativeSafeServers = stripSensitiveServerRuntimeList(nativeNormalized);
   if (nativeNormalized.some((server) => server.runtimeTemplate || server.rawUri)) {
-    if (!await saveProtectedProfiles(nativeNormalized)) {
-      throw new NativeStorageError('STATE_MIGRATION_FAILED', 'Кэш профилей не перенесён в защищённое хранилище. Оригинал сохранён.');
-    }
-    assertProfileCacheEpoch(epoch);
-    if (!fromWebView && !await saveNativeClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, nativeSafeServers)) {
-      throw new NativeStorageError('STATE_MIGRATION_FAILED', 'Защищённая копия сохранена; очистка старого кэша не завершена.');
-    }
-    assertProfileCacheEpoch(epoch);
-    safeLocalStorageSet(LAST_KNOWN_SERVERS_STORAGE, JSON.stringify(nativeSafeServers));
+    // Миграция старого native plaintext client-state: полный кэш сразу переносим
+    // в DPAPI, а обычный client-state перезаписываем безопасной UI-версией.
+    void saveProtectedProfiles(nativeNormalized);
+    void saveNativeClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY, nativeSafeServers);
     return nativeNormalized;
   }
 
@@ -888,13 +709,13 @@ export async function loadLastKnownServersBackup() {
 }
 
 export async function clearLastKnownServers() {
-  profileCacheEpoch++;
-  if (canUseTauriSecureStorage) {
-    const publicCleared = await queueStateWrite('public/' + NATIVE_LAST_KNOWN_SERVERS_KEY, 'clear_client_state_value', { key: NATIVE_LAST_KNOWN_SERVERS_KEY });
-    const protectedCleared = await clearNativeSensitiveClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY);
-    if (!publicCleared || !protectedCleared) {
-      throw new NativeStorageError('STATE_CLEAR_FAILED', 'Не удалось полностью очистить кэш профилей. Выход не завершён.');
-    }
-  }
   safeLocalStorageRemove(LAST_KNOWN_SERVERS_STORAGE);
+  if (canUseTauriSecureStorage) {
+    try {
+      await invokeTauri('clear_client_state_value', { key: NATIVE_LAST_KNOWN_SERVERS_KEY });
+    } catch {
+      // Best effort cleanup only.
+    }
+    await clearNativeSensitiveClientStateValue(NATIVE_LAST_KNOWN_SERVERS_KEY);
+  }
 }

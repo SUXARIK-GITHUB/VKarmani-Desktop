@@ -21,7 +21,6 @@ function cross(fill: string, stroke = 0) {
 }
 
 const FLAGS: Record<string, ReactNode> = {
-  BY: <><rect width="36" height="16" fill="#C8313E" /><rect y="16" width="36" height="8" fill="#4AA657" /><rect width="4.5" height="24" fill="#FFFFFF" />{Array.from({ length: 6 }, (_, i) => <path key={i} d={`M2.25 ${i * 4} l2 2 -2 2 -2 -2 Z`} fill="#C8313E" />)}</>,
   EU: <><rect width="36" height="24" fill="#003399" />{Array.from({ length: 12 }, (_, i) => {
     const angle = i * Math.PI / 6 - Math.PI / 2;
     return <path key={i} d="M0 -1.35 L.3 -.42 L1.28 -.42 L.49 .15 L.79 1.08 L0 .5 L-.79 1.08 L-.49 .15 L-1.28 -.42 L-.3 -.42 Z" fill="#FFCC00" transform={`translate(${18 + 7 * Math.cos(angle)} ${12 + 7 * Math.sin(angle)})`} />;

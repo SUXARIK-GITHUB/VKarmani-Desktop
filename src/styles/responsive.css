@@ -2128,8 +2128,8 @@ html.vk-window-dragging *::after {
   }
 }
 
-/* Keep the full-width dashboard at the minimum size. Move the existing
-   navigation into the titlebar gap rather than making settings unreachable. */
+/* VKarmani 0.13.70: guard against 940–980px WebView layout collapse.
+   At this width the sidebar is hidden, so the workspace must not keep a 96px sidebar column. */
 @media (min-width: 940px) and (max-width: 980px) {
   .workspace-grid {
     grid-template-columns: minmax(0, 1fr) !important;
@@ -2142,60 +2142,10 @@ html.vk-window-dragging *::after {
     width: 100% !important;
   }
 
+  .vk-sidebar,
   .sidebar-nav {
     display: none !important;
   }
-
-  .vk-sidebar {
-    position: fixed !important;
-    top: 5px;
-    left: 120px;
-    right: 120px;
-    height: 30px;
-    min-height: 0;
-    width: auto;
-    display: flex !important;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    padding: 0;
-    border: 0;
-    background: transparent;
-    z-index: 100;
-  }
-  .vk-sidebar-brand { display: none !important; }
-  .vk-sidebar-menu, .vk-sidebar-footer {
-    display: flex !important;
-    flex-direction: row !important;
-    align-items: center;
-    justify-content: center;
-    width: auto;
-    gap: 6px;
-  }
-  .vk-nav-item, .vk-info-button, .vk-exit-button {
-    width: 32px !important;
-    height: 28px !important;
-    min-height: 0 !important;
-    padding: 4px !important;
-    border-radius: 8px;
-  }
-  .vk-sidebar svg { width: 17px; height: 17px; }
-}
-
-/* The compact dashboard allocates a 48px action row. An older 96px minimum
-   on its child clipped the only Connect button below the window. */
-@media (max-height: 670px) {
-  .vk-power-actions { grid-template-rows: minmax(0, 1fr) !important; }
-  .vk-primary-power, .vk-tun-config-button {
-    min-height: 0 !important;
-    height: 100% !important;
-    max-height: 100% !important;
-    box-sizing: border-box !important;
-    padding: 8px 12px !important;
-  }
-  .vk-primary-power { gap: 8px !important; }
-  .vk-primary-power svg { width: 24px !important; height: 24px !important; }
-  .vk-primary-power span { font-size: 18px !important; }
 }
 
 /* Keep complete traffic values inside the existing card at the minimum width. */

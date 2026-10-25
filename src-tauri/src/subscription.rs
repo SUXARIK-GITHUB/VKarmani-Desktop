@@ -386,7 +386,6 @@ mod tests {
     use super::*;
     fn response(value: Value, expiry: Option<u64>) -> RemoteSubscriptionResponse {
         RemoteSubscriptionResponse {
-            userinfo: SubscriptionUserInfo::default(),
             text: value.to_string(),
             expires_at: expiry,
         }

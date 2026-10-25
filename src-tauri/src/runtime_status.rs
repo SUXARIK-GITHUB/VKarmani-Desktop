@@ -5,12 +5,6 @@ pub(crate) fn build_runtime_status(
     state: tauri::State<AppState>,
 ) -> RuntimeStatus {
     sync_runtime_liveness(app, &state);
-    read_runtime_status(app, state)
-}
-
-// Status observation for explicit diagnostics never performs recovery, stops a
-// child, restores proxy/routes or creates/hardens the runtime directory.
-pub(crate) fn read_runtime_status(app: &AppHandle, state: tauri::State<AppState>) -> RuntimeStatus {
     let active_server_label = state
         .active_server_label
         .lock()
@@ -27,6 +21,7 @@ pub(crate) fn read_runtime_status(app: &AppHandle, state: tauri::State<AppState>
         .ok()
         .and_then(|value| value.clone());
     let last_exit_code = state.last_exit_code.lock().ok().and_then(|value| *value);
+    let core_path = resolve_core_path(app).map(|path| path.to_string_lossy().to_string());
     let proxy_snapshot = current_proxy_snapshot().ok();
     let (route_ownership, owned_routes) = owned_route_summary(app);
 
@@ -48,17 +43,9 @@ pub(crate) fn read_runtime_status(app: &AppHandle, state: tauri::State<AppState>
                 runtime.config_hash.clone(),
                 runtime.self_restart_count,
                 traffic_runtime_id(runtime),
-                runtime.tun_routing_mode.clone(),
             ))
         })
     });
-
-    // The active runtime retains verified bundle handles for its entire
-    // lifetime. Status polling must not rehash the bundle on every tick.
-    let core_path = runtime_snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.0.clone())
-        .or_else(|| resolve_core_path(app).map(|path| path.to_string_lossy().to_string()));
 
     let connected = runtime_snapshot.is_some();
     let starting_snapshot = state.starting_runtime.lock().ok().and_then(|value| {
@@ -104,15 +91,11 @@ pub(crate) fn read_runtime_status(app: &AppHandle, state: tauri::State<AppState>
 
     let message = if connected && current_network_mode.as_deref() == Some("tun") {
         format!(
-            "Xray TUN runtime активен{}. Политика: {}. Доступность VPN и DNS проверяется отдельно.",
+            "Xray TUN режим активен{}. VKarmani направляет выбранные процессы через VPN, остальной трафик выходит напрямую.",
             current_tun_name
                 .as_deref()
                 .map(|name| format!(" через интерфейс {name}"))
-                .unwrap_or_default(),
-            runtime_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.12.as_deref())
-                .unwrap_or("не подтверждена")
+                .unwrap_or_default()
         )
     } else if connected {
         "Xray sidecar запущен. Можно переводить системный HTTP/HTTPS трафик в локальный proxy-режим.".to_string()
@@ -174,9 +157,6 @@ pub(crate) fn read_runtime_status(app: &AppHandle, state: tauri::State<AppState>
             .as_ref()
             .and_then(|snapshot| snapshot.bypass.clone()),
         network_mode: current_network_mode,
-        tun_routing_mode: runtime_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.12.clone()),
         tun_interface_name: current_tun_name,
         xray_pid: runtime_snapshot
             .as_ref()

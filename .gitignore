@@ -14,12 +14,8 @@ logs/
 .env.local
 .env.development
 .env.production
-.env.*
 
 !.env.example
-
-# Personal launcher is preserved locally and in private backups only.
-/START_VKarmani.bat
 
 # Tauri updater private keys
 .tauri/

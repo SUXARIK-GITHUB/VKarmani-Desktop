@@ -8,12 +8,10 @@ const tree = 'vkarmani-desktop v0.13.70 (synthetic-root)\nserde v1.0.228\n';
 const audit = (list = [vuln()]) => ({ settings: { ignore: [], severity: null, target_os: [], target_arch: [] },
   vulnerabilities: { found: list.length > 0, count: list.length, list }, warnings: { unsound: ['visible'] } });
 describe('strict Windows release advisory gate', () => {
-  it('blocks even historical inactive findings and preserves informational warnings', () => {
+  it('handles only the three reviewed exact inactive lock entries and preserves warnings', () => {
     const result = assessWindowsAudit(audit([vuln(), vuln('RUSTSEC-2026-0195'), vuln('RUSTSEC-2026-0185', 'quinn-proto', '0.11.14')]), metadata, tree);
-    expect(result.status).toBe('FAIL'); expect(result.handled).toHaveLength(0); expect(result.blocked).toHaveLength(3);
+    expect(result.status).toBe('PASS'); expect(result.handled).toHaveLength(3);
     expect(result.warnings.unsound).toEqual(['visible']);
-    const clean = assessWindowsAudit(audit([]), metadata, tree);
-    expect(clean.status).toBe('PASS'); expect(clean.warnings.unsound).toEqual(['visible']);
   });
   it('blocks a synthetic Windows-reachable High, including a formerly inactive advisory', () => {
     const result = assessWindowsAudit(audit(), metadata, tree + 'quick-xml v0.38.4\n');

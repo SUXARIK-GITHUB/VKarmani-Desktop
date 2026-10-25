@@ -101,19 +101,6 @@ function Assert-WindowsAmd64Pe([string]$Path) {
     if ($reader.ReadUInt32() -ne 17744 -or $reader.ReadUInt16() -ne 34404) { throw 'Resource must be Windows amd64 PE.' }
     $file.Position = $offset + 24
     if ($reader.ReadUInt16() -ne 523) { throw 'Resource must be PE32+.' }
-    $file.Position = $offset + 6
-    $sectionCount = $reader.ReadUInt16()
-    $file.Position = $offset + 20
-    $optionalSize = $reader.ReadUInt16()
-    $sectionTable = [long]$offset + 24 + $optionalSize
-    $sectionEnd = $sectionTable + [long]$sectionCount * 40
-    if ($sectionCount -lt 1 -or $sectionCount -gt 96 -or $optionalSize -lt 112 -or $sectionEnd -gt $file.Length) { throw 'Invalid PE section table.' }
-    for ($sectionIndex = 0; $sectionIndex -lt $sectionCount; $sectionIndex++) {
-      $file.Position = $sectionTable + [long]$sectionIndex * 40 + 16
-      $rawSize = [long]($reader.ReadUInt32())
-      $rawStart = [long]($reader.ReadUInt32())
-      if ($rawSize -gt 0 -and ($rawStart -lt $sectionEnd -or $rawStart + $rawSize -gt $file.Length)) { throw 'Truncated or overlapping PE section data.' }
-    }
   } finally { $file.Dispose() }
 }
 

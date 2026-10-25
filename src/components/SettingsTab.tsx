@@ -2,13 +2,11 @@ import { useState, type ReactNode } from 'react';
 import { Bell, Download, Globe2, Languages, MonitorCog, Palette, Plus, RefreshCw, Route, Shield, SlidersHorizontal, Split, Star, Trash2, Wifi, Zap } from 'lucide-react';
 import { tr, type UiLanguage } from '../i18n';
 import { PolicyChoice } from './PolicyChoice';
-import {autostartStatusLabel,type AutostartStatus} from '../utils/nativeErrors';
 import { useSettingsNavigation } from '../hooks/useSettingsNavigation';
 import type { AppSettings, RoutingExclusionSettings } from '../types/vpn';
 import { countActiveRoutingExclusions, normalizeRoutingDomainInput, normalizeRoutingIpInput, sanitizeRoutingExclusions } from '../utils/routingExclusions';
 
 interface SettingsTabProps {
-  autostartStatus?:AutostartStatus;
   settings: AppSettings;
   language: UiLanguage;
   onToggleSetting: (key: keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode' | 'ipStack' | 'routingExclusions' | 'tunRoutingMode'>) => void;
@@ -79,7 +77,7 @@ function SettingsSection({ id, kicker, title, icon: Icon, children }: { id: Sect
   );
 }
 
-export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeChange, onIpStackChange, onTunRoutingModeChange, onLanguageChange, onRoutingExclusionsChange,autostartStatus='unknown' }: SettingsTabProps) {
+export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeChange, onIpStackChange, onTunRoutingModeChange, onLanguageChange, onRoutingExclusionsChange }: SettingsTabProps) {
   const { containerRef, navRef, activeSection, navigate: handleTabClick } = useSettingsNavigation(SECTION_IDS);
   const nextLanguage: UiLanguage = language === 'ru' ? 'en' : 'ru';
   const [routingDomainInput, setRoutingDomainInput] = useState('');
@@ -183,7 +181,7 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
       {
         key: 'launchOnStartup',
         title: tr(language, 'Запускать при старте Windows', 'Launch on Windows startup'),
-        description: `${tr(language, 'Автоматически запускать приложение при включении компьютера', 'Start the app automatically when the computer turns on')} · ${autostartStatusLabel(autostartStatus,language)}`,
+        description: tr(language, 'Автоматически запускать приложение при включении компьютера', 'Start the app automatically when the computer turns on'),
         icon: MonitorCog
       },
       {
@@ -209,7 +207,7 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
       {
         key: 'autoInstallUpdates',
         title: tr(language, 'Автоустановка обновлений', 'Auto-install updates'),
-        description: tr(language, 'Устанавливать автоматически только при подтверждённом отключении VPN. При активном VPN потребуется ручное подтверждение.', 'Install automatically only when the VPN is confirmed disconnected. An active VPN requires manual confirmation.'),
+        description: tr(language, 'Устанавливать найденные обновления автоматически', 'Install found updates automatically'),
         icon: Download
       }
     ],
@@ -233,9 +231,10 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
           <p>{tr(language, 'Управляйте параметрами приложения, подключения и системной интеграции.', 'Manage application, connection, and system integration settings.')}</p>
         </div>
         <div className="settings-health-card">
+          <span className="system-status-dot" />
           <div>
-            <strong>{tr(language, 'Настройки клиента', 'Client settings')}</strong>
-            <small>{tr(language, 'Проверка сети — во вкладке «Диагностика»', 'Network checks are in Diagnostics')}</small>
+            <strong>{tr(language, 'Все системы работают', 'All systems operational')}</strong>
+            <small>{tr(language, 'Параметры применяются сразу', 'Settings apply instantly')}</small>
           </div>
         </div>
       </section>
@@ -414,9 +413,9 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
                 ? tr(language, 'TUN направляет трафик через VPN согласно выбранному режиму приложений.', 'TUN routes traffic through VPN according to the selected application mode.')
                 : tr(language, 'Proxy-режим использует локальные SOCKS/HTTP порты.', 'Proxy mode uses local SOCKS/HTTP ports.')}</p>
             </div>
-            <div className="settings-mode-switch" role="group" aria-label={tr(language,'Режим подключения','Connection mode')}>
-              <button className={settings.tunnelMode === 'proxy' ? 'active' : ''} type="button" aria-pressed={settings.tunnelMode==='proxy'} onClick={() => onTunnelModeChange('proxy')}>Proxy</button>
-              <button className={settings.tunnelMode === 'tun' ? 'active' : ''} type="button" aria-pressed={settings.tunnelMode==='tun'} onClick={() => onTunnelModeChange('tun')}>TUN</button>
+            <div className="settings-mode-switch">
+              <button className={settings.tunnelMode === 'proxy' ? 'active' : ''} type="button" onClick={() => onTunnelModeChange('proxy')}>Proxy</button>
+              <button className={settings.tunnelMode === 'tun' ? 'active' : ''} type="button" onClick={() => onTunnelModeChange('tun')}>TUN</button>
             </div>
           </div>
         </SettingsSection>
@@ -425,11 +424,11 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
           <div className="settings-routing-control">
             <PolicyChoice label={tr(language, 'Маршрутизация приложений', 'App routing')} value={settings.tunRoutingMode} onChange={onTunRoutingModeChange} options={[
               { value: 'all', label: tr(language, 'Все приложения', 'All applications') },
-              { value: 'selected', label: tr(language, 'Только выбранные — недоступно', 'Selected only — unavailable') },
+              { value: 'selected', label: tr(language, 'Только выбранные через VPN', 'Selected through VPN') },
               { value: 'exclude', label: tr(language, 'Все, кроме исключённых', 'All except excluded') }
             ]} />
             <p>{settings.tunRoutingMode === 'selected'
-              ? tr(language, 'Этот режим сейчас недоступен: подключение будет безопасно отклонено. Для полного TUN явно выберите «Все приложения».', 'This mode is unavailable: connection will be safely refused. For full TUN, explicitly choose All applications.')
+              ? tr(language, 'Через VPN идут только выбранные приложения. Остальные подключаются напрямую.', 'Only selected applications use the VPN. Others connect directly.')
               : tr(language, 'Приложения используют VPN. Правила «Напрямую» задают исключения.', 'Applications use the VPN. Direct rules specify exceptions.')}</p>
           </div>
           <div className="settings-note-card">

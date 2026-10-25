@@ -287,61 +287,9 @@ pub(crate) fn read_limited_remote_text(
     Ok(text)
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
-pub(crate) struct SubscriptionUserInfo {
-    upload: Option<String>,
-    download: Option<String>,
-    total: Option<String>,
-    expire: Option<String>,
-}
-
-fn parse_subscription_userinfo(header: Option<&str>) -> Result<SubscriptionUserInfo, String> {
-    let Some(header) = header else {
-        return Ok(SubscriptionUserInfo::default());
-    };
-    if header.len() > 2048 {
-        return Err("SUBSCRIPTION_USERINFO_INVALID".into());
-    }
-    let mut values = std::collections::BTreeMap::new();
-    for part in header
-        .split(';')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        let Some((key, value)) = part.split_once('=') else {
-            return Err("SUBSCRIPTION_USERINFO_INVALID".into());
-        };
-        let key = key.trim();
-        if !matches!(key, "upload" | "download" | "total" | "expire") {
-            continue;
-        }
-        let value = value.trim();
-        if value.is_empty()
-            || value.len() > 20
-            || !value.bytes().all(|b| b.is_ascii_digit())
-            || values.contains_key(key)
-        {
-            return Err("SUBSCRIPTION_USERINFO_INVALID".into());
-        }
-        let number = value
-            .parse::<u64>()
-            .map_err(|_| "SUBSCRIPTION_USERINFO_INVALID")?;
-        values.insert(key, number.to_string());
-    }
-    Ok(SubscriptionUserInfo {
-        upload: values.remove("upload"),
-        download: values.remove("download"),
-        total: values.remove("total"),
-        expire: values.remove("expire"),
-    })
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct RemoteSubscriptionResponse {
     pub(crate) text: String,
     pub(crate) expires_at: Option<u64>,
-    pub(crate) userinfo: SubscriptionUserInfo,
 }
 
 pub(crate) fn fetch_remote_response_blocking(
@@ -412,44 +360,25 @@ pub(crate) fn fetch_remote_response_blocking(
             return Err(format!("HTTP {}", response.status()));
         }
 
-        let userinfo = parse_subscription_userinfo(
-            response
-                .headers()
-                .get("subscription-userinfo")
-                .map(|value| value.to_str().map_err(|_| "SUBSCRIPTION_USERINFO_INVALID"))
-                .transpose()?,
-        )?;
-        let expires_at = userinfo
-            .expire
-            .as_ref()
-            .and_then(|value| value.parse::<u64>().ok())
+        let expires_at = response
+            .headers()
+            .get("subscription-userinfo")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                value.split(';').find_map(|part| {
+                    part.trim()
+                        .strip_prefix("expire=")
+                        .and_then(|value| value.parse::<u64>().ok())
+                })
+            })
             .filter(|value| *value > 0);
         return Ok(RemoteSubscriptionResponse {
             text: read_limited_remote_text(response)?,
             expires_at,
-            userinfo,
         });
     }
 
     Err("Слишком много redirects при удалённом fetch.".into())
-}
-
-#[tauri::command]
-pub(crate) async fn fetch_remote_subscription(
-    url: String,
-    accept: Option<String>,
-    user_agent: Option<String>,
-) -> Result<RemoteSubscriptionResponse, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        fetch_remote_response_blocking(
-            url,
-            accept,
-            user_agent,
-            Instant::now() + Duration::from_secs(8),
-        )
-    })
-    .await
-    .map_err(|_| "SUBSCRIPTION_FETCH_INTERRUPTED".to_string())?
 }
 
 #[tauri::command]
@@ -493,38 +422,6 @@ pub(crate) fn validate_api_credential_origin(
 #[cfg(test)]
 mod security_tests {
     use super::*;
-    #[test]
-    fn subscription_userinfo_is_bounded_exact_and_never_invents_missing_numbers() {
-        let parsed = parse_subscription_userinfo(Some(
-            "upload=0; download=18446744073709551615; total=0; expire=0",
-        ))
-        .unwrap();
-        assert_eq!(parsed.download.as_deref(), Some("18446744073709551615"));
-        assert_eq!(parsed.expire.as_deref(), Some("0"));
-        assert!(parse_subscription_userinfo(None)
-            .unwrap()
-            .download
-            .is_none());
-        for header in [
-            "upload=-1",
-            "upload=NaN",
-            "expire=1; expire=0",
-            "total=18446744073709551616",
-            "upload=1.5",
-            "download=+1",
-            "expire",
-        ] {
-            assert!(parse_subscription_userinfo(Some(header)).is_err());
-        }
-        assert!(parse_subscription_userinfo(Some(&"x".repeat(2049))).is_err());
-        assert_eq!(
-            parse_subscription_userinfo(Some("unknown=value; upload=00012"))
-                .unwrap()
-                .upload
-                .as_deref(),
-            Some("12")
-        );
-    }
     #[test]
     fn validates_all_resolved_addresses_and_pins_the_same_public_set() {
         for addresses in [

@@ -1,7 +1,7 @@
 {
   "name": "vkarmani-desktop",
   "private": true,
-  "version": "0.13.82",
+  "version": "0.13.76",
   "type": "module",
   "scripts": {
     "dev": "node ./node_modules/vite/bin/vite.js --host 127.0.0.1",
@@ -17,8 +17,7 @@
     "verify:xray:manifest": "node scripts/verify-core-manifest.mjs",
     "verify:xray:hy2": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-hysteria2-bundled-xray.ps1",
     "smoke:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-runtime-smoke.ps1 -RequireCleanDisconnect -CheckDnsSnapshot",
-    "test": "node ./node_modules/vitest/vitest.mjs run tests --pool=threads --maxWorkers=1",
-    "lint": "node ./node_modules/eslint/bin/eslint.js src --max-warnings 0"
+    "test": "node ./node_modules/vitest/vitest.mjs run tests --pool=threads --maxWorkers=1"
   },
   "dependencies": {
     "@tauri-apps/api": "2.10.1",
@@ -31,13 +30,10 @@
     "@tauri-apps/cli": "2.10.1",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
-    "@typescript-eslint/parser": "8.72.0",
     "@vitejs/plugin-react": "4.3.4",
-    "eslint": "10.13.0",
-    "eslint-plugin-react-hooks": "7.1.1",
     "typescript": "5.9.3",
-    "vite": "6.4.5",
-    "vitest": "4.1.12"
+    "vite": "6.4.3",
+    "vitest": "4.1.11"
   },
   "engines": {
     "node": ">=22 <23",

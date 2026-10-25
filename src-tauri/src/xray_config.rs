@@ -1,10 +1,5 @@
 use super::*;
 
-// Host addresses on the disposable Xray adapter, not physical gateway routes.
-// /32 and /128 avoid claiming a LAN subnet. Split routes remain journal-owned.
-pub(crate) const TUN_GATEWAY_IPV4: &str = "172.19.0.1/32";
-pub(crate) const TUN_GATEWAY_IPV6: &str = "fdfe:dcba:9876::1/128";
-
 pub(crate) fn tune_outbound_for_performance(outbound: &mut Value) {
     let Some(outbound_map) = outbound.as_object_mut() else {
         return;
@@ -381,136 +376,6 @@ fn set_client_owned_xray_field(map: &mut serde_json::Map<String, Value>, key: &s
     map.insert(key.into(), value);
 }
 
-// Xray26.4.25 FragmentMask uses singular Int32Range length/delay. Some
-// subscription generators emit singleton lengths/delays arrays instead. Map
-// only that lossless case; never drop a mask or choose one of several ranges.
-fn adapt_fragment_masks_for_pinned_core(config: &mut Value) -> Result<(), String> {
-    let Some(outbounds) = config.get_mut("outbounds").and_then(Value::as_array_mut) else {
-        return Ok(());
-    };
-    for outbound in outbounds {
-        let Some(masks) = outbound
-            .pointer_mut("/streamSettings/finalmask/tcp")
-            .and_then(Value::as_array_mut)
-        else {
-            continue;
-        };
-        for mask in masks {
-            if mask.get("type").and_then(Value::as_str) != Some("fragment") {
-                continue;
-            }
-            let Some(settings) = mask.get_mut("settings").and_then(Value::as_object_mut) else {
-                continue; // The actual core validator rejects malformed settings.
-            };
-            for (plural, singular) in [("lengths", "length"), ("delays", "delay")] {
-                let aliases = settings
-                    .keys()
-                    .filter(|name| xray_json_field_matches(name, plural))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if aliases.is_empty() {
-                    continue;
-                }
-                if aliases.len() != 1
-                    || settings
-                        .keys()
-                        .any(|name| xray_json_field_matches(name, singular))
-                {
-                    return Err("CORE_FRAGMENT_SCHEMA_UNSUPPORTED".into());
-                }
-                let value = settings[&aliases[0]]
-                    .as_array()
-                    .filter(|values| values.len() == 1)
-                    .and_then(|values| values[0].as_str())
-                    .filter(|value| !value.is_empty())
-                    .ok_or("CORE_FRAGMENT_SCHEMA_UNSUPPORTED")?
-                    .to_string();
-                settings.remove(&aliases[0]);
-                settings.insert(singular.into(), json!(value));
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod fragment_compatibility_tests {
-    use super::*;
-    fn template(settings: Value) -> RuntimeTemplate {
-        let outbound = json!({"tag":"node","protocol":"vless","settings":{"vnext":[{"address":"example.com","port":443,"users":[{"id":"123e4567-e89b-12d3-a456-426614174000","encryption":"none"}]}]},"streamSettings":{"network":"raw","finalmask":{"tcp":[{"type":"fragment","settings":settings}]}}});
-        RuntimeTemplate {
-            family: "xray".into(),
-            protocol: "vless".into(),
-            remarks: None,
-            full_config: Some(
-                json!({"outbounds":[outbound.clone()],"dns":{"servers":["localhost"]},"routing":{"rules":[]}}),
-            ),
-            primary_outbound_tag: Some("node".into()),
-            profile_kind: Some("node".into()),
-            outbound,
-        }
-    }
-    #[test]
-    fn singleton_fragment_ranges_are_lossless_in_both_modes_without_editing_provider() {
-        for full in [false, true] {
-            let mut template = template(
-                json!({"packets":"tlshello","lengths":["50-100"],"delays":["1-3"],"maxSplit":"3"}),
-            );
-            if !full {
-                template.full_config = None;
-            }
-            let original = (template.outbound.clone(), template.full_config.clone());
-            for mode in ["proxy", "tun"] {
-                let (config, _, _) =
-                    build_xray_config(&template, mode, "ipv4", None, &[], None, None).unwrap();
-                let settings =
-                    &config["outbounds"][0]["streamSettings"]["finalmask"]["tcp"][0]["settings"];
-                assert_eq!(
-                    settings,
-                    &json!({"packets":"tlshello","length":"50-100","delay":"1-3","maxSplit":"3"})
-                );
-                assert_eq!(
-                    (&template.outbound, &template.full_config),
-                    (&original.0, &original.1)
-                );
-                if full {
-                    assert_eq!(config["dns"], template.full_config.as_ref().unwrap()["dns"]);
-                }
-            }
-        }
-    }
-    #[test]
-    fn ambiguous_or_multiple_ranges_never_drop_fragmentation_or_fallback() {
-        for settings in [
-            json!({"lengths":[]}),
-            json!({"lengths":["50-100","200-300"]}),
-            json!({"lengths":"50-100"}),
-            json!({"lengths":[null]}),
-            json!({"lengths":[""]}),
-            json!({"lengths":["50-100"],"Length":"5-10"}),
-            json!({"lengths":["50-100"],"Lengths":["100-200"]}),
-            json!({"length":"50-100","delays":["1-3","4-5"]}),
-        ] {
-            let template = template(settings);
-            for mode in ["proxy", "tun"] {
-                assert_eq!(
-                    build_xray_config(&template, mode, "ipv4", None, &[], None, None)
-                        .err()
-                        .unwrap(),
-                    "CORE_FRAGMENT_SCHEMA_UNSUPPORTED"
-                );
-            }
-        }
-    }
-    #[test]
-    fn pinned_singular_masks_and_unrelated_masks_are_unchanged() {
-        let mut config = json!({"outbounds":[{"streamSettings":{"finalmask":{"tcp":[{"type":"fragment","settings":{"length":"5-10","delay":"1-2","packets":"tlshello","maxSplit":"3"}},{"type":"header-custom","settings":{"lengths":[1,2]}}]}}}]});
-        let original = config.clone();
-        adapt_fragment_masks_for_pinned_core(&mut config).unwrap();
-        assert_eq!(config, original);
-    }
-}
-
 struct FullConfigAdapterSettings<'a> {
     log_object: Value,
     domain_strategy: &'a str,
@@ -643,22 +508,9 @@ fn build_from_full_xray_config_template(
         .cloned()
         .unwrap_or_default();
     for mut rule in provider_rules {
-        // Canonicalize an explicitly supplied Go JSON selector, including its
-        // aliases. Last serialized occurrence wins as in encoding/json.
-        let selector = rule
-            .as_object()?
-            .iter()
-            .rfind(|(name, _)| xray_json_field_matches(name, "inboundTag"))
-            .map(|(_, value)| value.clone());
-        if let Some(selector) = selector {
-            let tags = match selector {
-                Value::Array(tags) if tags.iter().all(Value::is_string) => tags,
-                Value::String(tags) => tags.split(',').map(|tag| json!(tag)).collect(),
-                Value::Null => Vec::new(),
-                _ => return None,
-            };
+        let scope = if let Some(tags) = rule.get("inboundTag").and_then(Value::as_array) {
             let mut mapped = Vec::new();
-            for tag in &tags {
+            for tag in tags {
                 let declaration = full_config
                     .get("inbounds")
                     .and_then(Value::as_array)
@@ -676,12 +528,11 @@ fn build_from_full_xray_config_template(
                     _ => mapped.push(tag.clone()), // Preserve unknown selectors; never widen them.
                 }
             }
-            set_client_owned_xray_field(rule.as_object_mut()?, "inboundTag", json!(mapped));
-        }
-        // No inbound selector means ALL original contexts, including Xray's
-        // generated DNS tags. Adding listener-only scope silently drops those
-        // provider DNS/observatory rules. Client API and TUN admission rules
-        // have already handled their own listeners earlier in the chain.
+            mapped
+        } else {
+            virtual_tags.iter().map(|tag| json!(tag)).collect()
+        };
+        set_client_owned_xray_field(rule.as_object_mut()?, "inboundTag", json!(scope));
         adapter_rules.push(rule);
     }
     adapter_rules.push(json!({"type":"field","inboundTag":virtual_tags,"outboundTag":default_tag,"ruleTag":own("provider-default")}));
@@ -700,14 +551,9 @@ fn build_from_full_xray_config_template(
         set_client_owned_xray_field(log, key, value.clone());
     }
     set_client_owned_xray_field(log, "access", json!("none"));
-    // DNS is provider-owned. Go accepts DNS/dNs as aliases, so do not inject
-    // lowercase defaults that would shadow an existing provider definition.
-    if !map.keys().any(|key| xray_json_field_matches(key, "dns")) {
-        map.insert(
-            "dns".into(),
-            json!({"queryStrategy":dns_query_strategy,"servers":["1.1.1.1","8.8.8.8","localhost"]}),
-        );
-    }
+    map.entry("dns").or_insert(
+        json!({"queryStrategy":dns_query_strategy,"servers":["1.1.1.1","8.8.8.8","localhost"]}),
+    );
     let api = map.entry("api").or_insert(json!({})).as_object_mut()?;
     set_client_owned_xray_field(api, "tag", json!(api_tag));
     api.retain(|name, _| !xray_json_field_matches(name, "listen"));
@@ -873,9 +719,6 @@ pub(crate) fn build_xray_config_with_plan(
             "settings": {
                 "name": TUN_INTERFACE_NAME,
                 "MTU": 1400,
-                "gateway": [TUN_GATEWAY_IPV4, TUN_GATEWAY_IPV6],
-                "dns": ["1.1.1.1", "8.8.8.8"],
-                "autoSystemRoutingTable": [],
                 "userLevel": 0
             },
             "sniffing": {
@@ -885,18 +728,12 @@ pub(crate) fn build_xray_config_with_plan(
             }
         }));
 
-        // Every production TUN outbound is bound to the verified physical
-        // interface before launch. A self-process matcher is not loop protection:
-        // lookup failure logs on each captured flow, while the full-mode default
-        // is VPN anyway. Keep the legacy selected graph narrow (admission refuses it).
-        if !plan.default_vpn {
-            routing_rules.push(json!({
+        routing_rules.push(json!({
             "inboundTag": ["tun-in"],
             "process": ["self/", "xray/"],
             "outboundTag": "direct",
             "ruleTag": "tun-core-self-direct"
-            }));
-        }
+        }));
 
         routing_rules.push(json!({
             "inboundTag": ["tun-in"],
@@ -983,7 +820,7 @@ pub(crate) fn build_xray_config_with_plan(
             "settings": {}
         });
 
-        if let Some(mut full_runtime_config) = build_from_full_xray_config_template(
+        if let Some(full_runtime_config) = build_from_full_xray_config_template(
             template,
             full_config,
             inbounds.clone(),
@@ -997,54 +834,55 @@ pub(crate) fn build_xray_config_with_plan(
                 send_through_ip,
             },
         ) {
-            adapt_fragment_masks_for_pinned_core(&mut full_runtime_config)?;
             return Ok((full_runtime_config, plan, routing_exclusion_plan));
         }
         return Err("Не удалось применить client adapter к полному Xray config; неполный fallback запрещён.".into());
     }
 
-    let mut config = json!({
-        "log": log_object,
-        "dns": {
-            "queryStrategy": dns_query_strategy,
-            "servers": ["1.1.1.1", "8.8.8.8", "localhost"]
-        },
-        "api": {
-            "tag": "api",
-            "services": ["StatsService"]
-        },
-        "policy": {
-            "levels": {
-                "0": {
-                    "statsUserUplink": true,
-                    "statsUserDownlink": true
+    Ok((
+        json!({
+            "log": log_object,
+            "dns": {
+                "queryStrategy": dns_query_strategy,
+                "servers": ["1.1.1.1", "8.8.8.8", "localhost"]
+            },
+            "api": {
+                "tag": "api",
+                "services": ["StatsService"]
+            },
+            "policy": {
+                "levels": {
+                    "0": {
+                        "statsUserUplink": true,
+                        "statsUserDownlink": true
+                    }
+                },
+                "system": {
+                    "statsInboundUplink": true,
+                    "statsInboundDownlink": true,
+                    "statsOutboundUplink": true,
+                    "statsOutboundDownlink": true
                 }
             },
-            "system": {
-                "statsInboundUplink": true,
-                "statsInboundDownlink": true,
-                "statsOutboundUplink": true,
-                "statsOutboundDownlink": true
-            }
-        },
-        "stats": {},
-        "inbounds": inbounds,
-        "routing": {
-            "domainStrategy": domain_strategy,
-            "rules": routing_rules
-        },
-        "outbounds": [
-            outbound,
-            direct_outbound,
-            {
-                "tag": "block",
-                "protocol": "blackhole",
-                "settings": {}
-            }
-        ]
-    });
-    adapt_fragment_masks_for_pinned_core(&mut config)?;
-    Ok((config, plan, routing_exclusion_plan))
+            "stats": {},
+            "inbounds": inbounds,
+            "routing": {
+                "domainStrategy": domain_strategy,
+                "rules": routing_rules
+            },
+            "outbounds": [
+                outbound,
+                direct_outbound,
+                {
+                    "tag": "block",
+                    "protocol": "blackhole",
+                    "settings": {}
+                }
+            ]
+        }),
+        plan,
+        routing_exclusion_plan,
+    ))
 }
 
 pub(crate) fn value_as_valid_port(value: &Value) -> Option<u16> {
@@ -1173,19 +1011,14 @@ pub(crate) fn find_tun_interface_index(interface_name: &str) -> Result<u32, Stri
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn wait_for_tun_interface(
-    interface_name: &str,
-    mut check_operation: impl FnMut() -> Result<(), String>,
-) -> Result<u32, String> {
+pub(crate) fn wait_for_tun_interface(interface_name: &str) -> Result<u32, String> {
     let deadline = Instant::now() + Duration::from_secs(6);
     loop {
-        check_operation()?;
-        let error = match find_tun_interface_index(interface_name) {
-            Ok(index) => return Ok(index),
-            Err(error) => error,
-        };
+        if let Ok(index) = find_tun_interface_index(interface_name) {
+            return Ok(index);
+        }
         if Instant::now() >= deadline {
-            return Err(format!("{error}; TUN interface deadline exceeded"));
+            return Err("TUN interface deadline exceeded".into());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1194,127 +1027,6 @@ pub(crate) fn wait_for_tun_interface(
 #[cfg(test)]
 mod tun_policy_tests {
     use super::*;
-    #[test]
-    fn hotfix078_full_tun_initializes_addresses_without_a_second_route_owner_or_process_lookup() {
-        let template = RuntimeTemplate {
-            family: "xray".into(),
-            protocol: "vless".into(),
-            outbound: json!({"protocol":"vless","settings":{"vnext":[{"address":"192.0.2.1","port":443,"users":[{"id":"00000000-0000-4000-8000-000000000001","encryption":"none"}]}]}}),
-            remarks: None,
-            full_config: None,
-            primary_outbound_tag: None,
-            profile_kind: None,
-        };
-        let plan = SplitTunnelRulePlan {
-            default_vpn: true,
-            process_matches: vec![],
-            direct_process_matches: vec![],
-            resolved_apps: 0,
-            resolved_services: 0,
-            skipped_notes: vec![],
-        };
-        let (mut config, _, _) = build_xray_config_with_plan(
-            &template,
-            "tun",
-            "ipv4",
-            Some("192.0.2.20"),
-            Some(plan),
-            None,
-            None,
-        )
-        .unwrap();
-        bind_tun_outbounds(&mut config, "Ethernet").unwrap();
-        let settings = &config["inbounds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|v| v["protocol"] == "tun")
-            .unwrap()["settings"];
-        assert_eq!(
-            settings["gateway"],
-            json!(["172.19.0.1/32", "fdfe:dcba:9876::1/128"])
-        );
-        assert_eq!(settings["dns"], json!(["1.1.1.1", "8.8.8.8"]));
-        assert_eq!(
-            settings["autoSystemRoutingTable"],
-            json!([]),
-            "VKarmani's exact journal is the only owner of split routes"
-        );
-        assert!(
-            config["routing"]["rules"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|r| r.get("process").is_none()),
-            "Ordinary full TUN must not invoke process lookup, even for a core self rule"
-        );
-        assert_eq!(
-            config["routing"]["rules"]
-                .as_array()
-                .unwrap()
-                .last()
-                .unwrap()["outboundTag"],
-            "proxy"
-        );
-        println!(
-            "XRAY_HOTFIX078_CONFIG:{}",
-            serde_json::to_string(&config).unwrap()
-        );
-        let dns = json!({"servers":["9.9.9.9"],"tag":"provider-dns"});
-        let mut provider_outbound = template.outbound.clone();
-        provider_outbound["tag"] = json!("provider-proxy");
-        provider_outbound["streamSettings"] =
-            json!({"network":"tcp","sockopt":{"tcpFastOpen":true}});
-        let full_template = RuntimeTemplate {
-            full_config: Some(
-                json!({"outbounds":[provider_outbound.clone()],"DNS":dns.clone(),"routing":{"rules":[]}}),
-            ),
-            profile_kind: Some("node".into()),
-            primary_outbound_tag: Some("provider-proxy".into()),
-            ..template
-        };
-        let full_plan = SplitTunnelRulePlan {
-            default_vpn: true,
-            process_matches: vec![],
-            direct_process_matches: vec![],
-            resolved_apps: 0,
-            resolved_services: 0,
-            skipped_notes: vec![],
-        };
-        let (full, _, _) = build_xray_config_with_plan(
-            &full_template,
-            "tun",
-            "ipv4",
-            Some("192.0.2.20"),
-            Some(full_plan),
-            None,
-            None,
-        )
-        .unwrap();
-        let tun = full["inbounds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|v| v["protocol"] == "tun")
-            .unwrap();
-        assert_eq!(tun["settings"]["gateway"], settings["gateway"]);
-        assert_eq!(tun["settings"]["autoSystemRoutingTable"], json!([]));
-        assert_eq!(full["DNS"], dns);
-        assert!(full.get("dns").is_none());
-        assert_eq!(
-            full["outbounds"][0]["streamSettings"],
-            provider_outbound["streamSettings"]
-        );
-        let (proxy, _, _) =
-            build_xray_config_with_plan(&full_template, "proxy", "ipv4", None, None, None, None)
-                .unwrap();
-        assert!(proxy["inbounds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|v| v["protocol"] != "tun"));
-        assert_eq!(proxy["outbounds"][0], provider_outbound);
-    }
     #[cfg(target_os = "windows")]
     #[test]
     fn original_default_route_snapshot_is_read_only() {
@@ -1323,62 +1035,6 @@ mod tun_policy_tests {
         assert!(snapshot.interface_index > 0);
         assert_ne!(snapshot.interface_alias, TUN_INTERFACE_NAME);
         assert!(snapshot.source_ip.parse::<Ipv4Addr>().is_ok());
-    }
-    #[test]
-    fn generated_process_contract_for_tagged_upstream_matcher() {
-        let template = RuntimeTemplate {
-            family: "xray".into(),
-            protocol: "vless".into(),
-            outbound: json!({"protocol":"vless","settings":{"vnext":[{"address":"vpn.example","port":443,"users":[{"id":"00000000-0000-4000-8000-000000000001"}]}]}}),
-            remarks: None,
-            full_config: None,
-            primary_outbound_tag: None,
-            profile_kind: None,
-        };
-        let mut cases: Vec<Value> = [
-            "MiXeD.EXE",
-            "Outlook.ExE",
-            "outlook.exe",
-            "C:/Apps/MiXeD.EXE",
-            "c:/apps/mixed.exe",
-        ]
-        .into_iter()
-        .map(|value| {
-            let entries = vec![SplitTunnelEntryPayload {
-                kind: "app".into(),
-                value: value.into(),
-                enabled: true,
-                policy: Some("VPN".into()),
-            }];
-            let (config, _, _) = build_xray_config(
-                &template,
-                "tun",
-                "ipv4",
-                Some("192.0.2.20"),
-                &entries,
-                None,
-                None,
-            )
-            .unwrap();
-            json!({"input":value,"rules":config["routing"]["rules"]})
-        })
-        .collect();
-        let (all, _, _) = build_xray_config(
-            &template,
-            "tun",
-            "ipv4",
-            Some("192.0.2.20"),
-            &[],
-            None,
-            None,
-        )
-        .unwrap();
-        cases.push(json!({"input":"MiXeD.EXE","mode":"all","rules":all["routing"]["rules"]}));
-        // Synthetic rules only: no file/config/core/TUN initialization.
-        println!(
-            "XRAY_PROCESS_CONTRACT:{}",
-            serde_json::to_string(&cases).unwrap()
-        );
     }
     #[test]
     fn selected_vpn_unselected_direct_and_explicit_physical_binding() {
@@ -1446,126 +1102,5 @@ mod tun_policy_tests {
         assert!(bind_tun_outbounds(&mut config, "Wi-Fi")
             .unwrap_err()
             .starts_with("TUN_BINDING_CONFLICT"));
-    }
-}
-/// Provider/core preflight projection. It is never the launched configuration:
-/// actual TUN validation still occurs after confirmed owned-runtime teardown.
-pub(crate) fn config_preflight_projection(config: &Value) -> Result<Value, String> {
-    let inbounds = config
-        .get("inbounds")
-        .and_then(Value::as_array)
-        .ok_or("CONFIG_PREFLIGHT_INBOUNDS_INVALID")?;
-    for inbound in inbounds {
-        let protocol = inbound
-            .get("protocol")
-            .and_then(Value::as_str)
-            .ok_or("CONFIG_PREFLIGHT_INBOUNDS_INVALID")?;
-        if protocol.eq_ignore_ascii_case("tun") && protocol != "tun" {
-            return Err("CONFIG_PREFLIGHT_INBOUNDS_INVALID".into());
-        }
-    }
-    let mut projection = config.clone();
-    projection["inbounds"] = json!(inbounds
-        .iter()
-        .filter(|entry| entry["protocol"] != "tun")
-        .collect::<Vec<_>>());
-    Ok(projection)
-}
-
-#[cfg(test)]
-mod preflight_projection_tests {
-    use super::*;
-    #[test]
-    fn strips_only_tun_inbounds_preserves_original_graph_and_never_becomes_runtime_config() {
-        let config = json!({"inbounds":[{"tag":"tun-in","protocol":"tun","settings":{"MTU":1400}},{"tag":"http-in","protocol":"http","port":10809}],"outbounds":[{"tag":"proxy","protocol":"freedom"}],"routing":{"rules":[{"inboundTag":["tun-in"],"outboundTag":"proxy"}]},"dns":{"servers":["localhost"]}});
-        let snapshot = config.clone();
-        let projected = config_preflight_projection(&config).unwrap();
-        assert_eq!(config, snapshot);
-        assert_eq!(projected["inbounds"].as_array().unwrap().len(), 1);
-        assert_eq!(projected["inbounds"][0]["tag"], "http-in");
-        for field in ["outbounds", "routing", "dns"] {
-            assert_eq!(projected[field], config[field]);
-        }
-        assert_eq!(config["inbounds"][0]["protocol"], "tun");
-    }
-    #[test]
-    fn malformed_or_noncanonical_inbound_protocols_fail_without_editing_original() {
-        for config in [
-            json!(null),
-            json!({}),
-            json!({"inbounds":{}}),
-            json!({"inbounds":[null]}),
-            json!({"inbounds":[{"protocol":null}]}),
-            json!({"inbounds":[{"protocol":"TUN"}]}),
-        ] {
-            let before = config.clone();
-            assert!(config_preflight_projection(&config).is_err());
-            assert_eq!(config, before);
-        }
-    }
-    #[test]
-    fn generated_large_lists_remove_every_tun_and_preserve_non_tun_order() {
-        for count in [0, 1, 2, 10, 256] {
-            let entries = (0..count)
-                .map(|n| json!({"tag":format!("in-{n}"),"protocol":if n%3==0{"tun"}else{"socks"}}))
-                .collect::<Vec<_>>();
-            let config = json!({"inbounds":entries});
-            let result = config_preflight_projection(&config).unwrap();
-            let expected = config["inbounds"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|i| i["protocol"] != "tun")
-                .cloned()
-                .collect::<Vec<_>>();
-            assert_eq!(result["inbounds"], json!(expected));
-        }
-    }
-    #[cfg(windows)]
-    #[test]
-    fn failed_core_preflight_cleans_only_its_owned_projection_and_keeps_original() {
-        let root = std::env::temp_dir().join(format!(
-            "vkarmani-preflight-fixture-{}",
-            crate::durable_state::random_state_id().unwrap()
-        ));
-        fs::create_dir(&root).unwrap();
-        let path = root.join("xray-config-owned.json");
-        let original = b"original-owned-fixture";
-        fs::write(&path, original).unwrap();
-        let config = json!({"inbounds":[{"protocol":"tun"}],"outbounds":[{"protocol":"freedom","tag":"direct"}]});
-        assert!(
-            validate_config_projection(&root.join("missing-core.exe"), &path, &config).is_err()
-        );
-        assert_eq!(fs::read(&path).unwrap(), original);
-        assert!(!path.with_extension("preflight.json").exists());
-        assert_eq!(
-            root.parent().unwrap().canonicalize().unwrap(),
-            std::env::temp_dir().canonicalize().unwrap()
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-    #[cfg(windows)]
-    #[test]
-    fn existing_projection_is_not_overwritten_or_removed_on_collision() {
-        let root = std::env::temp_dir().join(format!(
-            "vkarmani-preflight-fixture-{}",
-            crate::durable_state::random_state_id().unwrap()
-        ));
-        fs::create_dir(&root).unwrap();
-        let path = root.join("xray-config-owned.json");
-        let prior = path.with_extension("preflight.json");
-        fs::write(&prior, b"owned-prior-file").unwrap();
-        assert!(validate_config_projection(
-            &root.join("missing-core.exe"),
-            &path,
-            &json!({"inbounds":[]})
-        )
-        .is_err());
-        assert_eq!(fs::read(&prior).unwrap(), b"owned-prior-file");
-        assert_eq!(
-            root.parent().unwrap().canonicalize().unwrap(),
-            std::env::temp_dir().canonicalize().unwrap()
-        );
-        fs::remove_dir_all(root).unwrap();
     }
 }

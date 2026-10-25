@@ -6,8 +6,6 @@ import { applyPingBatch, runPingBatch } from '../utils/pingBatch';
 import { EMPTY_PING_PROGRESS, type PingProgressState } from '../types/appState';
 import type { AppSettings, ConnectivityProbe, ConnectionState, RuntimeStatus, ToastItem, VpnServer } from '../types/vpn';
 
-const networkTransition = (state: ConnectionState) => state === 'connecting' || state === 'disconnecting';
-
 interface UsePingManagerArgs {
   servers: VpnServer[];
   setServers: Dispatch<SetStateAction<VpnServer[]>>;
@@ -36,6 +34,7 @@ export function usePingManager({
   connectedServerId,
   runtimeStatus,
   language,
+  setConnectivityProbe,
   pushToast,
   refreshDiagnosticsAndRuntime,
   onMeasurementsCommitted
@@ -110,10 +109,6 @@ export function usePingManager({
 
   const refreshPing = useCallback(async (options: PingOptions = {}) => {
     if (inFlightRef.current) return;
-    if (networkTransition(connectionStateRef.current)) {
-      pendingFullReasonRef.current = options.reason ?? 'network-transition';
-      return;
-    }
     const snapshot = serversRef.current;
     const activeId = connectionStateRef.current === 'connected'
       ? connectedServerIdRef.current || runtimeStatusRef.current.lastPreparedServerId || selectedServerIdRef.current : selectedServerIdRef.current;
@@ -138,14 +133,15 @@ export function usePingManager({
       const batch = await runPingBatch(targets, pingNativeServer, controller.signal, completed => {
         if (runIdRef.current === runId && mountedRef.current) setPingProgress({ active: true, total: targets.length, completed, success: 0, failed: 0 });
       });
-      if (runIdRef.current !== runId || controller.signal.aborted || !mountedRef.current || serversRef.current !== snapshot
-        || networkTransition(connectionStateRef.current)) return;
+      if (runIdRef.current !== runId || controller.signal.aborted || !mountedRef.current || serversRef.current !== snapshot) return;
       const measured = applyPingBatch(snapshot, snapshot, batch);
       if (onMeasurementsRef.current?.(measured, snapshot) === false) return;
       serversRef.current = measured;
       setServers(measured);
-      // Server TCP RTT does not observe local listeners or VPN/TUN egress.
-      // Publish only server measurements; keep the independent connectivity result.
+      const probe = batch.results.find(result => result.id === activeId)?.probe;
+      const currentId = connectionStateRef.current === 'connected'
+        ? connectedServerIdRef.current || runtimeStatusRef.current.lastPreparedServerId || selectedServerIdRef.current : selectedServerIdRef.current;
+      if (probe && activeId === currentId) setConnectivityProbe(probe);
       void writeNativeRoutingLog('Ping batch complete.', `total=${targets.length}; success=${batch.success}; timeout=${batch.timeout}; unreachable=${batch.unreachable}; cancelled=${batch.cancelled}; durationMs=${Math.round(batch.durationMs)}`);
       void refreshDiagnosticsAndRuntime();
       if (!options.silent) pushToast(tr(languageRef.current,
@@ -160,7 +156,7 @@ export function usePingManager({
         }
       }
     }
-  }, [getPingableServers, pushToast, refreshDiagnosticsAndRuntime, setServers]);
+  }, [getPingableServers, pushToast, refreshDiagnosticsAndRuntime, setConnectivityProbe, setServers]);
 
   const scheduleAutoPing = useCallback((reason = 'auto-main-refresh', delayMs = 450) => {
     pendingFullReasonRef.current = reason;
@@ -220,9 +216,6 @@ export function usePingManager({
   // Catalog replacements invalidate application by snapshot identity, but let
   // the bounded old batch drain before a coalesced full refresh starts.
   useEffect(() => { if (inFlightRef.current) cancelPing(true); }, [connectionState, selectedServerId, connectedServerId, cancelPing]);
-  useEffect(() => {
-    if (connectionState === 'idle' || connectionState === 'connected') drainFullRef.current();
-  }, [connectionState]);
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; cancelPing(); };

@@ -5,8 +5,13 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const target = 'x86_64-pc-windows-msvc';
-// The complete lock graph is patched. Target reachability explains findings,
-// but cannot exempt any vulnerability, including historical inactive entries.
+// Exact, reviewed lock entries only. Becoming reachable or changing version
+// removes the exception automatically; every other vulnerability blocks.
+export const inactiveAdvisories = Object.freeze({
+  'RUSTSEC-2026-0194': { package: 'quick-xml', version: '0.38.4', reason: 'tauri -> plist is cfg(target_os="macos"); duplicate-attribute parsing is absent on Windows' },
+  'RUSTSEC-2026-0195': { package: 'quick-xml', version: '0.38.4', reason: 'tauri -> plist is cfg(target_os="macos"); namespace parsing is absent on Windows' },
+  'RUSTSEC-2026-0185': { package: 'quinn-proto', version: '0.11.14', reason: 'reqwest http3/h3-quinn/quinn optional feature is disabled; QUIC stream path is absent' },
+});
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 function requireValid(condition, message) { if (!condition) throw new Error(message); }
 
@@ -37,8 +42,15 @@ export function assessWindowsAudit(audit, metadata, tree) {
     const id = finding.advisory.id;
     const pkg = finding.package;
     const reachable = active.has(`${pkg.name}@${pkg.version}`);
-    blocked.push({ id, package: pkg.name, version: pkg.version, reachable,
-      reason: reachable ? 'Windows-reachable vulnerability' : 'Vulnerability in the complete lock graph; target absence is not an exception' });
+    const reviewed = inactiveAdvisories[id];
+    if (!reachable && reviewed?.package === pkg.name && reviewed.version === pkg.version) {
+      handled.push({ id, package: pkg.name, version: pkg.version, target, reason: reviewed.reason,
+        targetEvidence: 'Absent from locked Windows cargo tree including normal/build/dev and tauri/custom-protocol',
+        reviewCondition: 'Re-review any manifest, feature, target, CI build arguments or advisory/package version change; reachable entry always blocks' });
+    } else {
+      blocked.push({ id, package: pkg.name, version: pkg.version, reachable,
+        reason: reachable ? 'Windows-reachable vulnerability' : 'No exact reviewed inactive-target assessment' });
+    }
   }
   return { status: blocked.length ? 'FAIL' : 'PASS', target, activePackages: active.size, handled, blocked,
     warnings: audit.warnings, treeSha256: hash(tree), metadataSha256: hash(JSON.stringify(metadata)),

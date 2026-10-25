@@ -18,7 +18,6 @@ pub(crate) struct ManagedCore {
     pub(crate) started_at: String,
     pub(crate) telemetry_epoch: u64,
     pub(crate) network_mode: String,
-    pub(crate) tun_routing_mode: Option<String>,
     pub(crate) tun_interface_name: Option<String>,
     pub(crate) tun_server_ips: Vec<String>,
     pub(crate) self_restart_count: u8,
@@ -28,8 +27,6 @@ pub(crate) struct ManagedCore {
 
 #[derive(Default)]
 pub(crate) struct AppState {
-    pub(crate) startup: Mutex<StartupSupervisor>,
-    pub(crate) repair_plans: Mutex<crate::repair_plan::RepairPlans>,
     pub(crate) restart_requested: std::sync::atomic::AtomicBool,
     pub(crate) connected: Mutex<bool>,
     pub(crate) active_server_label: Mutex<Option<String>>,
@@ -40,16 +37,11 @@ pub(crate) struct AppState {
     pub(crate) physical_recovery: Mutex<PhysicalRecoveryPolicy>,
     pub(crate) starting_runtime: Mutex<Option<StartingCore>>,
     pub(crate) last_exit_code: Mutex<Option<i32>>,
-    pub(crate) last_connect_failure:
-        Mutex<Option<crate::diagnostic_facts::ConnectFailureObservation>>,
     pub(crate) operation_lock: Mutex<()>,
     pub(crate) operation_machine: Mutex<OperationMachine>,
     pub(crate) operation_generation: std::sync::atomic::AtomicU64,
     pub(crate) stop_requested: std::sync::atomic::AtomicBool,
     pub(crate) storage_lock: Mutex<()>,
-    pub(crate) storage_closed: std::sync::atomic::AtomicBool,
-    pub(crate) exit_approved: std::sync::atomic::AtomicBool,
-    pub(crate) state_handoff: Mutex<StateHandoff>,
     pub(crate) session_authorized: Mutex<bool>,
     pub(crate) session_authorization: Mutex<Option<NativeSessionAuthorization>>,
     pub(crate) subscription_lock: Mutex<()>,
@@ -99,7 +91,6 @@ pub(crate) struct RuntimeStatus {
     pub(crate) proxy_server: Option<String>,
     pub(crate) proxy_bypass: Option<String>,
     pub(crate) network_mode: Option<String>,
-    pub(crate) tun_routing_mode: Option<String>,
     pub(crate) tun_interface_name: Option<String>,
     pub(crate) xray_pid: Option<u32>,
     pub(crate) runtime_config_hash: Option<String>,
@@ -157,7 +148,6 @@ pub(crate) struct NativeAppInfo {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConnectivityProbe {
-    pub(crate) kind: &'static str,
     pub(crate) success: bool,
     pub(crate) checked_at: String,
     pub(crate) http_port_open: bool,
