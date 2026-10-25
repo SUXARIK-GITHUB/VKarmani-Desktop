@@ -1,85 +1,88 @@
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(target_os = "windows")]
-#[link(name = "Kernel32")]
-unsafe extern "system" {
-    fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
-}
-
-#[cfg(target_os = "windows")]
-fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    let wide = |path: &Path| -> std::io::Result<Vec<u16>> {
-        let mut text: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if text.contains(&0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "NUL path",
-            ));
-        }
-        text.push(0);
-        Ok(text)
-    };
-    let src = wide(source)?;
-    let dst = wide(destination)?;
-    // One same-directory rename with replacement/write-through, never the
-    // old delete-then-rename fallback. The new file inherits its owned state
-    // directory ACL. ReplaceFileW without a recovery backup can lose the old
-    // filename on ERROR_UNABLE_TO_MOVE_REPLACEMENT; do not use that sequence.
-    let ok = unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), 0x1 | 0x8) };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::rename(source, destination)
-}
-
+// Journals and durable state must share the same path guards and bounded
+// sharing-conflict policy. No delete-first or generic access-denied fallback.
 pub(crate) fn atomic_write_text(path: &Path, payload: &str, context: &str) -> Result<(), String> {
-    if payload.len() as u64 > ENCRYPTED_STATE_MAX_BYTES {
-        return Err(format!("{context}: файл состояния слишком большой"));
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{context}: нет каталога состояния"))?;
-    fs::create_dir_all(parent).map_err(|error| format!("{context}: создание каталога: {error}"))?;
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|time| time.as_nanos())
-        .unwrap_or_default();
-    let temporary = parent.join(format!(
-        ".vkarmani-state-{}-{nonce}-{}.tmp",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| format!("{context}: создание временного файла: {error}"))?;
-    let result = (|| {
-        file.write_all(payload.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        replace_file(&temporary, path)
-    })();
-    if result.is_err() {
-        // This exact temporary file was created above by this invocation.
-        // The old target is never explicitly removed, even on replace failure.
-        let _ = fs::remove_file(&temporary);
-    }
-    result.map_err(|error| format!("{context}: atomic replacement: {error}"))
+    crate::compat_storage::atomic_write_state_text_with_limit(
+        path,
+        payload,
+        ENCRYPTED_STATE_MAX_BYTES,
+    )
+    .map_err(|error| format!("{context}: atomic replacement: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(windows)]
+    fn production_journal_writer_rejects_hardlinked_targets() {
+        let root = std::env::temp_dir().join(format!(
+            "vkarmani-journal-guard-{}",
+            crate::compat_storage::durable::random_state_id().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let original = root.join("synthetic-original.dpapi");
+        let target = root.join("system-proxy-ownership-v2.dpapi");
+        fs::write(&original, "original").unwrap();
+        fs::hard_link(&original, &target).unwrap();
+        let result = atomic_write_text(&target, "must-not-write", "Proxy journal");
+        let actual = fs::read_to_string(&target).unwrap();
+        let preserved = fs::read_to_string(&original).unwrap();
+        fs::remove_file(target).unwrap();
+        fs::remove_file(original).unwrap();
+        fs::remove_dir(root).unwrap();
+        assert!(result.is_err(), "unsafe journal target must be refused");
+        assert_eq!(actual, "original");
+        assert_eq!(preserved, "original");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn production_journal_writer_rejects_junction_parents() {
+        let root = std::env::temp_dir().join(format!(
+            "vkarmani-journal-parent-{}",
+            crate::compat_storage::durable::random_state_id().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let outside = root.join("synthetic-other-owner");
+        fs::create_dir(&outside).unwrap();
+        let link = root.join("linked-parent");
+        let mut command = Command::new(
+            system_program("reg")
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("cmd.exe"),
+        );
+        command
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside);
+        run_command_with_timeout(
+            command,
+            Duration::from_secs(3),
+            "synthetic journal junction",
+        )
+        .unwrap();
+        let actual_path = outside.join("owned-tun-routes-v1.dpapi");
+        fs::write(&actual_path, "original").unwrap();
+        let result = atomic_write_text(
+            &link.join("owned-tun-routes-v1.dpapi"),
+            "must-not-write",
+            "Owned routes",
+        );
+        let actual = fs::read_to_string(&actual_path).unwrap();
+        fs::remove_dir(link).unwrap();
+        fs::remove_file(actual_path).unwrap();
+        fs::remove_dir(outside).unwrap();
+        fs::remove_dir(root).unwrap();
+        assert!(
+            result.is_err(),
+            "a journal must not escape through a junction"
+        );
+        assert_eq!(actual, "original");
+    }
     #[test]
     fn state_replacement_and_failure_leave_last_good_target_intact() {
         let dir = std::env::temp_dir().join(format!(
