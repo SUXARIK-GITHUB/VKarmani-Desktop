@@ -20,6 +20,29 @@ import { defaultSettings } from '../src/services/storage';
 const profile = (input = auto) => parse(JSON.stringify(input))[0];
 const reply = (latencyMs: number, success = true): ConnectivityProbe => ({ success, latencyMs, checkedAt:'synthetic', httpPortOpen:false, socksPortOpen:false, message:'synthetic' });
 const ordinary = (id: string): VpnServer => ({ id, country:id, city:'', flag:'', protocol:'Xray', load:0, host:`${id}.example.test`, port:443 });
+
+describe('country metadata and Belarus flag regressions', () => {
+  it.each(['BY', 'by', 'Belarus', 'Беларусь', 'Belarus→S1', '🇧🇾 Belarus'])('renders an SVG BY flag for %s', country => {
+    const server = { ...ordinary('by-node'), country };
+    expect(getServerCountryCode(server)).toBe('BY');
+    const markup = renderToStaticMarkup(<ServerFlag server={server} />);
+    expect(markup).toContain('<svg'); expect(markup).toContain('Флаг BY'); expect(markup).not.toContain('vk-flag-fallback');
+    expect(resolveServerFlag(server)).toBe('🇧🇾');
+  });
+  it('gives explicit country metadata priority over stale flags and labels', () => {
+    const server = { ...ordinary('node'), country: 'Germany', countryCode: 'by', flag: '🇩🇪', rawLabel: 'DE server' };
+    expect(getServerCountryCode(server)).toBe('BY'); expect(resolveServerFlag(server)).toBe('🇧🇾');
+    expect(getServerCountryCode({ ...server, flag: 'DE' })).toBe('BY');
+  });
+  it.each(['node.io', 'node.de', 'node.by', '127.0.0.1'])('does not infer country from arbitrary host %s', host => {
+    const server = { ...ordinary('unknown'), host };
+    expect(getServerCountryCode(server)).toBeUndefined(); expect(resolveServerFlag(server)).toBe('🌐');
+  });
+  it.each(['EU', 'NL', 'PL', 'DE', 'US'])('retains existing SVG %s flags', countryCode => {
+    expect(renderToStaticMarkup(<ServerFlag server={{ ...ordinary('node'), countryCode }} />)).toContain('<svg');
+  });
+});
+
 describe('Auto logical measurement in the shared queue', () => {
   it('measures selected graph members, not the representative endpoint or cached member tags', () => {
     const p = profile(); p.runtimeTemplate!.memberTags = ['direct']; p.host = 'wrong.example.test';

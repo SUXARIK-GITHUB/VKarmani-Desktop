@@ -2,6 +2,9 @@ const FLAG_RE = /[\u{1F1E6}-\u{1F1FF}]{2}/u;
 
 const COUNTRY_NAME_TO_CODE: Record<string, string> = {
   eu: 'EU',
+  by: 'BY',
+  belarus: 'BY',
+  беларусь: 'BY',
   nl: 'NL',
   netherland: 'NL',
   netherlands: 'NL',
@@ -108,6 +111,7 @@ const COUNTRY_NAME_TO_CODE: Record<string, string> = {
 };
 
 const COUNTRY_CODE_TO_NAME: Record<string, string> = {
+  BY: 'Belarus',
   NL: 'Netherlands',
   DE: 'Germany',
   RU: 'Russia',
@@ -203,7 +207,6 @@ export function looksLikeHost(value?: string | null) {
 export function inferCountryCode({
   country,
   rawLabel,
-  host,
   explicitCode
 }: {
   country?: string | null;
@@ -246,11 +249,6 @@ export function inferCountryCode({
     }
   }
 
-  const tld = host?.trim().split('.').pop()?.toUpperCase();
-  if (tld && /^[A-Z]{2}$/.test(tld)) {
-    return tld;
-  }
-
   return undefined;
 }
 
@@ -261,6 +259,8 @@ export function getServerCountryCode(server: {
   host?: string | null;
   flag?: string | null;
 }) {
+  const explicit = server.countryCode?.trim().toUpperCase();
+  if (explicit && /^[A-Z]{2}$/.test(explicit)) return explicit;
   const normalizedFlag = server.flag?.trim();
 
   if (normalizedFlag && /^[A-Z]{2}$/i.test(normalizedFlag)) {
@@ -296,6 +296,8 @@ export function resolveServerFlag({
   host?: string | null;
   explicitCode?: string | null;
 }) {
+  const explicit = (countryCode || explicitCode)?.trim().toUpperCase();
+  if (explicit && /^[A-Z]{2}$/.test(explicit)) return flagEmojiFromCountryCode(explicit);
   const normalizedFlag = flag?.trim();
 
   if (normalizedFlag && normalizedFlag !== '🌐') {
