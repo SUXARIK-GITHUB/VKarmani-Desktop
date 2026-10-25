@@ -199,10 +199,26 @@ let bootstrapState: Promise<void> | null = null;
 // A failed initial native restore cannot authorize the 0.13.76 autosave effects
 // to replace durable values with render defaults. Restart/recovery reloads them.
 let nativeRestoreFailed = false;
+
+function validateNativeSettings(value: unknown): void {
+  // A genuinely missing legacy preference can use the documented migration.
+  // A present invalid policy must never become ALL while retaining autoconnect.
+  if (value === undefined) return;
+  const settings = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : null;
+  if (!settings || settings.tunRoutingModeInvalid === true
+    || (Object.prototype.hasOwnProperty.call(settings, 'tunRoutingMode')
+      && (typeof settings.tunRoutingMode !== 'string'
+        || !['all', 'selected', 'exclude'].includes(settings.tunRoutingMode)))) {
+    throw new NativeStorageError('STATE_SETTINGS_INVALID', 'Сохранённая политика TUN недопустима. Автозапуск и сохранение заблокированы; оригиналы сохранены.', false);
+  }
+}
+
 function initializeNativeState(): Promise<void> {
   if (!bootstrapState) {
     bootstrapState = (async () => {
       const current = await readNativeState();
+      validateNativeSettings(current.payload.public[NATIVE_SETTINGS_KEY]);
       if (legacyMirrorAtBoot && Object.keys(legacyMirrorAtBoot).length && current.payload.legacyWebView === null) {
         // Retain the original mirror encrypted before any hydration/autosave
         // can replace it. It is evidence, never an automatic native override.

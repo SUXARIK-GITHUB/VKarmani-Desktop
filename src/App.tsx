@@ -436,21 +436,21 @@ export default function App() {
   }, [activeTab]);
 
   useEffect(() => {
-    if (!settings.runAsAdmin || hasTriedAdminLaunch.current) {
+    if (!persistentStateReady || !settings.runAsAdmin || hasTriedAdminLaunch.current) {
       return;
     }
 
     hasTriedAdminLaunch.current = true;
     void ensureAdminLaunch(settings.runAsAdmin).catch(() => undefined);
-  }, [settings.runAsAdmin]);
+  }, [settings.runAsAdmin, persistentStateReady]);
 
   useEffect(() => {
-    if (!isTauriRuntime) {
+    if (!isTauriRuntime || !persistentStateReady) {
       return;
     }
 
     void setNativeLaunchOnStartup(settings.launchOnStartup).catch(() => undefined);
-  }, [settings.launchOnStartup]);
+  }, [settings.launchOnStartup, persistentStateReady]);
 
   useEffect(() => {
     if (!settings.showDiagnostics && activeTab === 'diagnostics') {
