@@ -992,6 +992,18 @@ export class RemnawaveClient {
     return this.cachedSession;
   }
 
+  clearSessionCache() {
+    this.invalidateProfileSync();
+    this.cachedSession = null;
+    this.cachedServers = [];
+    this.cachedDevices = [buildLocalDeviceRecord()];
+    this.lastProbe = null;
+    this.profileSyncInfo = {
+      status: 'idle', source: 'demo', sourceLabel: 'Ожидание live sync', configCount: 0,
+      message: 'Серверы появятся после синхронизации вашего профиля Remnawave.'
+    };
+  }
+
   updateCachedMeasurements(servers: VpnServer[]) {
     this.cachedServers = mergeServerMeasurements(this.cachedServers, servers);
   }

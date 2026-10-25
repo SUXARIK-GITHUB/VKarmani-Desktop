@@ -2822,6 +2822,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         await clearLastKnownServers();
         authorizedAccessKeyRef.current = '';
         await setNativeSessionAuthorized(false);
+        remnawaveClient.clearSessionCache();
         setAccessKey('');
         setIsAuthorized(false);
         setSession(null);

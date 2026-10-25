@@ -11,6 +11,29 @@ const config=(name:string)=>({remarks:name,outbounds:[{tag:'proxy',protocol:'vle
 beforeEach(()=>{vi.stubGlobal('window',{setTimeout,clearTimeout});mocks.fetch.mockReset();mocks.json.mockReset();mocks.cache.mockReset();mocks.cache.mockResolvedValue(undefined);});
 afterEach(()=>vi.unstubAllGlobals());
 describe('actual subscription-client atomic refresh and generation ownership',()=>{
+  it('confirmed logout clears the old catalog so a different key cannot inherit its larger profile', async () => {
+    const client = new RemnawaveClient();
+    mocks.fetch.mockResolvedValue(JSON.stringify([config('OldA'), config('OldB')]));
+    await client.authorizeByAccessKey(key);
+    expect(await client.loadServers()).toHaveLength(2); expect(client.getCachedSession()).not.toBeNull();
+    client.clearSessionCache();
+    expect(await client.loadServers()).toEqual([]); expect(client.getCachedSession()).toBeNull();
+    expect(client.getProfileSyncInfo()).toMatchObject({ status: 'idle', configCount: 0 });
+    expect(client.getProfileSyncInfo().rawUrl).toBeUndefined();
+    mocks.fetch.mockResolvedValue(JSON.stringify(config('NewAccount')));
+    const session = await client.authorizeByAccessKey(key + '-different');
+    expect(session.accessKey).toBe(key + '-different');
+    expect((await client.loadServers()).map(s => s.rawLabel)).toEqual(['NewAccount']);
+  });
+  it('cache retirement revokes pending authorization and sync before either can repopulate it', async () => {
+    for (const method of ['authorizeByAccessKey', 'syncProfile'] as const) {
+      const client = new RemnawaveClient(); let release!: (value: string) => void;
+      mocks.fetch.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+      const pending = client[method](key); const rejected = expect(pending).rejects.toThrow('PROFILE_SYNC_CANCELLED');
+      client.clearSessionCache(); release(JSON.stringify(config('Stale'))); await rejected;
+      expect(await client.loadServers()).toEqual([]); expect(client.getCachedSession()).toBeNull();
+    }
+  });
   it('revokes pending authorization as well as sync, without stale cache or fallback', async () => {
     const client = new RemnawaveClient(); let release!: (value: string) => void;
     mocks.fetch.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
