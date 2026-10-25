@@ -317,15 +317,23 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
     setPersistentStateReady(true);
   }
 
-  function reportPersistentFailure(error: unknown) {
+  function invalidateProfileWork(resetUi = true) {
     recoveryEpochRef.current++;
+    profileSyncGenerationRef.current++;
+    profileSyncInFlightRef.current = false;
+    remnawaveClient.invalidateProfileSync();
+    if (resetUi) { setAuthLoading(false); setIsSyncingProfile(false); }
+  }
+
+  function reportPersistentFailure(error: unknown) {
+    invalidateProfileWork();
     recoveryModeRef.current = true;
     setStorageIssue(storageFailure(error)); setRecoveryMode(true);
   }
 
   async function handleStorageRecovery(confirmBackup = false) {
     if (storageRecoveryLock.current) return;
-    storageRecoveryLock.current = true; recoveryEpochRef.current++; recoveryModeRef.current = true; setStorageRecoveryBusy(true); setRecoveryMode(true);
+    storageRecoveryLock.current = true; invalidateProfileWork(); recoveryModeRef.current = true; setStorageRecoveryBusy(true); setRecoveryMode(true);
     try {
       if (!confirmBackup) {
         const preview = await inspectPersistentRecovery();
@@ -349,7 +357,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
     recoveryModeRef.current = recoveryMode;
     const handler = (event: Event) => reportPersistentFailure((event as CustomEvent).detail);
     window.addEventListener('vkarmani:storage-error', handler);
-    return () => { recoveryEpochRef.current++; recoveryModeRef.current = true; window.removeEventListener('vkarmani:storage-error', handler); };
+    return () => { invalidateProfileWork(false); recoveryModeRef.current = true; window.removeEventListener('vkarmani:storage-error', handler); };
   }, []);
 
   useEffect(() => {
@@ -1942,14 +1950,18 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       // prevent the canonical full batch after a successful subscription sync.
       if (result.profile.status === 'ready') scheduleAutoPing(silent ? 'silent-profile-sync' : 'manual-profile-sync');
       try {
-        setDevices(await remnawaveClient.loadDevices());
+        const devices = await remnawaveClient.loadDevices();
+        if (syncGeneration !== profileSyncGenerationRef.current) return null;
+        setDevices(devices);
       } catch (error) {
+        if (syncGeneration !== profileSyncGenerationRef.current) return null;
         void writeNativeInterfaceLog('Не удалось обновить список устройств после синхронизации.', normalizeNativeError(error, 'Device refresh failed.').message);
       }
 
       if (!isConnectionActionBusy()) {
         await refreshDiagnosticsAndRuntime();
       }
+      if (syncGeneration !== profileSyncGenerationRef.current) return null;
       void writeNativeInterfaceLog(
         'Профиль Remnawave синхронизирован.',
         `${result.profile.configCount} конфигов | источник: ${result.profile.sourceLabel}`
@@ -1995,7 +2007,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       return;
     }
 
-    const recoveryEpoch = recoveryEpochRef.current;
+    const recoveryEpoch = ++recoveryEpochRef.current;
     try {
       const currentSettings = settingsRef.current;
       void writeNativeInterfaceLog(connectFavoriteAfterLaunch ? 'Начата авторизация по сохранённому ключу для автоподключения.' : 'Начата авторизация по ключу доступа.');
@@ -2090,6 +2102,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         void handleConnectionToggle(preferredServerForAutoConnect);
       }
     } catch (error) {
+      if (recoveryEpoch !== recoveryEpochRef.current) return;
       void writeNativeInterfaceLog(
         'Ошибка авторизации по ключу доступа.',
         normalizeNativeError(error, 'unknown-error').message
@@ -2098,7 +2111,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       setErrorText(message);
       pushToast(message, 'error');
     } finally {
-      setAuthLoading(false);
+      if (recoveryEpoch === recoveryEpochRef.current) setAuthLoading(false);
     }
   }
 
@@ -2761,7 +2774,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       try {
         // No invalidation, disconnect or deletion before durable save succeeds.
         await flushPersistentWrites();
-        profileSyncGenerationRef.current++; remnawaveClient.invalidateProfileSync(); cancelPing();
+        invalidateProfileWork(); cancelPing();
         clearPendingConnectionQueue();
 
         if (isConnectionActionBusy()) {

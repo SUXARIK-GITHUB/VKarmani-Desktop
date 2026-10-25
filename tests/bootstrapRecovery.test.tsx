@@ -15,7 +15,15 @@ function appFunction(name: string, bindings: Record<string, unknown>) {
   const visit = (node: ts.Node) => { if (ts.isFunctionDeclaration(node) && node.name?.text === name) found = node; ts.forEachChild(node, visit); };
   visit(appSource); expect(found).toBeDefined();
   const js = ts.transpileModule(found!.getText(appSource), { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
+  if (name !== 'invalidateProfileWork' && js.includes('invalidateProfileWork(')) {
+    bindings = { ...bindings, invalidateProfileWork: appFunction('invalidateProfileWork', bindings) };
+  }
   return new Function('bindings', 'const {' + Object.keys(bindings).join(',') + '}=bindings;' + js + ';return ' + name + ';')(bindings);
+}
+
+function profileWorkBindings() {
+  return { profileSyncGenerationRef: { current: 7 }, profileSyncInFlightRef: { current: true },
+    remnawaveClient: { invalidateProfileSync: vi.fn() }, setAuthLoading: vi.fn(), setIsSyncingProfile: vi.fn() };
 }
 
 it('contains render/import failures without displaying exception credentials, retry requests safe start', () => {
@@ -52,7 +60,7 @@ it('initial storage failure blocks authorization before remote validation withou
 it('backup preview never restores; explicit confirmation passes only the reviewed token; duplicates are ignored', async () => {
   const token = 'a'.repeat(64); const reload = vi.fn().mockResolvedValue({ selected: 'saved' }); const apply = vi.fn();
   const preview = vi.fn().mockResolvedValue({ readOnly: true, token }); const setToken = vi.fn(); const safe = vi.fn();
-  const common = { storageRecoveryLock: { current: false }, recoveryEpochRef: { current: 0 }, recoveryModeRef: { current: false }, setStorageRecoveryBusy: vi.fn(), setRecoveryMode: safe,
+  const common = { ...profileWorkBindings(), storageRecoveryLock: { current: false }, recoveryEpochRef: { current: 0 }, recoveryModeRef: { current: false }, setStorageRecoveryBusy: vi.fn(), setRecoveryMode: safe,
     inspectPersistentRecovery: preview, reloadPersistentSnapshot: reload, applyRestoredPersistentState: apply,
     setStorageIssue: vi.fn(), setStorageRecoveryToken: setToken, reportPersistentFailure: vi.fn(), NativeStorageError: Error };
   await appFunction('handleStorageRecovery', { ...common, storageRecoveryToken: null })(false);
@@ -67,7 +75,7 @@ it('backup preview never restores; explicit confirmation passes only the reviewe
 it('failed recovery retains the storage error, clears stale consent and releases the busy lock', async () => {
   const failure = new Error('STATE_RECOVERY_CHANGED'); const report = vi.fn(); const setToken = vi.fn();
   const lock = { current: false }; const busy = vi.fn(); const apply = vi.fn(); const clearIssue = vi.fn();
-  await appFunction('handleStorageRecovery', { storageRecoveryLock: lock, recoveryEpochRef: { current: 0 }, recoveryModeRef: { current: false }, setStorageRecoveryBusy: busy,
+  await appFunction('handleStorageRecovery', { ...profileWorkBindings(), storageRecoveryLock: lock, recoveryEpochRef: { current: 0 }, recoveryModeRef: { current: false }, setStorageRecoveryBusy: busy,
     setRecoveryMode: vi.fn(), storageRecoveryToken: 'a'.repeat(64), inspectPersistentRecovery: vi.fn(),
     reloadPersistentSnapshot: vi.fn().mockRejectedValue(failure), applyRestoredPersistentState: apply,
     setStorageIssue: clearIssue, setStorageRecoveryToken: setToken, reportPersistentFailure: report, NativeStorageError: Error })(true);
@@ -85,7 +93,7 @@ it('requesting logout opens confirmation without changing generation, profile, p
 
 function logoutBindings() {
   const idle = { bridge: 'tauri', nativeInstanceId: 'owned', runtimeRevision: 1, tunnelActive: false, proxyOwnership: 'none', routeOwnership: 'none', systemProxyEnabled: true };
-  const bindings: Record<string, any> = { isTauriRuntime: true, language: 'en', NativeStorageError, connectionFailureState,
+  const bindings: Record<string, any> = { ...profileWorkBindings(), recoveryEpochRef: { current: 4 }, isTauriRuntime: true, language: 'en', NativeStorageError, connectionFailureState,
     tr: (_: unknown, _ru: string, en: string) => en, runActionOnce: async (_: string, operation: () => Promise<void>) => operation(),
     flushPersistentWrites: vi.fn().mockResolvedValue(undefined), profileSyncGenerationRef: { current: 7 },
     remnawaveClient: { invalidateProfileSync: vi.fn(), disconnect: vi.fn().mockResolvedValue(undefined) },
@@ -105,6 +113,7 @@ it('confirmed logout refuses failed saves before disconnect, invalidation or key
   await run(); expect(b.profileSyncGenerationRef.current).toBe(7); expect(b.remnawaveClient.invalidateProfileSync).not.toHaveBeenCalled();
   expect(b.remnawaveClient.disconnect).not.toHaveBeenCalled(); expect(b.clearStoredAccessKey).not.toHaveBeenCalled();
   expect(b.reportPersistentFailure).toHaveBeenCalledWith(failure); expect(b.setConnectionStateSafe).toHaveBeenCalledExactlyOnceWith('connected');
+  expect(b.recoveryEpochRef.current).toBe(4); expect(b.profileSyncInFlightRef.current).toBe(true);
 });
 
 it.each([null, { bridge: 'tauri', operation: { kind: 'connect' } }, { bridge: 'tauri', proxyOwnership: 'unavailable' }])('unknown or busy runtime prevents credential deletion: %j', async runtime => {
@@ -128,6 +137,41 @@ it('a foreign proxy with no VKarmani ownership does not cause proxy restoration 
   expect(b.remnawaveClient.disconnect).not.toHaveBeenCalled(); expect(b.clearStoredAccessKey).toHaveBeenCalledTimes(1);
   expect(b.setIsAuthorized).toHaveBeenCalledWith(false);
   expect(b.flushPersistentWrites.mock.invocationCallOrder[0]).toBeLessThan(b.clearStoredAccessKey.mock.invocationCallOrder[0]);
+  expect(b.recoveryEpochRef.current).toBe(5); expect(b.profileSyncInFlightRef.current).toBe(false);
+  expect(b.setAuthLoading).toHaveBeenCalledWith(false); expect(b.setIsSyncingProfile).toHaveBeenCalledWith(false);
+});
+
+it('a superseded login error cannot overwrite newer loading, show an error or authorize a stale key', async () => {
+  const releases: Array<(value: unknown) => void> = []; const rejections: Array<(error: Error) => void> = [];
+  const epoch = { current: 0 }; const client = { authorizeByAccessKey: vi.fn(() => new Promise((resolve, reject) => { releases.push(resolve); rejections.push(reject); })),
+    loadDevices: vi.fn().mockResolvedValue([]), loadServers: vi.fn().mockResolvedValue([]) };
+  const b: Record<string, any> = { isTauriRuntime: true, persistentStateReady: true, recoveryEpochRef: epoch,
+    recoveryModeRef: { current: false }, settingsRef: { current: {} }, remnawaveClient: client,
+    authorizedAccessKeyRef: { current: '' }, overviewAutoRefreshAtRef: { current: 0 }, serversRef: { current: [] },
+    selectedServerIdRef: { current: '' }, selectedServer: null, mergeServerMeasurements: (v: unknown) => v,
+    saveStoredAccessKey: vi.fn().mockResolvedValue(true), setNativeSessionAuthorized: vi.fn().mockResolvedValue(true),
+    pickPreferredServer: () => null, tr: (_: unknown, ru: string) => ru, language: 'ru', normalizeNativeError: (e: Error) => e };
+  for (const name of ['writeNativeInterfaceLog','setAuthLoading','setErrorText','setAccessKey','setSession','setDevices','setIsAuthorized',
+    'pushToast','setProfileSyncInfo','handleConnectionToggle']) b[name] = vi.fn();
+  const authorize = appFunction('authorizeWithAccessKey', b);
+  const old = authorize('https://sub.vkarmani.com/old-synthetic');
+  const latest = authorize('https://sub.vkarmani.com/new-synthetic');
+  rejections[0](new Error('OLD_PROFILE_FAILURE')); await old;
+  expect(b.setAuthLoading.mock.calls).toEqual([[true],[true]]);
+  expect(b.setErrorText.mock.calls).toEqual([[''],['']]); expect(b.pushToast).not.toHaveBeenCalled();
+  releases[1]({ id: 'new' }); await latest;
+  expect(b.saveStoredAccessKey).toHaveBeenCalledExactlyOnceWith('https://sub.vkarmani.com/new-synthetic');
+  expect(b.setSession).toHaveBeenCalledExactlyOnceWith({ id: 'new' }); expect(b.setAuthLoading).toHaveBeenLastCalledWith(false);
+});
+
+it('profile invalidation releases stale busy flags, revokes client work and avoids UI writes on unmount', () => {
+  const b = { ...profileWorkBindings(), recoveryEpochRef: { current: 2 } };
+  const invalidate = appFunction('invalidateProfileWork', b); invalidate();
+  expect(b.recoveryEpochRef.current).toBe(3); expect(b.profileSyncGenerationRef.current).toBe(8);
+  expect(b.profileSyncInFlightRef.current).toBe(false); expect(b.remnawaveClient.invalidateProfileSync).toHaveBeenCalledTimes(1);
+  expect(b.setAuthLoading).toHaveBeenCalledWith(false); expect(b.setIsSyncingProfile).toHaveBeenCalledWith(false);
+  invalidate(false); expect(b.recoveryEpochRef.current).toBe(4);
+  expect(b.setAuthLoading).toHaveBeenCalledTimes(1); expect(b.setIsSyncingProfile).toHaveBeenCalledTimes(1);
 });
 
 it('confirmed owned disconnect is read back before deleting the key, preserving an unrelated proxy', async () => {
@@ -211,9 +255,10 @@ it('the actual recovery listener revokes pending automatic work immediately, sup
   }; find(appSource); expect(effect).toBeDefined();
   const ref = { current: false }; const setMode = vi.fn(); const setIssue = vi.fn();
   const epoch = { current: 0 };
-  const report = appFunction('reportPersistentFailure', { recoveryEpochRef: epoch, recoveryModeRef: ref, storageFailure, setStorageIssue: setIssue, setRecoveryMode: setMode });
+  const profile = { ...profileWorkBindings(), recoveryEpochRef: epoch };
+  const report = appFunction('reportPersistentFailure', { ...profile, recoveryModeRef: ref, storageFailure, setStorageIssue: setIssue, setRecoveryMode: setMode });
   let listener!: (event: unknown) => void;
-  const bindings = { recoveryMode: false, recoveryEpochRef: epoch, recoveryModeRef: ref, reportPersistentFailure: report,
+  const bindings = { recoveryMode: false, recoveryEpochRef: epoch, recoveryModeRef: ref, reportPersistentFailure: report, invalidateProfileWork: appFunction('invalidateProfileWork', profile),
     window: { addEventListener: (_: string, callback: typeof listener) => { listener = callback; }, removeEventListener: vi.fn() } };
   const js = ts.transpileModule('const effect=' + effect!.getText(appSource), { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
   const setup = new Function('bindings', 'const {' + Object.keys(bindings).join(',') + '}=bindings;' + js + ';return effect;')(bindings);
