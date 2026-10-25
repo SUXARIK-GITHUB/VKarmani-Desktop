@@ -2605,43 +2605,15 @@ export default function App() {
   }
 
   async function handleInstallUpdate(silent = false) {
-    if (updaterActionLock.current || connectionActionLock.current || ['checking', 'downloading', 'installing'].includes(updateInfoRef.current.status)) {
+    if (!persistentStateReady || updaterActionLock.current || isConnectionActionBusy() || ['checking', 'downloading', 'installing'].includes(updateInfoRef.current.status)) {
       return;
     }
 
     updaterActionLock.current = true;
     let installSucceeded = false;
+    let installationLease = false;
     void setNativeTrayUpdateState(Boolean(updateInfoRef.current.available), true);
     try {
-      if (isTauriRuntime || connectionStateRef.current === 'connected') {
-        setUpdateInfo((current: UpdateInfo) => ({
-          ...current,
-          status: 'installing',
-          message: tr(language, 'Отключаем VPN перед обновлением…', 'Disconnecting VPN before update…')
-        }));
-        try {
-          setConnectionStateSafe('disconnecting');
-          await remnawaveClient.disconnect({ useSystemProxy: proxyStatusRef.current.enabled || shouldUseSystemProxy(settingsRef.current.tunnelMode, settingsRef.current.useSystemProxy) });
-          setVpnExternalIp('—');
-          setSessionDuration(0);
-          setConnectivityProbe(null);
-          setConnectionStateSafe('idle');
-          await refreshDiagnosticsAndRuntime();
-        } catch (error) {
-          await refreshDiagnosticsAndRuntime().catch(() => undefined);
-          const message = normalizeNativeError(error, tr(language, 'Не удалось остановить VPN перед обновлением.', 'Failed to stop VPN before update.')).message;
-          setUpdateInfo((current: UpdateInfo) => ({
-            ...current,
-            status: 'error',
-            message
-          }));
-          if (!silent) {
-            pushToast(message, 'error');
-          }
-          return;
-        }
-      }
-
       setUpdateInfo((current: UpdateInfo) => ({
         ...current,
         status: 'downloading',
@@ -2656,6 +2628,19 @@ export default function App() {
           downloadedPercent: percent,
           message: percent >= 100 ? tr(language, 'Файлы загружены, запускаем установку…', 'Files are ready, starting installation…') : tr(language, 'Скачиваем обновление…', 'Downloading update…')
         }));
+      }, async () => {
+        // Download/signature verification and state flush are complete. Reserve
+        // connection commands across the fresh observation and installer handoff.
+        if (isConnectionActionBusy()) throw new Error(tr(language, 'Завершите текущее VPN-действие и повторите установку.', 'Finish the current VPN operation and retry installation.'));
+        connectionActionLock.current = true;
+        installationLease = true;
+        const runtime = isTauriRuntime ? await refreshDiagnosticsAndRuntime() : null;
+        if (isTauriRuntime && (!runtime || runtime.bridge !== 'tauri')) {
+          throw new Error(tr(language, 'Состояние VPN не подтверждено. Установка отложена; соединение не изменено.', 'VPN state is unconfirmed. Installation deferred; connection unchanged.'));
+        }
+        if (connectionStateRef.current !== 'idle' || runtime?.tunnelActive || runtime?.xrayPid || runtime?.operation || managedReconnectRef.current) {
+          throw new Error(tr(language, 'Обновление скачано и проверено. Отключите VPN и повторите установку. Соединение не изменено.', 'Update downloaded and verified. Disconnect VPN and retry installation. Connection unchanged.'));
+        }
       });
 
       if (!result.ok) {
@@ -2684,20 +2669,21 @@ export default function App() {
         pushToast(tr(language, 'Обновление подготовлено.', 'Update prepared.'), 'success');
       }
     } finally {
-      updaterActionLock.current = false;
-      void setNativeTrayUpdateState(installSucceeded ? false : Boolean(updateInfoRef.current.available), false);
+      if (installationLease && !installSucceeded) connectionActionLock.current = false;
+      updaterActionLock.current = installSucceeded;
+      void setNativeTrayUpdateState(installSucceeded ? false : Boolean(updateInfoRef.current.available), installSucceeded);
     }
   }
 
 
   useEffect(() => {
-    if (!settings.autoUpdate || hasAutoCheckedUpdates.current) {
+    if (!persistentStateReady || !settings.autoUpdate || hasAutoCheckedUpdates.current) {
       return;
     }
 
     hasAutoCheckedUpdates.current = true;
     void handleCheckUpdates(true, settings.autoInstallUpdates);
-  }, [settings.autoUpdate, settings.autoInstallUpdates, settings.releaseChannel]);
+  }, [settings.autoUpdate, settings.autoInstallUpdates, settings.releaseChannel, persistentStateReady]);
 
   function toggleSetting(key: keyof Omit<AppSettings, 'releaseChannel' | 'protocolStrategy' | 'language' | 'allowDemoFallback' | 'tunnelMode' | 'ipStack' | 'routingExclusions' | 'tunRoutingMode'>) {
     setSettings((current: AppSettings) => {
