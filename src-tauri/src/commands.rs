@@ -605,12 +605,10 @@ pub(crate) fn wait_for_xray_runtime_ready(
             ));
         }
 
-        let http_ready = tcp_port_open("127.0.0.1", HTTP_PORT, 80);
-        let socks_ready = tcp_port_open("127.0.0.1", SOCKS_PORT, 80);
-        let api_ready = tcp_port_open("127.0.0.1", XRAY_API_PORT, 80);
-        let ports_state = format!("http={http_ready} socks={socks_ready} api={api_ready}");
+        let owned_ready = runtime_listeners_ready(child)?;
+        let ports_state = format!("ownedListeners={owned_ready}");
 
-        if http_ready && socks_ready && api_ready {
+        if owned_ready {
             let _ =
                 append_runtime_event(app, &format!("Xray локальные порты готовы: {ports_state}."));
             return Ok(());
