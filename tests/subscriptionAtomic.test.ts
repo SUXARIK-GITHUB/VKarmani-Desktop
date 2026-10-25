@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-const mocks=vi.hoisted(()=>({fetch:vi.fn(),cache:vi.fn()}));
-vi.mock('../src/services/runtime',async importOriginal=>({ ...await importOriginal<typeof import('../src/services/runtime')>(),fetchRemoteText:mocks.fetch,cacheNativeProfileSync:mocks.cache }));
+const mocks=vi.hoisted(()=>({fetch:vi.fn(),json:vi.fn(),cache:vi.fn()}));
+vi.mock('../src/services/runtime',async importOriginal=>({ ...await importOriginal<typeof import('../src/services/runtime')>(),fetchRemoteText:mocks.fetch,fetchRemoteJson:mocks.json,cacheNativeProfileSync:mocks.cache }));
 import { RemnawaveClient } from '../src/services/remnawave';
 import { parseXrayJsonSubscriptionToServers as parse } from '../src/services/remnawave/subscriptionParser';
 import { resolveConnectedProfile, buildServerRuntimeFingerprint } from '../src/utils/serverIdentity';
@@ -8,9 +8,35 @@ import { serverMeasurementIdentity } from '../src/utils/serverMeasurements';
 import { normalizeStoredSettings, saveSettings, loadSettings, loadSplitTunnelEntries } from '../src/services/storage';
 const key='https://sub.vkarmani.com/qa-synthetic-fixture';
 const config=(name:string)=>({remarks:name,outbounds:[{tag:'proxy',protocol:'vless',settings:{vnext:[{address:`${name.toLowerCase()}.example.test`,port:443,users:[{id:'00000000-0000-4000-8000-000000000001'}]}]}}]});
-beforeEach(()=>{vi.stubGlobal('window',{setTimeout,clearTimeout});mocks.fetch.mockReset();mocks.cache.mockReset();mocks.cache.mockResolvedValue(undefined);});
+beforeEach(()=>{vi.stubGlobal('window',{setTimeout,clearTimeout});mocks.fetch.mockReset();mocks.json.mockReset();mocks.cache.mockReset();mocks.cache.mockResolvedValue(undefined);});
 afterEach(()=>vi.unstubAllGlobals());
 describe('actual subscription-client atomic refresh and generation ownership',()=>{
+  it('revokes pending authorization as well as sync, without stale cache or fallback', async () => {
+    const client = new RemnawaveClient(); let release!: (value: string) => void;
+    mocks.fetch.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    const pending = client.authorizeByAccessKey(key);
+    const rejected = expect(pending).rejects.toThrow('PROFILE_SYNC_CANCELLED');
+    client.invalidateProfileSync(); release(JSON.stringify(config('Stale'))); await rejected;
+    expect(await client.loadServers()).toEqual([]); expect(client.getCachedSession()).toBeNull();
+    expect(mocks.json).not.toHaveBeenCalled(); expect(mocks.cache).not.toHaveBeenCalled();
+  });
+  it('older authorization cannot overwrite a newer key or catalog', async () => {
+    const client = new RemnawaveClient(); let release!: (value: string) => void;
+    mocks.fetch.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    const pending = client.authorizeByAccessKey(key); const rejected = expect(pending).rejects.toThrow('PROFILE_SYNC_CANCELLED');
+    mocks.fetch.mockResolvedValue(JSON.stringify(config('New')));
+    const latest = await client.authorizeByAccessKey(key + '-new'); const servers = await client.loadServers();
+    release(JSON.stringify(config('Stale'))); await rejected;
+    expect(client.getCachedSession()).toBe(latest); expect(await client.loadServers()).toEqual(servers);
+  });
+  it.each([false, true])('revokes late info fallback even when demo fallback=%s', async allowDemo => {
+    const client = new RemnawaveClient(); let release!: (value: unknown) => void;
+    mocks.fetch.mockRejectedValue(new Error('synthetic unavailable'));
+    mocks.json.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const pending = client.authorizeByAccessKey(key, allowDemo); const rejected = expect(pending).rejects.toThrow('PROFILE_SYNC_CANCELLED');
+    await vi.waitFor(() => expect(mocks.json).toHaveBeenCalled()); client.invalidateProfileSync(); release({}); await rejected;
+    expect(client.getCachedSession()).toBeNull(); expect(await client.loadServers()).toEqual([]);
+  });
   it('successful refresh/reorder preserves the measured cache; changed endpoints invalidate only themselves',async()=>{
     const client=new RemnawaveClient();mocks.fetch.mockResolvedValue(JSON.stringify([config('A'),config('B')]));
     const first=await client.syncProfile(key);const measured=first.servers.map((s,i)=>({...s,latency:47+i,latencyStatus:'ok' as const,latencyCheckedAt:new Date().toISOString(),latencyIdentity:serverMeasurementIdentity(s),latencySource:'physical-tcp' as const}));

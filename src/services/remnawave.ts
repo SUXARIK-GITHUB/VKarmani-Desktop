@@ -1015,6 +1015,7 @@ export class RemnawaveClient {
   }
 
   async authorizeByAccessKey(accessKey: string, allowDemoFallback = allowDemoFallbackByEnv): Promise<RemnawaveSession> {
+    const generation = ++this.profileSyncGeneration;
     const key = resolveAccessKey(accessKey);
     const provisionalSession = makeProvisionalSession(accessKey, key);
     const candidates = buildInfoCandidates(key);
@@ -1038,6 +1039,7 @@ export class RemnawaveClient {
       const xrayJsonResult = await fetchParsableXrayJsonProfileCandidates(xrayJsonCandidates, {
         expectedMinimumServers: this.cachedServers.length
       });
+      if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
       const importedServers = xrayJsonResult.servers;
       const previousServers = [...this.cachedServers];
       const keepPreviousProfile = shouldKeepPreviousFullProfile(previousServers, importedServers);
@@ -1063,11 +1065,13 @@ export class RemnawaveClient {
       };
       return provisionalSession;
     } catch (error) {
+      if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
       xrayJsonFirstError = error instanceof Error ? error.message : 'Не удалось получить Xray JSON profile.';
     }
 
     try {
       const result = await fetchJsonCandidates(candidates);
+      if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
       const source: RemnawaveSource = result.url.includes('/api/sub/') ? 'public-api' : 'panel-api';
       const session = mapSessionFromPayload(accessKey, key, result.value, source, result.url);
       this.cachedSession = session;
@@ -1077,6 +1081,7 @@ export class RemnawaveClient {
       }
       return session;
     } catch (error) {
+      if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
       const infoError = error instanceof Error ? error.message : 'Не удалось получить профиль из Remnawave.';
 
       if (!allowDemoFallback) {
