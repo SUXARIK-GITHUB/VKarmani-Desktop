@@ -405,13 +405,22 @@ export async function loadPersistentSnapshot() {
 }
 
 // User-confirmed reload/recovery, never an automatic conflict rebase.
-export async function reloadPersistentSnapshot() {
+export async function inspectPersistentRecovery() {
+  const current = await inspectNativeState(true);
+  return { readOnly: current.readOnly, token: current.recoveryToken };
+}
+
+export async function reloadPersistentSnapshot(confirmedRecoveryToken?: string) {
   writesQuiesced = true;
   try {
     pendingWrites.clear();
     if (writeDrain) await withStorageTimeout(writeDrain, 12000, 'reload-state');
-    await inspectNativeState(true);
-    await recoverNativeState();
+    const current = await inspectNativeState(true);
+    if (confirmedRecoveryToken !== undefined) {
+      await recoverNativeState(confirmedRecoveryToken);
+    } else if (current.readOnly) {
+      throw new NativeStorageError('STATE_RECOVERY_REQUIRED', 'Доступна резервная копия. Перечитывание не разрешает её восстановление; требуется отдельное подтверждение.', false);
+    }
     bootstrapState = null;
     await initializeNativeState();
     const restored = await loadPersistentSnapshot();
