@@ -427,9 +427,7 @@ export function SettingsTab({ settings, language, onToggleSetting, onTunnelModeC
               { value: 'selected', label: tr(language, 'Только выбранные через VPN', 'Selected through VPN') },
               { value: 'exclude', label: tr(language, 'Все, кроме исключённых', 'All except excluded') }
             ]} />
-            <p>{settings.tunRoutingMode === 'selected'
-              ? tr(language, 'Через VPN идут только выбранные приложения. Остальные подключаются напрямую.', 'Only selected applications use the VPN. Others connect directly.')
-              : tr(language, 'Приложения используют VPN. Правила «Напрямую» задают исключения.', 'Applications use the VPN. Direct rules specify exceptions.')}</p>
+            <p>{tr(language, 'Маршрутизация отдельных приложений и служб временно заблокирована. Для TUN выберите «Все приложения» без активных правил «Напрямую». Сохранённые правила не удаляются.', 'App and service routing is temporarily blocked. For TUN, choose All applications without active Direct rules. Saved rules are preserved.')}</p>
           </div>
           <div className="settings-note-card">
             <strong>{tr(language, 'Раздельное туннелирование управляется на главном экране TUN-режима', 'Split tunneling is managed from the main TUN-mode screen')}</strong>

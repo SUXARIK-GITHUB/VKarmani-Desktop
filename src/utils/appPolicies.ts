@@ -77,3 +77,7 @@ export function activePolicyEntries(entries: SplitTunnelEntry[], mode: TunRoutin
 export function isSelectedTunPolicyEmpty(entries: SplitTunnelEntry[], mode: TunRoutingMode): boolean {
   return mode === 'selected' && !entries.some(entry => entry.enabled && (entry.policy ?? 'VPN') === 'VPN');
 }
+
+export function isTunProcessRoutingBlocked(entries: SplitTunnelEntry[], mode: TunRoutingMode): boolean {
+  return mode === 'selected' || activePolicyEntries(entries, mode).length > 0;
+}

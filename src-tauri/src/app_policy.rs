@@ -265,6 +265,25 @@ pub(crate) fn active_policy_entries(
         .cloned()
         .collect())
 }
+pub(crate) fn ensure_tun_process_enforcement(
+    network_mode: Option<&str>,
+    policy_mode: Option<&str>,
+    entries: &[SplitTunnelEntryPayload],
+) -> Result<(), String> {
+    if !network_mode.is_some_and(|mode| mode.eq_ignore_ascii_case("tun")) {
+        return Ok(());
+    }
+    let mode = policy_mode.unwrap_or("selected");
+    let active = active_policy_entries(entries, mode)?;
+    // Xray process lookup is not an OS enforcement boundary. A protected,
+    // unknown or short-lived process can miss a rule and take the fallback.
+    // Neither selected VPN routing nor DIRECT process exclusions are safe to
+    // advertise until a separately approved enforcement implementation exists.
+    if mode == "selected" || !active.is_empty() {
+        return Err("TUN_PROCESS_ENFORCEMENT_UNAVAILABLE: маршрутизация выбранных приложений и служб, включая правила Напрямую, временно заблокирована. Выберите Все приложения без активных правил Напрямую или Proxy. Сохранённые правила не удаляются.".into());
+    }
+    Ok(())
+}
 pub(crate) fn build_split_tunnel_rule_plan_for_mode(
     entries: &[SplitTunnelEntryPayload],
     mode: &str,
@@ -293,6 +312,48 @@ mod tests {
             enabled: true,
             policy: Some(policy.into()),
         }
+    }
+    #[test]
+    fn native_admission_blocks_every_process_dependent_tun_policy() {
+        for entries in [
+            vec![],
+            vec![entry("app.exe", "VPN")],
+            vec![entry("app.exe", "DIRECT")],
+        ] {
+            assert!(
+                ensure_tun_process_enforcement(Some("tun"), Some("selected"), &entries)
+                    .unwrap_err()
+                    .starts_with("TUN_PROCESS_ENFORCEMENT_UNAVAILABLE")
+            );
+        }
+        for mode in ["all", "exclude"] {
+            assert!(ensure_tun_process_enforcement(Some("tun"), Some(mode), &[]).is_ok());
+            assert!(ensure_tun_process_enforcement(
+                Some("TUN"),
+                Some(mode),
+                &[entry("app.exe", "VPN")]
+            )
+            .is_ok());
+            for kind in ["app", "service"] {
+                let mut direct = entry("private-target", "DIRECT");
+                direct.kind = kind.into();
+                assert!(
+                    ensure_tun_process_enforcement(Some("tun"), Some(mode), &[direct.clone()])
+                        .unwrap_err()
+                        .starts_with("TUN_PROCESS_ENFORCEMENT_UNAVAILABLE")
+                );
+                direct.enabled = false;
+                assert!(ensure_tun_process_enforcement(Some("tun"), Some(mode), &[direct]).is_ok());
+            }
+        }
+        assert!(ensure_tun_process_enforcement(Some("tun"), None, &[]).is_err());
+        assert!(ensure_tun_process_enforcement(Some("tun"), Some("invalid"), &[]).is_err());
+        assert!(ensure_tun_process_enforcement(
+            Some("proxy"),
+            Some("selected"),
+            &[entry("app.exe", "VPN")]
+        )
+        .is_ok());
     }
     fn service(name: &str, exe: &str, pid: u32, kind: &str) -> WindowsServiceInfo {
         WindowsServiceInfo {
