@@ -5,6 +5,9 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { expect, it, vi } from 'vitest';
 import { RootErrorBoundary } from '../src/components/RootErrorBoundary';
 import { StorageRecoveryNotice } from '../src/components/StorageRecoveryNotice';
+import { LogoutConfirmModal } from '../src/components/LogoutConfirmModal';
+import { NativeStorageError } from '../src/services/nativeState';
+import { connectionFailureState } from '../src/utils/runtimeSnapshot';
 
 const appSource = ts.createSourceFile('App.tsx', readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 function appFunction(name: string, bindings: Record<string, unknown>) {
@@ -70,4 +73,80 @@ it('failed recovery retains the storage error, clears stale consent and releases
     setStorageIssue: clearIssue, setStorageRecoveryToken: setToken, reportPersistentFailure: report, NativeStorageError: Error })(true);
   expect(report).toHaveBeenCalledWith(failure); expect(apply).not.toHaveBeenCalled(); expect(clearIssue).not.toHaveBeenCalled();
   expect(setToken).toHaveBeenCalledWith(null); expect(lock.current).toBe(false); expect(busy.mock.calls).toEqual([[true], [false]]);
+});
+
+it('requesting logout opens confirmation without changing generation, profile, ping, storage or runtime', async () => {
+  const generation = { current: 7 }; const invalidate = vi.fn(); const cancelPing = vi.fn(); const run = vi.fn(); const open = vi.fn();
+  await appFunction('handleClearAccessKey', { profileSyncGenerationRef: generation, remnawaveClient: { invalidateProfileSync: invalidate },
+    cancelPing, runActionOnce: run, setLogoutConfirmationOpen: open })();
+  expect(generation.current).toBe(7); expect(invalidate).not.toHaveBeenCalled(); expect(cancelPing).not.toHaveBeenCalled();
+  expect(run).not.toHaveBeenCalled(); expect(open).toHaveBeenCalledExactlyOnceWith(true);
+});
+
+function logoutBindings() {
+  const idle = { bridge: 'tauri', nativeInstanceId: 'owned', runtimeRevision: 1, tunnelActive: false, proxyOwnership: 'none', routeOwnership: 'none', systemProxyEnabled: true };
+  const bindings: Record<string, any> = { isTauriRuntime: true, language: 'en', NativeStorageError, connectionFailureState,
+    tr: (_: unknown, _ru: string, en: string) => en, runActionOnce: async (_: string, operation: () => Promise<void>) => operation(),
+    flushPersistentWrites: vi.fn().mockResolvedValue(undefined), profileSyncGenerationRef: { current: 7 },
+    remnawaveClient: { invalidateProfileSync: vi.fn(), disconnect: vi.fn().mockResolvedValue(undefined) },
+    isConnectionActionBusy: () => false, refreshDiagnosticsAndRuntime: vi.fn().mockResolvedValue(idle),
+    clearStoredAccessKey: vi.fn().mockResolvedValue(undefined), clearLastKnownServers: vi.fn().mockResolvedValue(undefined),
+    setNativeSessionAuthorized: vi.fn().mockResolvedValue(false), connectedServerIdRef: { current: 'old' },
+    authorizedAccessKeyRef: { current: 'synthetic-key' }, serversRef: { current: ['old'] }, selectedServerIdRef: { current: 'old' } };
+  for (const name of ['setLogoutConfirmationOpen','cancelPing','clearPendingConnectionQueue','setConnectionStateSafe','setConnectedServerId',
+    'setConnectivityProbe','setVpnExternalIp','setSessionDuration','refreshPrimaryExternalIp','setAccessKey','setIsAuthorized','setSession',
+    'setDevices','setSessionHistory','setDiagnostics','setServers','setSelectedServerId','pushToast','reportPersistentFailure']) bindings[name] = vi.fn();
+  return { bindings, idle, run: () => appFunction('performConfirmedLogout', bindings)() };
+}
+
+it('confirmed logout refuses failed saves before disconnect, invalidation or key deletion', async () => {
+  const { bindings: b, idle, run } = logoutBindings(); const failure = new NativeStorageError('STATE_CONFLICT', 'synthetic');
+  b.flushPersistentWrites.mockRejectedValue(failure); b.refreshDiagnosticsAndRuntime.mockResolvedValue({ ...idle, tunnelActive: true });
+  await run(); expect(b.profileSyncGenerationRef.current).toBe(7); expect(b.remnawaveClient.invalidateProfileSync).not.toHaveBeenCalled();
+  expect(b.remnawaveClient.disconnect).not.toHaveBeenCalled(); expect(b.clearStoredAccessKey).not.toHaveBeenCalled();
+  expect(b.reportPersistentFailure).toHaveBeenCalledWith(failure); expect(b.setConnectionStateSafe).toHaveBeenCalledExactlyOnceWith('connected');
+});
+
+it.each([null, { bridge: 'tauri', operation: { kind: 'connect' } }, { bridge: 'tauri', proxyOwnership: 'unavailable' }])('unknown or busy runtime prevents credential deletion: %j', async runtime => {
+  const { bindings: b, run } = logoutBindings(); b.refreshDiagnosticsAndRuntime.mockResolvedValue(runtime);
+  await run(); expect(b.clearStoredAccessKey).not.toHaveBeenCalled(); expect(b.remnawaveClient.disconnect).not.toHaveBeenCalled();
+  expect(b.setIsAuthorized).not.toHaveBeenCalled(); expect(b.setConnectionStateSafe).not.toHaveBeenCalledWith('idle');
+});
+
+it.each(['failure', 'still-active', 'unknown'] as const)('unconfirmed disconnect retains credentials and does not invent idle: %s', async mode => {
+  const { bindings: b, idle, run } = logoutBindings(); const active = { ...idle, tunnelActive: true, xrayPid: 123 };
+  b.refreshDiagnosticsAndRuntime.mockResolvedValue(active);
+  if (mode === 'failure') b.remnawaveClient.disconnect.mockRejectedValue(new Error('injected disconnect failure'));
+  else if (mode === 'unknown') b.refreshDiagnosticsAndRuntime.mockResolvedValueOnce(active).mockResolvedValue(null);
+  await run(); expect(b.remnawaveClient.disconnect).toHaveBeenCalledWith({ useSystemProxy: false });
+  expect(b.clearStoredAccessKey).not.toHaveBeenCalled(); expect(b.setIsAuthorized).not.toHaveBeenCalled();
+  expect(b.setConnectedServerId).not.toHaveBeenCalled(); expect(b.setConnectionStateSafe).not.toHaveBeenCalledWith('idle');
+});
+
+it('a foreign proxy with no VKarmani ownership does not cause proxy restoration or block sign out', async () => {
+  const { bindings: b, run } = logoutBindings(); await run();
+  expect(b.remnawaveClient.disconnect).not.toHaveBeenCalled(); expect(b.clearStoredAccessKey).toHaveBeenCalledTimes(1);
+  expect(b.setIsAuthorized).toHaveBeenCalledWith(false);
+  expect(b.flushPersistentWrites.mock.invocationCallOrder[0]).toBeLessThan(b.clearStoredAccessKey.mock.invocationCallOrder[0]);
+});
+
+it('confirmed owned disconnect is read back before deleting the key, preserving an unrelated proxy', async () => {
+  const { bindings: b, idle, run } = logoutBindings();
+  b.refreshDiagnosticsAndRuntime.mockResolvedValueOnce({ ...idle, tunnelActive: true, xrayPid: 123, routeOwnership: 'confirmed', proxyOwnership: 'owned' });
+  await run(); expect(b.remnawaveClient.disconnect).toHaveBeenCalledExactlyOnceWith({ useSystemProxy: true });
+  expect(b.refreshDiagnosticsAndRuntime).toHaveBeenCalledTimes(2);
+  expect(b.clearStoredAccessKey.mock.invocationCallOrder[0]).toBeGreaterThan(b.refreshDiagnosticsAndRuntime.mock.invocationCallOrder[1]);
+  expect(b.setIsAuthorized).toHaveBeenCalledWith(false);
+});
+
+it('a duplicate or conflicting logout admission cannot invalidate the profile before acquiring the lease', async () => {
+  const { bindings: b, run } = logoutBindings(); b.runActionOnce = vi.fn().mockResolvedValue(null); await run();
+  expect(b.profileSyncGenerationRef.current).toBe(7); expect(b.remnawaveClient.invalidateProfileSync).not.toHaveBeenCalled();
+  expect(b.flushPersistentWrites).not.toHaveBeenCalled(); expect(b.setLogoutConfirmationOpen).not.toHaveBeenCalled();
+});
+
+it.each(['ru', 'en'] as const)('logout consent names data scope and offers cancellation in %s', language => {
+  const html = renderToStaticMarkup(<LogoutConfirmModal open language={language} busy={false} onCancel={vi.fn()} onConfirm={vi.fn()} />);
+  expect(html).toContain('role="dialog"'); expect(html).toContain(language === 'ru' ? 'Отмена' : 'Cancel');
+  expect(html).toContain(language === 'ru' ? 'Настройки и правила приложений останутся' : 'Settings and app rules will remain');
 });
