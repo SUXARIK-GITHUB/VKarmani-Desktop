@@ -1677,18 +1677,10 @@ pub(crate) fn set_system_proxy_blocking(
     let status = if enabled {
         enable_owned_windows_proxy(&app)?
     } else {
-        restore_saved_proxy_state(&app, &state, "manual_proxy_toggle")?.unwrap_or_else(|| {
-            current_proxy_snapshot().unwrap_or_else(|_| ProxyStatus {
-                enabled: false,
-                server: None,
-                bypass: None,
-                method: "unknown".into(),
-                scope: "current-user".into(),
-                checked_at: unix_now_string(),
-                auto_config_url: None,
-                auto_detect: false,
-            })
-        })
+        match restore_saved_proxy_state(&app, &state, "manual_proxy_toggle")? {
+            Some(restored) => restored,
+            None => current_proxy_snapshot()?,
+        }
     };
 
     let _ = append_runtime_event(
@@ -1698,7 +1690,7 @@ pub(crate) fn set_system_proxy_blocking(
             if enabled {
                 "включён"
             } else {
-                "восстановлен/отключён"
+                "проверен после запроса восстановления"
             }
         ),
     );

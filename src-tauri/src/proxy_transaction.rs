@@ -459,12 +459,18 @@ mod tests {
     struct Fake {
         current: ProxySettings,
         journal: Option<ProxyJournal>,
+        reads: usize,
+        fail_read: Option<usize>,
         writes: usize,
         fail_write: Option<usize>,
         fail_save: bool,
     }
     impl ProxyBackend for Fake {
         fn read(&mut self) -> Result<ProxySettings, String> {
+            self.reads += 1;
+            if self.fail_read == Some(self.reads) {
+                return Err("injected WinINet query failure".into());
+            }
             Ok(self.current.clone())
         }
         fn write(&mut self, settings: &ProxySettings) -> Result<(), String> {
@@ -497,9 +503,39 @@ mod tests {
                 pac: "https://pac.example/config.pac".into(),
             },
             journal: None,
+            reads: 0,
+            fail_read: None,
             writes: 0,
             fail_write: None,
             fail_save: false,
+        }
+    }
+    #[test]
+    fn failed_restore_observation_preserves_journal_before_and_after_write() {
+        for failed_read in [1, 2] {
+            let mut fake = backend();
+            let original = fake.current.clone();
+            let journal = enable_transaction(&mut fake, None).unwrap();
+            let writes = fake.writes;
+            fake.fail_read = Some(fake.reads + failed_read);
+            assert_eq!(
+                restore_transaction(&mut fake, &journal).unwrap_err(),
+                "injected WinINet query failure"
+            );
+            assert!(fake.journal.is_some());
+            if failed_read == 1 {
+                assert_eq!(fake.writes, writes);
+                assert_eq!(fake.current, journal.target);
+            } else {
+                assert_eq!(fake.writes, writes + 1);
+                assert_eq!(fake.current, original);
+                assert!(!fake.journal.as_ref().unwrap().applied);
+            }
+            fake.fail_read = None;
+            let retained = fake.journal.clone().unwrap();
+            restore_transaction(&mut fake, &retained).unwrap();
+            assert_eq!(fake.current, original);
+            assert!(fake.journal.is_none());
         }
     }
     #[test]
