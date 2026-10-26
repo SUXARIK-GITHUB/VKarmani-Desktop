@@ -30,4 +30,15 @@ describe('native readiness uses the retained child, never any reachable port', (
     const final = source.split('Xray остановился до завершения подключения.')[1].split('_operation_guard.stage("publishing")')[0];
     expect(final).toContain('runtime_listeners_ready(&mut child)?');
   });
+  it('requires exact listener ownership under the operation lease before enabling system Proxy', () => {
+    const command = read('commands.rs').split('pub(crate) fn set_system_proxy_blocking')[1].split('#[tauri::command]')[0];
+    const check = command.indexOf('require_proxy_runtime_ready(');
+    expect(check).toBeGreaterThan(command.indexOf('acquire_operation_lock('));
+    expect(check).toBeLessThan(command.indexOf('enable_owned_windows_proxy('));
+    const admission = command.slice(command.lastIndexOf('if enabled {', check), command.indexOf('let status ='));
+    expect(admission.replace(/\s+/g, '')).toContain('runtime.as_mut()');
+    expect(admission).toContain('&[HTTP_PORT, SOCKS_PORT, XRAY_API_PORT]');
+    expect(admission).toContain(')?;');
+    expect(admission.indexOf('_operation_guard.stage("configuring-proxy")?')).toBeGreaterThan(admission.indexOf('require_proxy_runtime_ready('));
+  });
 });
