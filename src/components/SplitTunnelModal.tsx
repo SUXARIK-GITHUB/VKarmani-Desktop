@@ -138,7 +138,6 @@ export function SplitTunnelModal({
 
         <div className="vk-modal-scroll">
           <TunRoutingChoice language={language} mode={tunRoutingMode} entries={entries} onChange={onTunRoutingModeChange} />
-          <p className="split-tunnel-help">{tr(language, 'Полный путь выбирает один файл, а имя .exe — все приложения с таким именем.', 'A full path targets one file; an .exe name targets all applications with that name.')}</p>
           {tunnelMode === 'proxy' && <p className="split-tunnel-help policy-warning">{tr(language, 'Правила приложений не управляют режимом Proxy. Приложение с собственными настройками прокси может подключаться через него.', 'App rules do not control Proxy mode. An application with its own proxy settings may still use that proxy.')}</p>}
           <div className="policy-toolbar">
             <label className="split-field"><span>{tr(language, 'Поиск правил, программ и служб', 'Search rules, applications and services')}</span><input value={appSearch} onChange={event => setAppSearch(event.target.value)} placeholder={tr(language, 'Имя или путь…', 'Name or path…')} /></label>

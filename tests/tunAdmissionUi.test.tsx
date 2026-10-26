@@ -30,6 +30,29 @@ it.each(['ru', 'en'] as const)('has an in-modal mode choice and no blanket warni
   expect(html).toContain('Discord.exe'); expect(html).toContain('brave.exe');
 });
 
+it.each((['ru', 'en'] as const).flatMap(language => (['all', 'selected', 'exclude'] as const).map(mode => ({ language, mode }))))('omits redundant executable help while retaining saved identities and controls ($language/$mode)', ({ language, mode }) => {
+  const entries: SplitTunnelEntry[] = [
+    { id: 'exact', kind: 'app', value: 'C:/Exact Folder/Discord.exe', enabled: true, policy: 'VPN', schemaVersion: 2 },
+    { id: 'by-name', kind: 'app', value: 'brave.exe', enabled: false, policy: 'DIRECT', schemaVersion: 2 },
+    { id: 'service', kind: 'service', value: 'DedicatedSvc', enabled: false, policy: 'VPN', schemaVersion: 2 }
+  ];
+  const before = structuredClone(entries);
+  const html = renderToStaticMarkup(modal(mode, entries, language));
+  expect(html).not.toContain('Полный путь выбирает один файл');
+  expect(html).not.toContain('A full path targets one file');
+  expect(html).toContain('C:/Exact Folder/Discord.exe');
+  expect(html).toContain('brave.exe');
+  expect(html).toContain('DedicatedSvc');
+  const routingChoices = html.match(/role="radiogroup" aria-label="(?:Маршрутизация приложений|App routing)">([\s\S]*?)<\/div>/)?.[1];
+  expect(routingChoices?.match(/role="radio"/g)).toHaveLength(3);
+  expect(html.match(/class="split-entry /g)).toHaveLength(3);
+  expect(html).toContain(language === 'ru' ? 'Поиск правил, программ и служб' : 'Search rules, applications and services');
+  expect(html).toContain(language === 'ru' ? 'Выбрать .exe' : 'Choose .exe');
+  expect(html).toContain(language === 'ru' ? 'Добавить службу' : 'Add service');
+  expect(entries).toEqual(before);
+  expect(isTunProcessRoutingBlocked(entries, mode)).toBe(mode === 'selected');
+});
+
 it('places a concise limitation with an All applications action beside the selected mode', () => {
   const html = renderToStaticMarkup(modal('selected'));
   expect(html).toContain('Selected-app routing is unavailable');
