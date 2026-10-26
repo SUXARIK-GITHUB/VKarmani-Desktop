@@ -68,9 +68,13 @@ it.each(['success', 'error', 'cancelled'] as const)('current manual probe handle
     expect(toast).toHaveBeenCalledExactlyOnceWith('Route probe completed successfully.', 'success');
     expect(log).toHaveBeenCalledTimes(1);
   } else {
-    expect(update).not.toHaveBeenCalled(); expect(refresh).not.toHaveBeenCalled(); expect(log).not.toHaveBeenCalled();
-    if (outcome === 'error') expect(toast).toHaveBeenCalledExactlyOnceWith('synthetic probe failure', 'error');
-    else expect(toast).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled(); expect(log).not.toHaveBeenCalled();
+    if (outcome === 'error') {
+      expect(update).toHaveBeenCalledExactlyOnceWith(null);
+      expect(toast).toHaveBeenCalledExactlyOnceWith('synthetic probe failure', 'error');
+    } else {
+      expect(update).not.toHaveBeenCalled(); expect(toast).not.toHaveBeenCalled();
+    }
   }
 });
 

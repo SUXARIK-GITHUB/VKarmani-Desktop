@@ -1605,6 +1605,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         void writeNativeRoutingLog('Запущена ручная проверка маршрута.', probe.message || probe.publicIp || 'probe-finished');
       } catch (error) {
         if (!isCurrent() || (error instanceof Error && error.message === 'CONNECTIVITY_PROBE_CANCELLED')) return;
+        setConnectivityProbe(null);
         pushToast(
           error instanceof Error
             ? error.message

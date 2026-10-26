@@ -41,4 +41,19 @@ describe('native readiness uses the retained child, never any reachable port', (
     expect(admission).toContain(')?;');
     expect(admission.indexOf('_operation_guard.stage("configuring-proxy")?')).toBeGreaterThan(admission.indexOf('require_proxy_runtime_ready('));
   });
+  it('binds a native HTTP health response to the same owned per-launch runtime before and after HTTP', () => {
+    const source = read('commands.rs');
+    const command = source.split('pub(crate) fn connectivity_probe_blocking')[1].split('pub(crate) fn server_ping_blocking')[0];
+    expect(command).toContain('app: AppHandle');
+    const capture = command.indexOf('connectivity_probe_runtime_identity(&state, None, &ports)?');
+    expect(capture).toBeGreaterThan(-1);
+    expect(capture).toBeLessThan(command.indexOf('tcp_port_open('));
+    const afterHttp = command.slice(command.indexOf('let public_ip = fetch_public_ip(&client);'));
+    expect(afterHttp.indexOf('connectivity_probe_runtime_identity(&state, Some(&identity), &ports)?')).toBeGreaterThan(-1);
+    expect(afterHttp.indexOf('let public_ip = public_ip?;')).toBeGreaterThan(afterHttp.indexOf('connectivity_probe_runtime_identity('));
+    const guard = source.split('pub(crate) fn connectivity_probe_runtime_identity')[1].split('#[tauri::command]')[0];
+    expect(guard).toContain('traffic_runtime_id(runtime)');
+    expect(guard).toContain('require_proxy_runtime_ready(');
+    expect(guard).toContain('CONNECTIVITY_RUNTIME_SUPERSEDED');
+  });
 });

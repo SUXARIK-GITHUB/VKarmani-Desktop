@@ -1237,6 +1237,7 @@ export class RemnawaveClient {
       return probe;
     } catch (error) {
       requireCurrent();
+      this.lastProbe = null;
       throw error;
     }
   }
@@ -1432,7 +1433,7 @@ export class RemnawaveClient {
       ? this.lastProbe.success
         ? `[probe] OK · IP ${this.lastProbe.publicIp ?? 'не определён'} · ${this.lastProbe.latencyMs ?? 0} мс`
         : `[probe] ${this.lastProbe.message}`
-      : '[probe] Проверка соединения ещё не запускалась.';
+      : '[probe] Нет актуального результата проверки соединения.';
 
     const mergedLogLines = [
       `[runtime] ${runtime.message}`,
