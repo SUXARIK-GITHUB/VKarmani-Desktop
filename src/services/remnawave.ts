@@ -965,6 +965,7 @@ export class RemnawaveClient {
   private cachedDevices: DeviceRecord[] = [buildLocalDeviceRecord()];
   private profileSyncInfo: ProfileSyncInfo = emptyProfileSyncInfo();
   private lastProbe: ConnectivityProbe | null = null;
+  private connectivityProbeGeneration = 0;
   private runtimeSnapshotInFlight: Promise<{ runtime: RuntimeStatus; proxyStatus: ProxyStatus; diagnostics: DiagnosticsSnapshot }> | null = null;
 
   constructor(
@@ -1221,9 +1222,23 @@ export class RemnawaveClient {
   }
 
   async runConnectivityProbe(): Promise<ConnectivityProbe> {
-    const probe = await runNativeConnectivityProbe();
-    this.lastProbe = probe;
-    return probe;
+    const request = ++this.connectivityProbeGeneration;
+    const generation = this.profileSyncGeneration;
+    const key = this.cachedProfileKey;
+    const requireCurrent = () => {
+      if (request !== this.connectivityProbeGeneration || generation !== this.profileSyncGeneration || key !== this.cachedProfileKey) {
+        throw new Error('CONNECTIVITY_PROBE_CANCELLED');
+      }
+    };
+    try {
+      const probe = await runNativeConnectivityProbe();
+      requireCurrent();
+      this.lastProbe = probe;
+      return probe;
+    } catch (error) {
+      requireCurrent();
+      throw error;
+    }
   }
 
   async connect(
