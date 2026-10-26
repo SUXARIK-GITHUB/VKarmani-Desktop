@@ -90,6 +90,22 @@ it('info-only login cannot autoconnect the previous React catalog or selected se
   expect(b.setErrorText.mock.calls).toEqual([['']]);
 });
 
+it.each(['save', 'native'])('unconfirmed login durability stops before publishing or caching the new subscription: %s', async phase => {
+  const report = vi.fn(); const native = vi.fn().mockResolvedValue(false); const save = vi.fn().mockResolvedValue(phase !== 'save');
+  const publish = vi.fn(); const catalog = vi.fn(); const connect = vi.fn();
+  const b: Record<string, any> = { isTauriRuntime: true, persistentStateReady: true, recoveryEpochRef: { current: 0 }, recoveryModeRef: { current: false },
+    settingsRef: { current: { autoConnect: true } }, remnawaveClient: { authorizeByAccessKey: vi.fn().mockResolvedValue({}), loadDevices: vi.fn().mockResolvedValue([]), loadServers: catalog },
+    saveStoredAccessKey: save, setNativeSessionAuthorized: native, reportPersistentFailure: report, NativeStorageError,
+    authorizedAccessKeyRef: { current: 'old' }, setSession: publish, handleConnectionToggle: connect,
+    tr: (_: unknown, ru: string) => ru, language: 'ru', normalizeNativeError: (e: Error) => e };
+  for (const n of ['writeNativeInterfaceLog','setAuthLoading','setErrorText','setAccessKey','setDevices','setIsAuthorized','pushToast']) b[n] = vi.fn();
+  await appFunction('authorizeWithAccessKey', b)('https://sub.vkarmani.com/new-synthetic');
+  expect(publish).not.toHaveBeenCalled(); expect(catalog).not.toHaveBeenCalled(); expect(connect).not.toHaveBeenCalled();
+  expect(b.authorizedAccessKeyRef.current).toBe('old');
+  if (phase === 'save') { expect(report).toHaveBeenCalled(); expect(native).not.toHaveBeenCalled(); }
+  else expect(native).toHaveBeenCalledExactlyOnceWith(true, 'https://sub.vkarmani.com/new-synthetic');
+});
+
 it('contains render/import failures without displaying exception credentials, retry requests safe start', () => {
   const children = vi.fn((safe: boolean) => <div>{safe ? 'safe' : 'normal'}</div>);
   const boundary = new RootErrorBoundary({ children });
