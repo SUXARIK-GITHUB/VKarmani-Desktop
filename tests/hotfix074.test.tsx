@@ -137,7 +137,7 @@ describe('EU region and local quarantined rule UI', () => {
   it.each(['ru','en'] as const)('has no raw DIRECT badge or new native policy select in Settings %s',language=>{
     const noop=()=>{};
     const html=renderToStaticMarkup(<SettingsTab settings={defaultSettings} language={language} onToggleSetting={noop} onTunnelModeChange={noop} onIpStackChange={noop} onTunRoutingModeChange={noop} onLanguageChange={noop} onRoutingExclusionsChange={noop}/>);
-    expect(html).not.toContain('>DIRECT<');expect(html).not.toContain('<select');expect(html).toContain(language==='ru'?'Напрямую':'Direct');
+    expect(html).not.toContain('>DIRECT<');expect(html).not.toContain('<select');expect(html).toContain(language==='ru'?'Все приложения':'All applications');
   });
   it.each(['EU','eu','Eu','🇪🇺'])('renders the normalized region %s using the common resolver and actual SVG', flag => {
     const server={country:'EU Auto',flag}; expect(getServerCountryCode(server)).toBe('EU'); expect(resolveServerFlag(server)).toBe('🇪🇺');
@@ -153,7 +153,7 @@ describe('EU region and local quarantined rule UI', () => {
   it.each(['ru','en'] as const)('renders quarantined records locally with human policies in %s and no technical sentinel/reason',language=>{
     const entries=normalizeStoredRules([{id:'bad',kind:'app',value:'<invalid stored policy>',enabled:true},{id:'path',kind:'app',value:'C:/Apps/Example.exe',enabled:true}]);
     expect(policyEntryDisplay(entries[0],language).detail).toBe('');
-    const html=renderToStaticMarkup(<SplitTunnelModal open language={language} entries={entries} runningApps={[]} isLoadingApps={false} onClose={()=>{}} onAddEntry={()=>true} onChangePolicy={()=>{}} tunnelMode="tun" tunRoutingMode="all" onToggleEntry={()=>{}} onRemoveEntry={()=>{}} onPickExecutable={()=>{}} onRefreshRunningApps={()=>{}}/>);
+    const html=renderToStaticMarkup(<SplitTunnelModal open language={language} entries={entries} runningApps={[]} isLoadingApps={false} onClose={()=>{}} onAddEntry={()=>true} onChangePolicy={()=>{}} tunnelMode="tun" tunRoutingMode="all" onTunRoutingModeChange={()=>{}} onToggleEntry={()=>{}} onRemoveEntry={()=>{}} onPickExecutable={()=>{}} onRefreshRunningApps={()=>{}}/>);
     expect(html).not.toContain('invalid stored policy');expect(html).not.toContain(entries[0].invalidReason);expect(html).not.toContain('<select');expect(html).not.toContain('>DIRECT<');expect(html).toContain(language==='ru'?'Требует настройки':'Needs setup');expect(html).toContain('Example.exe');
   });
 });

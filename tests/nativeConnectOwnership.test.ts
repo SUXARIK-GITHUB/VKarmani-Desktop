@@ -9,9 +9,25 @@ import auto from './fixtures/xray/auto.json';
 import { parseXrayJsonSubscriptionToServers as parse } from '../src/services/remnawave/subscriptionParser';
 import { remnawaveClient } from '../src/services/remnawave';
 import { buildServerRuntimeFingerprint } from '../src/utils/serverIdentity';
+import policyMatrix from './fixtures/policies/tun-admission.json';
+import type { SplitTunnelEntry, TunRoutingMode } from '../src/types/vpn';
 const [server] = parse(JSON.stringify(auto));
 const status = () => ({ lastPreparedServerId: server.id, lastPreparedServerFingerprint: buildServerRuntimeFingerprint(server), configPath: 'owned-B.json' });
 beforeEach(() => { vi.resetAllMocks(); native.flush.mockResolvedValue(undefined); native.proxy.mockResolvedValue({ enabled: true }); native.rollback.mockResolvedValue({ tunnelActive: false }); });
+it.each(policyMatrix)('actual native-client admission matches shared policy: $name', async row => {
+  native.connect.mockResolvedValue(status());
+  const before = structuredClone(row.entries);
+  const result = remnawaveClient.connect(server, { tunnelMode: 'tun', tunRoutingMode: row.mode as TunRoutingMode, splitTunnelEntries: row.entries as SplitTunnelEntry[] });
+  if (row.blocked) {
+    await expect(result).rejects.toThrow('TUN_PROCESS_ENFORCEMENT_UNAVAILABLE');
+    expect(native.flush).not.toHaveBeenCalled(); expect(native.connect).not.toHaveBeenCalled();
+  } else {
+    await result; expect(native.connect).toHaveBeenCalledOnce();
+    expect(native.connect.mock.calls[0][2]).toEqual(row.entries.filter(entry => entry.enabled));
+  }
+  expect(row.entries).toEqual(before);
+  expect(native.proxy).not.toHaveBeenCalled(); expect(native.disconnect).not.toHaveBeenCalled();
+});
 describe('native connect cleanup is scoped to the exact returned runtime', () => {
   it.each(['selected', 'all', 'exclude'] as const)('refuses unenforced application routing in %s before native work', async tunRoutingMode => {
     native.connect.mockResolvedValueOnce(status());

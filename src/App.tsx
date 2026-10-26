@@ -22,7 +22,7 @@ import { useToastManager } from './hooks/useToastManager';
 import { useSyncedRef } from './hooks/useSyncedRef';
 import { buildDiagnosticsFilename, createSafeDiagnosticsPayload, downloadTextFile } from './utils/diagnosticsExport';
 import { sleep } from './utils/async';
-import { activePolicyEntries, isSelectedTunPolicyEmpty, isTunProcessRoutingBlocked, insertRule, rulesOverlap } from './utils/appPolicies';
+import { activePolicyEntries, isTunProcessRoutingBlocked, tunProcessRoutingBlockMessage, insertRule, rulesOverlap } from './utils/appPolicies';
 import { appendTrafficSample, buildTrafficBars, formatTrafficBytes, validTrafficSnapshot, type TrafficSample } from './utils/traffic';
 import { assertNativeRuntimeServerMatches, runtimeConfirmsTargetServer } from './services/connectionGuards';
 import { pickPreferredServer, rankServersForDisplay } from './utils/serverSorting';
@@ -1001,7 +1001,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       : !selectedServer.runtimeTemplate
         ? tr(language, 'У выбранного сервера ещё нет runtime-конфига.', 'The selected server has no runtime config yet.')
         : settings.tunnelMode === 'tun' && isTunProcessRoutingBlocked(splitTunnelEntries, settings.tunRoutingMode)
-          ? tr(language, 'Маршрутизация программ временно заблокирована. Выберите «Все приложения» без активных правил «Напрямую» или Proxy.', 'App routing is temporarily blocked. Choose All applications without active Direct rules, or Proxy.')
+          ? tunProcessRoutingBlockMessage(splitTunnelEntries, settings.tunRoutingMode, language)
           : ''
     : '';
   const canConnectSelectedServer = connectionState !== 'idle' || !connectionDisabledReason;
@@ -1691,9 +1691,9 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       return;
     }
 
-    if (currentConnectionState !== 'idle' && nextMode === 'tun' && isSelectedTunPolicyEmpty(splitTunnelEntriesRef.current, settingsRef.current.tunRoutingMode)) {
+    if (currentConnectionState !== 'idle' && nextMode === 'tun' && isTunProcessRoutingBlocked(splitTunnelEntriesRef.current, currentSettings.tunRoutingMode)) {
       pushToast(
-        tr(language, 'Для TUN сначала добавьте хотя бы одну программу или службу. Текущее подключение оставлено без изменений.', 'For TUN, add at least one program or service first. The current connection was left unchanged.'),
+        tunProcessRoutingBlockMessage(splitTunnelEntriesRef.current, currentSettings.tunRoutingMode, language),
         'info'
       );
       return;
@@ -1721,11 +1721,12 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
 
       updateTunnelModePreference(nextMode);
 
-      if (nextMode === 'tun' && isSelectedTunPolicyEmpty(splitTunnelEntriesRef.current, settingsRef.current.tunRoutingMode)) {
+      if (nextMode === 'tun' && isTunProcessRoutingBlocked(splitTunnelEntriesRef.current, settingsRef.current.tunRoutingMode)) {
         pushToast(
-          tr(language, 'Выбран TUN режим. Сначала добавьте программы или службы, затем подключайтесь.', 'TUN mode selected. Add apps or services first, then connect.'),
+          tunProcessRoutingBlockMessage(splitTunnelEntriesRef.current, settingsRef.current.tunRoutingMode, language),
           'info'
         );
+        return;
       }
 
       if (currentConnectionState !== 'connected' || !serverForReconnect) {
@@ -3057,6 +3058,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
             {activeTab === 'settings' ? (
               <SettingsTab
                 settings={settings}
+                splitTunnelEntries={splitTunnelEntries}
                 language={language}
                 onToggleSetting={toggleSetting}
                 onTunnelModeChange={(value) => void handleTunnelModeChange(value)}
@@ -3098,6 +3100,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         onChangePolicy={handleChangeSplitTunnelPolicy}
         tunnelMode={settings.tunnelMode}
         tunRoutingMode={settings.tunRoutingMode}
+        onTunRoutingModeChange={value => { settingsRef.current = { ...settingsRef.current, tunRoutingMode: value }; setSettings(current => ({ ...current, tunRoutingMode: value })); }}
         onRemoveEntry={handleRemoveSplitTunnelEntry}
         onPickExecutable={handlePickExecutableForSplitTunnel}
         onRefreshRunningApps={refreshRunningAppsForSplitTunnel}
