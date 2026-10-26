@@ -153,18 +153,33 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: VKarmani Desktop ${{ github.ref_name }}
           releaseBody: |
-            ## VKarmani Desktop 0.13.85-rc.1 — TUN admission and controls
+            ## VKarmani Desktop 0.13.85 Stable
 
-            Test candidate only: GitHub Draft, not Stable Latest. Full TUN packet/native acceptance remains NOT_RUN / OWNER_ACCEPTANCE_PENDING. Stable0.13.84 and all previous assets stay unchanged; MASTER v2 is ACTIVE.
+            Точечное обновление управления TUN. Публикуется по прямому решению владельца после технических проверок. Реальные установка/встроенная кнопка, DPAPI readback, Proxy/Full TUN/UDP/DNS/cleanup/rollback на Windows11 остаются **NOT_RUN / OWNER_ACCEPTANCE_PENDING**. MASTER v2 не завершён.
 
-            - The Applications and services dialog now includes the existing All / Selected / Exclude mode choice. A concise contextual reason replaces the permanent blanket warning; the disabled Connect reason is visible with Configure TUN action.
-            - All mode with saved VPN rules is allowed without deleting or disabling those entries. Active DIRECT app/service rules still block all/exclude; disable only those rules explicitly to use Full TUN. Selected remains unavailable because pinned Xray process lookup can miss and fall through to DIRECT.
-            - A blocked connected Proxy-to-TUN switch now returns before changing preferences or attempting a native transition. Working Proxy, Happ and foreign networking are not modified.
-            - Shared frontend/client/Rust admission cases and synthetic native-state save/reload regressions preserve modes and saved VPN/DIRECT rules. CI unit/helper/config tests do not qualify actual VPN, UDP, DNS, rollback or packet isolation.
-            - Process lookup common/net: not found is not the cause of a pre-launch disabled button. Existing runtime logs append across launches; the supplied historical line is not attributed to this attempt without timestamp/runtime evidence.
-            - No Xray/Wintun/dependency/trust/DPAPI/route/DNS/Proxy backend changes. No WFP service, privileged helper, driver, Strict Isolation or Kill Switch is added; selected routing requires separately approved enforcement and isolated acceptance.
-            - Tauri Updater retains its key and production endpoint. This Draft must not replace public latest.json/Stable Latest. Windows Authenticode remains unavailable; Tauri signatures are checked separately.
-            - MSI ProductVersion0.13.85.0 exceeds Stable084/0.13.84.0. Native install/update/rollback remains owner-only NOT_RUN. Before any owner install, keep a private consistent full-tree same-profile backup and the previous084 installer; never use force or mix NSIS/MSI.
+            ### Исправления
+
+            - В «Приложения и службы» добавлен выбор «Все приложения / Только выбранные / Все, кроме исключённых», согласованный с настройками. Большое постоянное предупреждение убрано; ограничения отображаются коротко возле соответствующего режима.
+            - Причина неактивной кнопки подключения теперь видна вместе с действием настройки TUN. На небольшой высоте правая TUN-область прокручивается, сохраняя доступ к подсказке и кнопкам вместо обрезания. Проверены browser fixtures940x620/1000x670 RU/EN, не nativeWebView/VPN.
+            - Запрещённое переключение работающего Proxy в TUN отклоняется до изменения настройки и отключения текущего подключения.
+            - Режим all с сохранёнными VPN-правилами допускается. Переход в all выполняется только явным действием пользователя. Правила, их значения и флаги сохраняются, настройки не сбрасываются.
+            - Xray/Wintun, зависимости, DPAPI schema/codec, backend Proxy/routes/DNS, installer hooks, updater endpoint и public key не менялись.
+
+            ### Ограничения
+
+            - Selected-app/service routing и активные process DIRECT исключения остаются заблокированы. Для Full TUN выбрать «Все приложения» и при необходимости явно отключить активные DIRECT-записи их переключателями; сами записи сохраняются. Это не восстановление выбранных приложений и не WFP/privileged helper/driver implementation.
+            - Full TUN, UDP, DNS leak protection и сетевая изоляция не получили native PASS. Kill Switch и Strict Isolation не реализованы. Исторические startup crash/os error32/timeouts и остальные требования не объявляются полностью исправленными.
+            - Строка Xray process lookup common/net:not found без времени/runtime provenance не отнесена к текущей попытке. Неактивная кнопка сама не запускает Xray. Happ не объявляется первопричиной.
+            - Windows Authenticode у приложения/установщиков отсутствует. Tauri Updater signatures проверяются прежним ключом отдельно от Authenticode.
+            - MSI ProductVersion0.13.85.0 выше Stable084/0.13.84.0, но совпадает с RC1. RC1-MSI→Stable-MSI same-version upgrade NOT_RUN; не применять force/reinstall/registration cleanup или ручной NSIS поверх MSI. Сохранять согласованный тип установки.
+
+            ### Обновление и восстановление
+
+            Из0.13.84: подтвердить idle/cleanup только своей VKarmani, дождаться сохранения, закрыть её и сделать приватный согласованный backup всего дерева данных в том же Windows профиле/SID; сохранить прежний084 installer. Затем открыть без автоматического подключения и нажать «Проверить обновление» → убедиться в0.13.85 → «Установить обновление». После запуска проверить версию, подписку, серверы, избранное, настройки и все правила сразу и после повторного запуска. Ручная установка не заменяет испытание кнопки.
+
+            При ошибке/неизвестном ownership — STOP: сохранить новое состояние отдельно, подтвердить own cleanup/закрытый app, использовать проверенный прежний084 installer и coherent pre-update snapshot при необходимости. Native rollback не испытан; отказ downgrade не обходить force. Не смешивать поколения данных, не делать reset AppData или raw076/v1 downgrade. Happ/чужой Xray и Windows DNS/routes/Proxy/Firewall/adapters не трогать.
+
+            Stable0.13.84, прежние RC, их теги и файлы сохранены. Новый latest.json должен указывать на подписанный NSIS отдельного релиза v0.13.85; доставка и подписи проверяются отдельно от реальной кнопки на установленной копии.
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           includeUpdaterJson: true
