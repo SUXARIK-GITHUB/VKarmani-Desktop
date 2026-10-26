@@ -1545,8 +1545,8 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         const nextProxy = await remnawaveClient.applySystemProxy(false);
         setProxyStatus(nextProxy);
         void refreshDiagnosticsAndRuntime();
-        pushToast(tr(language, 'Системный proxy выключен.', 'System proxy disabled.'), 'info');
-        void writeNativeRoutingLog('Системный proxy выключен вручную.');
+        pushToast(tr(language, 'Состояние системного proxy проверено.', 'System proxy state checked.'), 'info');
+        void writeNativeRoutingLog('Состояние системного proxy проверено после запроса восстановления.');
       } catch (error) {
         pushToast(
           error instanceof Error
