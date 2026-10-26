@@ -165,7 +165,7 @@ fn install_routes_with_rollback(
     let created = journal.entries.iter().filter(|entry| entry.applied).count();
     if created == 0 {
         return Err(format!(
-            "ROUTE_SETUP_NOT_STARTED: Windows-маршруты этой попыткой не создавались; {error}"
+            "ROUTE_SETUP_NOT_STARTED: новые управляемые маршруты этой операцией не создавались; {error}"
         ));
     }
     Err(match cleanup_routes(backend, journal) {
@@ -812,6 +812,7 @@ mod tests {
             install_routes_with_rollback(&mut backend, &mut j, &[route("0.0.0.0")]).unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(error.starts_with("ROUTE_SETUP_NOT_STARTED:"));
+        assert!(error.contains("новые управляемые маршруты этой операцией не создавались"));
         // Windows reports 32 for a pinned parent and may report 5 for an open
         // target; the writer verifies the latter conflict before bounded retry.
         assert!(
