@@ -1658,17 +1658,20 @@ pub(crate) fn set_system_proxy_blocking(
         )?;
     }
 
-    let is_connected = state
-        .runtime
-        .lock()
-        .map(|mut runtime| {
-            runtime
-                .as_mut()
-                .is_some_and(|runtime| matches!(runtime.child.try_wait(), Ok(None)))
-        })
-        .unwrap_or(false);
-    if enabled && !is_connected {
-        return Err("Сначала запустите runtime, затем включайте системный proxy.".into());
+    if enabled {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "Runtime state повреждён")?;
+        let runtime = runtime
+            .as_mut()
+            .ok_or("Сначала запустите runtime, затем включайте системный proxy.")?;
+        crate::listener_owner::require_proxy_runtime_ready(
+            &mut runtime.child,
+            &[HTTP_PORT, SOCKS_PORT, XRAY_API_PORT],
+        )?;
+        // Disconnect may cancel while the read-only owner snapshot is queried.
+        _operation_guard.stage("configuring-proxy")?;
     }
 
     let status = if enabled {

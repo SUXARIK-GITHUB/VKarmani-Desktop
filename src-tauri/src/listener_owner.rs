@@ -112,6 +112,16 @@ pub(crate) fn child_listeners_ready(
     })
 }
 
+pub(crate) fn require_proxy_runtime_ready(
+    child: &mut std::process::Child,
+    ports: &[u16],
+) -> Result<(), String> {
+    if !child_listeners_ready(child, ports)? {
+        return Err("PROXY_RUNTIME_NOT_READY: owned Xray listeners unavailable.".into());
+    }
+    Ok(())
+}
+
 fn retained_child_alive(child: &mut std::process::Child) -> Result<(), String> {
     // Keep using this Child's HANDLE, never reopen a process by numeric PID.
     match child
@@ -377,17 +387,24 @@ mod tests {
             assert_eq!(fields[1].parse::<u32>().unwrap(), child.id());
             let port = fields[2].parse::<u16>().unwrap();
             assert_eq!(child_listeners_ready(&mut child, &[port]), Ok(true));
+            assert_eq!(require_proxy_runtime_ready(&mut child, &[port]), Ok(()));
             assert_eq!(owned_loopback_listeners_ready(pid, &[port]), Ok(false));
             assert_eq!(
                 child_listeners_ready(&mut child, &[occupied_port]),
                 Ok(false)
             );
+            assert!(require_proxy_runtime_ready(&mut child, &[occupied_port])
+                .unwrap_err()
+                .starts_with("PROXY_RUNTIME_NOT_READY"));
+            assert!(child.try_wait().unwrap().is_none());
             child.stdin.as_mut().unwrap().write_all(b"CLOSE\n").unwrap();
             receive(&messages, "OWNER_CLOSED");
             assert!(child.try_wait().unwrap().is_none());
             assert_eq!(child_listeners_ready(&mut child, &[port]), Ok(false));
+            assert!(require_proxy_runtime_ready(&mut child, &[port]).is_err());
             child.stdin.as_mut().unwrap().write_all(b"EXIT\n").unwrap();
             wait_exit(&mut child);
+            assert!(require_proxy_runtime_ready(&mut child, &[port]).is_err());
             // Simulate a stale/reused-PID table after actual child exit. Its
             // retained HANDLE remains authoritative, so that snapshot is refused.
             assert!(
