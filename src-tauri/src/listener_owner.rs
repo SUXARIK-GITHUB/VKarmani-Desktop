@@ -92,6 +92,37 @@ pub(crate) fn owned_loopback_listeners_ready(pid: u32, ports: &[u16]) -> Result<
     }
 }
 
+fn ready_from_owner_snapshot(
+    owned: Result<bool, String>,
+    check_retained_child: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    if !owned? {
+        return Ok(false);
+    }
+    check_retained_child()?;
+    Ok(true)
+}
+
+pub(crate) fn child_listeners_ready(
+    child: &mut std::process::Child,
+    ports: &[u16],
+) -> Result<bool, String> {
+    ready_from_owner_snapshot(owned_loopback_listeners_ready(child.id(), ports), || {
+        retained_child_alive(child)
+    })
+}
+
+fn retained_child_alive(child: &mut std::process::Child) -> Result<(), String> {
+    // Keep using this Child's HANDLE, never reopen a process by numeric PID.
+    match child
+        .try_wait()
+        .map_err(|_| "XRAY_READINESS_EXIT_UNKNOWN")?
+    {
+        Some(status) => Err(format!("XRAY_EXITED_DURING_READINESS: {:?}", status.code())),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,12 +222,132 @@ mod tests {
         }
     }
     #[test]
+    fn reused_pid_or_exit_after_snapshot_cannot_pass_a_dead_retained_child() {
+        let rows = table(&[listener(44, [127, 0, 0, 1], 10808)]);
+        for reason in [
+            "XRAY_EXITED_DURING_READINESS",
+            "XRAY_READINESS_EXIT_UNKNOWN",
+        ] {
+            // Even a matching numeric PID in a stale/reused table is insufficient.
+            assert_eq!(
+                ready_from_owner_snapshot(
+                    table_has_owned_loopback_listeners(&rows, 44, &[10808]),
+                    || Err(reason.into())
+                ),
+                Err(reason.into())
+            );
+        }
+        assert_eq!(
+            ready_from_owner_snapshot(Ok(false), || panic!(
+                "foreign/missing listener is not Ready"
+            )),
+            Ok(false)
+        );
+        assert_eq!(
+            ready_from_owner_snapshot(Err("TABLE_UNKNOWN".into()), || panic!(
+                "unknown table must not pass"
+            )),
+            Err("TABLE_UNKNOWN".into())
+        );
+    }
+    #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "CI-only isolated loopback socket; do not run native trials on the owner's PC"]
     fn windows_socket_owner_integration() {
+        use std::io::{BufRead, Write};
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
         use windows_sys::Win32::NetworkManagement::IpHelper::{
             MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
         };
+        assert_eq!(
+            std::env::var("GITHUB_ACTIONS").as_deref(),
+            Ok("true"),
+            "disposable CI runner only"
+        );
+        if let Ok(requested) = std::env::var("VKARMANI_LISTENER_FIXTURE_PORT") {
+            let port: u16 = requested.parse().unwrap();
+            let bound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port));
+            if port != 0 {
+                assert!(bound.is_err());
+                println!("BIND_REFUSED");
+                return;
+            }
+            let socket = bound.unwrap();
+            println!(
+                "OWNER_READY {} {}",
+                std::process::id(),
+                socket.local_addr().unwrap().port()
+            );
+            std::io::stdout().flush().unwrap();
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).unwrap();
+            assert_eq!(input.trim(), "CLOSE");
+            drop(socket);
+            println!("OWNER_CLOSED");
+            std::io::stdout().flush().unwrap();
+            input.clear();
+            std::io::stdin().read_line(&mut input).unwrap();
+            assert_eq!(input.trim(), "EXIT");
+            return;
+        }
+        fn spawn_fixture(
+            port: u16,
+        ) -> (crate::OwnedXrayProcess, std::sync::mpsc::Receiver<String>) {
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "listener_owner::tests::windows_socket_owner_integration",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("VKARMANI_LISTENER_FIXTURE_PORT", port.to_string())
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            // Retained process HANDLE and kill-on-close job; cleanup never reopens a PID.
+            let mut child = crate::OwnedXrayProcess::attach(child).unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            (child, rx)
+        }
+        fn receive(rx: &std::sync::mpsc::Receiver<String>, prefix: &str) -> String {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let line = rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("bounded fixture handshake");
+                if let Some(at) = line.find(prefix) {
+                    return line[at..].to_string();
+                }
+            }
+        }
+        fn wait_exit(child: &mut std::process::Child) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                assert!(Instant::now() < deadline, "fixture exit deadline");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         assert_eq!(std::mem::size_of::<MIB_TCPROW_OWNER_PID>(), 24);
         assert_eq!(std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table), 4);
         let socket = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -209,5 +360,41 @@ mod tests {
         );
         drop(socket);
         assert_eq!(owned_loopback_listeners_ready(pid, &[port]), Ok(false));
+        let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        let (mut rejected, messages) = spawn_fixture(occupied_port);
+        receive(&messages, "BIND_REFUSED");
+        wait_exit(&mut rejected);
+        assert_eq!(
+            owned_loopback_listeners_ready(pid, &[occupied_port]),
+            Ok(true)
+        );
+        // Two independent launches exercise restart without reusing an old handle.
+        for _ in 0..2 {
+            let (mut child, messages) = spawn_fixture(0);
+            let ready = receive(&messages, "OWNER_READY ");
+            let fields: Vec<_> = ready.split_whitespace().collect();
+            assert_eq!(fields[1].parse::<u32>().unwrap(), child.id());
+            let port = fields[2].parse::<u16>().unwrap();
+            assert_eq!(child_listeners_ready(&mut child, &[port]), Ok(true));
+            assert_eq!(owned_loopback_listeners_ready(pid, &[port]), Ok(false));
+            assert_eq!(
+                child_listeners_ready(&mut child, &[occupied_port]),
+                Ok(false)
+            );
+            child.stdin.as_mut().unwrap().write_all(b"CLOSE\n").unwrap();
+            receive(&messages, "OWNER_CLOSED");
+            assert!(child.try_wait().unwrap().is_none());
+            assert_eq!(child_listeners_ready(&mut child, &[port]), Ok(false));
+            child.stdin.as_mut().unwrap().write_all(b"EXIT\n").unwrap();
+            wait_exit(&mut child);
+            // Simulate a stale/reused-PID table after actual child exit. Its
+            // retained HANDLE remains authoritative, so that snapshot is refused.
+            assert!(
+                ready_from_owner_snapshot(Ok(true), || retained_child_alive(&mut child))
+                    .unwrap_err()
+                    .starts_with("XRAY_EXITED_DURING_READINESS")
+            );
+        }
     }
 }

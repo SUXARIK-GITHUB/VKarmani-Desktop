@@ -555,20 +555,7 @@ pub(crate) fn ps_quote(value: &str) -> String {
 }
 
 pub(crate) fn runtime_listeners_ready(child: &mut Child) -> Result<bool, String> {
-    let ready = crate::listener_owner::owned_loopback_listeners_ready(
-        child.id(),
-        &[HTTP_PORT, SOCKS_PORT, XRAY_API_PORT],
-    )?;
-    if ready {
-        // The table is a snapshot. Check the retained child HANDLE again after it.
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|_| "XRAY_READINESS_EXIT_UNKNOWN")?
-        {
-            return Err(format!("XRAY_EXITED_DURING_READINESS: {:?}", status.code()));
-        }
-    }
-    Ok(ready)
+    crate::listener_owner::child_listeners_ready(child, &[HTTP_PORT, SOCKS_PORT, XRAY_API_PORT])
 }
 
 fn wait_for_restarted_xray_ready(
@@ -912,6 +899,10 @@ fn try_self_restart_xray_runtime(
                 .unwrap_or_else(|| "XRAY_RESTART_LISTENERS_LOST".into());
             return Err(Box::new((runtime, error)));
         }
+    }
+    if let Err(error) = check_current_operation(state) {
+        let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+        return Err(Box::new((runtime, error)));
     }
     runtime.child = child;
     runtime.started_at = unix_now_string();
