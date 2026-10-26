@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(target_os = "windows")]
+mod native_services;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,30 +55,7 @@ fn classify_services(mut services: Vec<WindowsServiceInfo>) -> Vec<WindowsServic
 pub(crate) fn service_inventory() -> Result<Vec<WindowsServiceInfo>, String> {
     #[cfg(target_os = "windows")]
     {
-        let raw = run_powershell(
-            r#"
-$ErrorActionPreference = 'Stop'
-$items = @(Get-CimInstance Win32_Service | Select-Object -First 2049)
-if ($items.Count -gt 2048) { throw 'Service inventory limit' }
-$result = @($items | ForEach-Object {
-  $command = [Environment]::ExpandEnvironmentVariables([string]$_.PathName)
-  $exe = ''
-  if ($command -match '^\s*"([^"\r\n]+?\.exe)"') { $exe = $Matches[1] }
-  elseif ($command -match '^\s*([^\r\n]+?\.exe)(\s|$)') { $exe = $Matches[1] }
-  @{ name=[string]$_.Name; displayName=[string]$_.DisplayName; exePath=$exe; processId=[uint32]$_.ProcessId; state=[string]$_.State; serviceType=[string]$_.ServiceType }
-})
-ConvertTo-Json -InputObject $result -Depth 3 -Compress
-"#,
-        )?;
-        if raw.len() > 2 * 1024 * 1024 {
-            return Err("SERVICE_INVENTORY_LIMIT".into());
-        }
-        let services: Vec<WindowsServiceInfo> =
-            serde_json::from_str(&raw).map_err(|_| "SERVICE_INVENTORY_INVALID".to_string())?;
-        if services.len() > 2048 {
-            return Err("SERVICE_INVENTORY_LIMIT".into());
-        }
-        Ok(classify_services(services))
+        native_services::enumerate().map(classify_services)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -616,7 +595,6 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn real_service_inventory_is_read_only() {
-        let _fixture = HELPER_TEST_LOCK.lock().unwrap();
         let services = service_inventory().unwrap();
         assert!(!services.is_empty());
         assert!(services.len() <= 2048);
