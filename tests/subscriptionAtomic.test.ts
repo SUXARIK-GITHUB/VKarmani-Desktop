@@ -11,6 +11,14 @@ const config=(name:string)=>({remarks:name,outbounds:[{tag:'proxy',protocol:'vle
 beforeEach(()=>{vi.stubGlobal('window',{setTimeout,clearTimeout});mocks.fetch.mockReset();mocks.json.mockReset();mocks.cache.mockReset();mocks.cache.mockResolvedValue(undefined);mocks.probe.mockReset();});
 afterEach(()=>vi.unstubAllGlobals());
 describe('actual subscription-client atomic refresh and generation ownership',()=>{
+  it('a current failed health request clears the old successful diagnostics observation', async () => {
+    const client = new RemnawaveClient();
+    mocks.probe.mockResolvedValueOnce({ success: true, publicIp: '192.0.2.44' });
+    await client.runConnectivityProbe();
+    mocks.probe.mockRejectedValueOnce(new Error('CONNECTIVITY_RUNTIME_UNAVAILABLE'));
+    await expect(client.runConnectivityProbe()).rejects.toThrow('CONNECTIVITY_RUNTIME_UNAVAILABLE');
+    expect((await client.loadDiagnostics()).logLines.join('\n')).not.toContain('192.0.2.44');
+  });
   it.each(['invalidateProfileSync', 'clearSessionCache'] as const)('late connectivity probe cannot repopulate diagnostics after %s', async revoke => {
     for (const fails of [false, true]) {
       const client = new RemnawaveClient(); let release!: (value: unknown) => void; let fail!: (error: Error) => void;

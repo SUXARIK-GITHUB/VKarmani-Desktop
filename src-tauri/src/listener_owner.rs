@@ -358,6 +358,28 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+        fn probe_state(child: crate::OwnedXrayProcess) -> crate::AppState {
+            let state = crate::AppState::default();
+            *state.runtime.lock().unwrap() = Some(crate::ManagedCore {
+                child,
+                core_path: String::new(),
+                config_path: String::new(),
+                config_hash: String::new(),
+                request_hash: String::new(),
+                log_path: String::new(),
+                server_id: String::new(),
+                server_fingerprint: None,
+                started_at: "synthetic-start".into(),
+                telemetry_epoch: 1,
+                network_mode: "proxy".into(),
+                tun_interface_name: None,
+                tun_server_ips: Vec::new(),
+                self_restart_count: 0,
+                last_self_restart_at: None,
+                physical_binding: None,
+            });
+            state
+        }
         assert_eq!(std::mem::size_of::<MIB_TCPROW_OWNER_PID>(), 24);
         assert_eq!(std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table), 4);
         let socket = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -381,11 +403,41 @@ mod tests {
         );
         // Two independent launches exercise restart without reusing an old handle.
         for _ in 0..2 {
-            let (mut child, messages) = spawn_fixture(0);
+            let (child, messages) = spawn_fixture(0);
             let ready = receive(&messages, "OWNER_READY ");
             let fields: Vec<_> = ready.split_whitespace().collect();
             assert_eq!(fields[1].parse::<u32>().unwrap(), child.id());
             let port = fields[2].parse::<u16>().unwrap();
+            let state = probe_state(child);
+            let identity =
+                crate::connectivity_probe_runtime_identity(&state, None, &[port]).unwrap();
+            assert!(crate::connectivity_probe_runtime_identity(
+                &state,
+                Some(&identity),
+                &[occupied_port]
+            )
+            .is_err());
+            // A new per-launch epoch invalidates an in-flight HTTP response even
+            // when numeric PID/start text is unchanged (synthetic reuse window).
+            state
+                .runtime
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .telemetry_epoch += 1;
+            assert_eq!(
+                crate::connectivity_probe_runtime_identity(&state, Some(&identity), &[port])
+                    .unwrap_err(),
+                "CONNECTIVITY_RUNTIME_SUPERSEDED"
+            );
+            let fresh = crate::connectivity_probe_runtime_identity(&state, None, &[port]).unwrap();
+            assert_ne!(identity, fresh);
+            assert_eq!(
+                crate::connectivity_probe_runtime_identity(&state, Some(&fresh), &[port]).unwrap(),
+                fresh
+            );
+            let mut child = state.runtime.lock().unwrap().take().unwrap().child;
             assert_eq!(child_listeners_ready(&mut child, &[port]), Ok(true));
             assert_eq!(require_proxy_runtime_ready(&mut child, &[port]), Ok(()));
             assert_eq!(owned_loopback_listeners_ready(pid, &[port]), Ok(false));
@@ -402,6 +454,9 @@ mod tests {
             assert!(child.try_wait().unwrap().is_none());
             assert_eq!(child_listeners_ready(&mut child, &[port]), Ok(false));
             assert!(require_proxy_runtime_ready(&mut child, &[port]).is_err());
+            let state = probe_state(child);
+            assert!(crate::connectivity_probe_runtime_identity(&state, None, &[port]).is_err());
+            let mut child = state.runtime.lock().unwrap().take().unwrap().child;
             child.stdin.as_mut().unwrap().write_all(b"EXIT\n").unwrap();
             wait_exit(&mut child);
             assert!(require_proxy_runtime_ready(&mut child, &[port]).is_err());

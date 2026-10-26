@@ -1732,18 +1732,41 @@ pub(crate) fn repair_runtime_environment_blocking(app: AppHandle) -> Result<Runt
 }
 
 #[tauri::command]
-pub(crate) async fn connectivity_probe() -> Result<ConnectivityProbe, String> {
-    tauri::async_runtime::spawn_blocking(connectivity_probe_blocking)
+pub(crate) async fn connectivity_probe(app: AppHandle) -> Result<ConnectivityProbe, String> {
+    tauri::async_runtime::spawn_blocking(move || connectivity_probe_blocking(app))
         .await
         .map_err(|error| format!("Проверка маршрута была прервана: {error}"))?
 }
 
-pub(crate) fn connectivity_probe_blocking() -> Result<ConnectivityProbe, String> {
+pub(crate) fn connectivity_probe_runtime_identity(
+    state: &AppState,
+    expected: Option<&str>,
+    ports: &[u16],
+) -> Result<String, String> {
+    let mut runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "CONNECTIVITY_RUNTIME_STATE_UNAVAILABLE")?;
+    let runtime = runtime.as_mut().ok_or("CONNECTIVITY_RUNTIME_UNAVAILABLE")?;
+    let identity = traffic_runtime_id(runtime);
+    if expected.is_some_and(|expected| expected != identity) {
+        return Err("CONNECTIVITY_RUNTIME_SUPERSEDED".into());
+    }
+    crate::listener_owner::require_proxy_runtime_ready(&mut runtime.child, ports)
+        .map_err(|error| format!("CONNECTIVITY_RUNTIME_NOT_READY: {error}"))?;
+    Ok(identity)
+}
+
+pub(crate) fn connectivity_probe_blocking(app: AppHandle) -> Result<ConnectivityProbe, String> {
+    let state = app.state::<AppState>();
+    let ports = [HTTP_PORT, SOCKS_PORT, XRAY_API_PORT];
+    let identity = connectivity_probe_runtime_identity(&state, None, &ports)?;
     let checked_at = unix_now_string();
     let http_port_open = tcp_port_open("127.0.0.1", HTTP_PORT, 1200);
     let socks_port_open = tcp_port_open("127.0.0.1", SOCKS_PORT, 1200);
 
     if !http_port_open {
+        connectivity_probe_runtime_identity(&state, Some(&identity), &ports)?;
         return Ok(ConnectivityProbe {
             success: false,
             checked_at,
@@ -1764,7 +1787,11 @@ pub(crate) fn connectivity_probe_blocking() -> Result<ConnectivityProbe, String>
     )?;
 
     let started = Instant::now();
-    let public_ip = fetch_public_ip(&client)?;
+    let public_ip = fetch_public_ip(&client);
+    // Do not hold a runtime/operation lock during HTTP. A restart or disconnect
+    // may complete while it is in flight; that response must not publish success.
+    connectivity_probe_runtime_identity(&state, Some(&identity), &ports)?;
+    let public_ip = public_ip?;
 
     Ok(ConnectivityProbe {
         success: true,
@@ -2554,5 +2581,30 @@ mod ping_budget_tests {
         let permit = PingPermit::acquire().unwrap();
         drop(permit);
         assert_eq!(PING_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod connectivity_runtime_tests {
+    use super::*;
+    #[test]
+    fn absent_runtime_refuses_probe_before_any_network_request() {
+        assert_eq!(
+            connectivity_probe_runtime_identity(&AppState::default(), None, &[HTTP_PORT])
+                .unwrap_err(),
+            "CONNECTIVITY_RUNTIME_UNAVAILABLE"
+        );
+    }
+    #[test]
+    fn unreadable_runtime_state_is_not_treated_as_an_owned_proxy() {
+        let state = AppState::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.runtime.lock().unwrap();
+            panic!("synthetic poisoned state");
+        }));
+        assert_eq!(
+            connectivity_probe_runtime_identity(&state, None, &[HTTP_PORT]).unwrap_err(),
+            "CONNECTIVITY_RUNTIME_STATE_UNAVAILABLE"
+        );
     }
 }
