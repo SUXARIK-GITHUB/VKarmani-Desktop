@@ -1213,6 +1213,12 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         ));
     }
 
+    if !runtime_listeners_ready(&mut child)? {
+        return Err(
+            "XRAY_CONNECT_LISTENERS_LOST: локальные listener утрачены до завершения подключения."
+                .into(),
+        );
+    }
     _operation_guard.stage("publishing")?;
 
     if let Ok(mut guard) = state.active_server_label.lock() {

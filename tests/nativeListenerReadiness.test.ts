@@ -14,12 +14,20 @@ describe('native readiness uses the retained child, never any reachable port', (
   it('checks the child handle after the owner snapshot and after restart setup', () => {
     const source = read('runtime_lifecycle.rs');
     const helper = source.split('pub(crate) fn runtime_listeners_ready')[1].split('fn wait_for_restarted')[0];
-    expect(helper).toContain('child.id()');
-    const compact = helper.replace(/\s+/g, '');
-    expect(compact.indexOf('owned_loopback_listeners_ready')).toBeLessThan(compact.indexOf('child.try_wait()'));
+    expect(helper).toContain('child_listeners_ready(');
+    const owner = read('listener_owner.rs').split('pub(crate) fn child_listeners_ready')[1].split('#[cfg(test)]')[0];
+    expect(owner).toContain('child.id()');
+    const compact = owner.replace(/\s+/g, '');
+    expect(compact.indexOf('owned_loopback_listeners_ready')).toBeLessThan(compact.indexOf('retained_child_alive(child)'));
+    expect(read('listener_owner.rs').split('fn retained_child_alive')[1].split('#[cfg(test)]')[0].replace(/\s+/g, '')).toContain('child.try_wait()');
     const publish = source.split('runtime.child = child;')[0];
     expect(publish).toContain('match runtime_listeners_ready(&mut child)');
     expect(publish.lastIndexOf('current_physical_binding()')).toBeLessThan(publish.lastIndexOf('match runtime_listeners_ready(&mut child)'));
     expect(publish.slice(publish.lastIndexOf('match runtime_listeners_ready(&mut child)'))).toContain('return Err(Box::new((runtime, error)))');
+  });
+  it('rechecks listeners after initial route setup before publishing, including a still-live child that lost its binds', () => {
+    const source = read('commands.rs');
+    const final = source.split('Xray остановился до завершения подключения.')[1].split('_operation_guard.stage("publishing")')[0];
+    expect(final).toContain('runtime_listeners_ready(&mut child)?');
   });
 });
