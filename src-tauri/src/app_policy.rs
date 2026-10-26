@@ -263,6 +263,31 @@ pub(crate) fn ensure_tun_process_enforcement(
     }
     Ok(())
 }
+pub(crate) fn ensure_tun_process_admission(
+    network_mode: Option<&str>,
+    policy_mode: Option<&str>,
+    entries: &[SplitTunnelEntryPayload],
+    isolated_owner_test: bool,
+) -> Result<(), String> {
+    if !isolated_owner_test {
+        return ensure_tun_process_enforcement(network_mode, policy_mode, entries);
+    }
+    if network_mode.is_some_and(|v| v.eq_ignore_ascii_case("tun")) {
+        let mode = policy_mode.unwrap_or("selected");
+        let active = active_policy_entries(entries, mode)?;
+        if mode == "selected"
+            && !active
+                .iter()
+                .any(|e| e.policy.as_deref().unwrap_or("VPN") == "VPN")
+        {
+            return Err(
+                "RULE_SELECTION_EMPTY: selected mode requires an active VPN application/service"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
 pub(crate) fn build_split_tunnel_rule_plan_for_mode(
     entries: &[SplitTunnelEntryPayload],
     mode: &str,
@@ -362,6 +387,27 @@ mod tests {
             &[entry("app.exe", "VPN")]
         )
         .is_ok());
+    }
+    #[test]
+    fn isolated_owner_test_admission_keeps_modes_rules_and_empty_selection_validation() {
+        let entries = vec![
+            entry("C:/A/app.exe", "VPN"),
+            entry("D:/B/app.exe", "DIRECT"),
+        ];
+        let before = serde_json::to_value(&entries).unwrap();
+        for mode in ["all", "selected", "exclude"] {
+            assert!(ensure_tun_process_admission(Some("tun"), Some(mode), &entries, true).is_ok());
+            assert!(
+                ensure_tun_process_admission(Some("tun"), Some(mode), &entries, false).is_err()
+            );
+        }
+        assert!(
+            ensure_tun_process_admission(Some("tun"), Some("selected"), &[], true)
+                .unwrap_err()
+                .starts_with("RULE_SELECTION_EMPTY")
+        );
+        assert!(ensure_tun_process_admission(Some("tun"), Some("wrong"), &entries, true).is_err());
+        assert_eq!(serde_json::to_value(&entries).unwrap(), before);
     }
     fn service(name: &str, exe: &str, pid: u32, kind: &str) -> WindowsServiceInfo {
         WindowsServiceInfo {

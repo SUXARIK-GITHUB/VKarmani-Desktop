@@ -64,6 +64,8 @@ use tauri::{
 
 mod runtime_integrity;
 pub(crate) use runtime_integrity::*;
+mod local_test;
+pub(crate) use local_test::*;
 mod platform;
 pub(crate) use platform::*;
 mod state;

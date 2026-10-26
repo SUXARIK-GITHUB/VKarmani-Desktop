@@ -705,10 +705,18 @@ pub(crate) fn validate_xray_config_with_core(
         .arg("run")
         .arg("-test")
         .arg("-config")
-        .arg(config_path)
-        .stdin(Stdio::null());
+        .arg(if integrity.stdin_config.is_some() {
+            Path::new("stdin:")
+        } else {
+            config_path
+        })
+        .stdin(if integrity.stdin_config.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
 
-    run_command_with_timeout(command, Duration::from_secs(8), "xray config test")
+    run_command_with_timeout_and_input(command, Duration::from_secs(8), "xray config test", integrity.stdin_config.clone())
         .map(|_| ())
         .map_err(|error| format!("Xray-core не принял runtime-конфиг. Подключение остановлено до запуска процесса: {error}"))
 }
@@ -752,10 +760,11 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         app,
         requested_generation,
     } = request;
-    ensure_tun_process_enforcement(
+    ensure_tun_process_admission(
         network_mode.as_deref(),
         tun_routing_mode.as_deref(),
         split_tunnel_entries.as_deref().unwrap_or_default(),
+        local_test_build() && app.config().identifier == LOCAL_TEST_ID,
     )
     .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
     let state = app.state::<AppState>();

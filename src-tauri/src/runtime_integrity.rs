@@ -27,6 +27,7 @@ pub(crate) struct LaunchIntegrity {
     pub(crate) config: Option<PathBuf>,
     _files: Vec<File>,
     staged_config: bool,
+    pub(crate) stdin_config: Option<Vec<u8>>,
 }
 impl Drop for LaunchIntegrity {
     fn drop(&mut self) {
@@ -461,10 +462,15 @@ mod windows {
                 config: config.map(|(p, _)| p.to_path_buf()),
                 _files: source_locks,
                 staged_config: false,
+                stdin_config: None,
             });
         }
         // No elevated binary/config execution from a user-writable location.
-        let base = program_data()?.join("VKarmani-Protected-Runtime");
+        let base = program_data()?.join(if local_test_build() {
+            "VKarmani-Local-Test-Protected-Runtime"
+        } else {
+            "VKarmani-Protected-Runtime"
+        });
         let mut pinned = lock_ancestors(&base)?;
         pinned.push(create_protected_directory(&base)?);
         let package = base.join(sha256_hex_bytes(COMPILED_CORE_MANIFEST.as_bytes()));
@@ -521,6 +527,7 @@ mod windows {
             config: staged_config,
             _files: pinned,
             staged_config: config.is_some(),
+            stdin_config: None,
         })
     }
 }
@@ -556,13 +563,14 @@ pub(crate) fn ensure_safe_log_directory(path: &Path) -> Result<Vec<File>, String
     }
 }
 pub(crate) fn write_new_runtime_config(path: &Path, content: &[u8]) -> Result<(), String> {
+    let content = runtime_config_disk_bytes(content)?;
     let _parents = lock_runtime_parent_paths(path)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .map_err(|_| "CONFIG_CREATE_NEW_FAILED")?;
-    let result = file.write_all(content).and_then(|_| file.sync_all());
+    let result = file.write_all(&content).and_then(|_| file.sync_all());
     drop(file);
     if result.is_err() {
         let _ = fs::remove_file(path);
@@ -602,6 +610,15 @@ pub(crate) fn prepare_core_launch(
 ) -> Result<LaunchIntegrity, String> {
     #[cfg(target_os = "windows")]
     {
+        if local_test_build() {
+            if let Some((path, hash)) = config {
+                let plain = local_config_bytes(path, hash)?;
+                let mut integrity = windows::prepare(core, None)?;
+                integrity.config = Some(path.to_path_buf());
+                integrity.stdin_config = Some(plain);
+                return Ok(integrity);
+            }
+        }
         windows::prepare(core, config)
     }
     #[cfg(not(target_os = "windows"))]
@@ -613,6 +630,10 @@ pub(crate) fn prepare_core_launch(
 pub(crate) fn read_verified_runtime_config(path: &Path, hash: &str) -> Result<Value, String> {
     #[cfg(target_os = "windows")]
     {
+        if local_test_build() {
+            let plain = local_config_bytes(path, hash)?;
+            return serde_json::from_slice(&plain).map_err(|_| "LOCAL_CONFIG_JSON_INVALID".into());
+        }
         windows::read_config(path, hash)
     }
     #[cfg(not(target_os = "windows"))]

@@ -134,6 +134,22 @@ pub(crate) fn refresh_tray_menu(app: &AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+    if let Err(error) = validate_local_test_config(context.config()) {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
+    // Pure build inspection: before Builder, WebView, storage or network setup.
+    if std::env::args().any(|value| value == "--local-test-check") {
+        match local_test_metadata(context.config()) {
+            Ok(value) => println!("{value}"),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     // Keep single-instance protection only for release builds. In dev mode we intentionally
     // allow local restarts from the BAT launcher without getting an `unused_mut` warning.
     #[cfg(debug_assertions)]
@@ -262,8 +278,10 @@ pub fn run() {
             reveal_main_window(app.handle());
             let _ = append_interface_event(app.handle(), "Главное окно активировано при запуске.");
 
-            app.handle()
-                .plugin(tauri_plugin_updater::Builder::new().build())?;
+            if !local_test_build() {
+                app.handle()
+                    .plugin(tauri_plugin_updater::Builder::new().build())?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -315,7 +333,7 @@ pub fn run() {
             pick_executable_path,
             restart_application
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building VKarmani Desktop")
         .run(|app, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {

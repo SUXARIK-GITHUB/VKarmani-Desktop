@@ -275,9 +275,7 @@ struct NativeProxyBackend<'a> {
     app: &'a AppHandle,
 }
 fn journal_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app
-        .path()
-        .app_local_data_dir()
+    Ok(application_data_root(app)
         .map_err(|_| "Нет proxy journal каталога".to_string())?
         .join("system-proxy-ownership-v2.dpapi"))
 }

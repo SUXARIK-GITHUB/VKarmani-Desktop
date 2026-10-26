@@ -53,26 +53,30 @@ it.each((['ru', 'en'] as const).flatMap(language => (['all', 'selected', 'exclud
   expect(isTunProcessRoutingBlocked(entries, mode)).toBe(mode === 'selected');
 });
 
-it('places a concise limitation with an All applications action beside the selected mode', () => {
+it('keeps the selected choice without the obsolete warning or forced-All action', () => {
   const html = renderToStaticMarkup(modal('selected'));
-  expect(html).toContain('Selected-app routing is unavailable');
-  expect(html).toContain('Switch to All applications');
+  expect(html).not.toContain('Selected-app routing is unavailable');
+  expect(html).not.toContain('Switch to All applications');
+  expect(html).toContain('aria-checked="true" tabindex="0" class="active">Selected through VPN');
+  expect(isTunProcessRoutingBlocked(rules, 'selected')).toBe(true); // Ordinary builds stay protected.
   expect(html).not.toContain('Add at least one');
 });
 
-it('keeps active DIRECT intent visible in both settings and modal; never presents all as sufficient', () => {
+it('preserves DIRECT intent and ordinary-build refusal without obsolete modal/settings banners', () => {
   const direct = normalizeStoredRules(matrix[2].entries);
   for (const html of [renderToStaticMarkup(modal('all', direct)), renderToStaticMarkup(<SettingsTab settings={{...defaultSettings,tunnelMode:'tun'}} splitTunnelEntries={direct} language="en" onToggleSetting={noop} onTunnelModeChange={noop} onIpStackChange={noop} onTunRoutingModeChange={noop} onLanguageChange={noop} onRoutingExclusionsChange={noop} />)]) {
-    expect(html).toContain('Disable active DIRECT rules');
+    expect(html).not.toContain('Disable active DIRECT rules');
   }
   expect(direct[0]).toMatchObject({enabled:true,policy:'DIRECT'});
+  expect(isTunProcessRoutingBlocked(direct, 'all')).toBe(true);
 });
 
-it('renders the disabled reason as visible text and an actionable TUN control, not just a title', () => {
+it('removes the extra CTA banner/action while retaining the actual disabled reason on the control', () => {
   const reason = 'Selected-app routing is unavailable';
   const html = renderToStaticMarkup(<OverviewTab connectionState="idle" connectLabel="Connect" selectedServer={null} selectedServerId="" servers={[]} allServerCount={0} searchValue="" sessionDurationText="00:00:00" language="en" showDiagnostics={false} tunnelMode="tun" onToggleConnection={noop} onTunnelModeChange={noop} onSelectServer={noop} onSearchChange={noop} onRefreshServers={noop} onRefreshPing={noop} onToggleFavoriteServer={noop} favoriteServerIds={[]} trafficReceivedText="0" trafficSentText="0" trafficChartBars={[]} vpnExternalIp="" packetLossText="" canConnect={false} connectDisabledReason={reason} activeSplitTunnelCount={3} onOpenSplitTunnel={noop}/>);
-  expect(html).toContain('>' + reason + '<');
-  expect(html).toContain('Configure TUN');
+  expect(html).toContain('title="' + reason + '"');
+  expect(html).not.toContain('vk-connect-disabled-reason');
+  expect(html).not.toContain('Configure TUN');
 });
 
 it.each(['selected','all','exclude'] as const)('blocked connected Proxy→TUN (%s) preserves the prior connection and preferences before admission', async mode => {

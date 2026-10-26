@@ -2,6 +2,7 @@ import type { ReleaseChannel, UpdateInfo } from '../types/vpn';
 import { appVersion, isTauriRuntime } from './runtime';
 import { quiescePersistentWrites, resumePersistentWrites } from './storage';
 import type { Update } from '@tauri-apps/plugin-updater';
+import { isLocalTestBuild } from './localTest';
 
 const wait = (value: number) => new Promise<void>((resolve) => window.setTimeout(resolve, value));
 
@@ -34,6 +35,7 @@ function normalizeUpdaterError(error: unknown) {
 }
 
 export async function checkForUpdates(channel: ReleaseChannel): Promise<UpdateInfo> {
+  if (isLocalTestBuild()) return { available:false, currentVersion:appVersion, source:'tauri', status:'idle', message:'LOCAL TEST: обновления отключены.' };
   if (isTauriRuntime) {
     try {
       const { check } = await import('@tauri-apps/plugin-updater');
@@ -88,6 +90,7 @@ export async function installAvailableUpdate(
   onProgress: (percent: number) => void,
   beforeInstall?: () => Promise<void>
 ): Promise<{ ok: true } | { ok: false; message: string }> {
+  if (isLocalTestBuild()) return { ok:false, message:'LOCAL TEST: установка обновлений запрещена.' };
   if (isTauriRuntime) {
     let interactionRoot: HTMLElement | null = null;
     let previousInert = false;

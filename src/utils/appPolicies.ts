@@ -1,5 +1,6 @@
 import type { SplitTunnelEntry, SplitTunnelEntryKind, RoutingPolicy, TunRoutingMode } from '../types/vpn';
 import { tr, type UiLanguage } from '../i18n';
+import { isLocalTestBuild } from '../services/localTest';
 
 export const MAX_APP_RULES = 256;
 export function normalizeRuleValue(kind: SplitTunnelEntryKind, value: string, legacy = false): string {
@@ -80,11 +81,13 @@ export function isSelectedTunPolicyEmpty(entries: SplitTunnelEntry[], mode: TunR
 }
 
 export function isTunProcessRoutingBlocked(entries: SplitTunnelEntry[], mode: TunRoutingMode): boolean {
+  if (isLocalTestBuild()) return isSelectedTunPolicyEmpty(entries, mode);
   return mode === 'selected' || activePolicyEntries(entries, mode).length > 0;
 }
 
 export function tunProcessRoutingBlockMessage(entries: SplitTunnelEntry[], mode: TunRoutingMode, language: UiLanguage): string {
   if (!isTunProcessRoutingBlocked(entries, mode)) return '';
+  if (isLocalTestBuild()) return tr(language, 'Выберите хотя бы одно включённое приложение или службу через VPN.', 'Select at least one enabled VPN application or service.');
   const selected = mode === 'selected'
     ? tr(language, 'Маршрутизация выбранных приложений недоступна. Перейдите к «Все приложения».', 'Selected-app routing is unavailable. Switch to All applications.')
     : '';
