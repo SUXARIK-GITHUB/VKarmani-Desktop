@@ -2026,8 +2026,20 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       if (recoveryEpoch !== recoveryEpochRef.current) return;
       const keyPersisted = await saveStoredAccessKey(normalizedAccessKey);
       if (recoveryEpoch !== recoveryEpochRef.current) return;
-      const nativeSessionReady = await setNativeSessionAuthorized(true);
+      if (isTauriRuntime && !keyPersisted) {
+        reportPersistentFailure(new NativeStorageError('STATE_WRITE_FAILED', tr(language,
+          'Сохранение ключа не подтверждено. Вход отложен; исходные данные сохранены.',
+          'Key persistence is unconfirmed. Sign in deferred; original data retained.')));
+        return;
+      }
+      const nativeSessionReady = await setNativeSessionAuthorized(true, normalizedAccessKey);
       if (recoveryEpoch !== recoveryEpochRef.current) return;
+      if (isTauriRuntime && !nativeSessionReady) {
+        const message = tr(language, 'SESSION_AUTH_UNCONFIRMED: native-сессия для этого ключа не подтверждена. Повторите вход.',
+          'SESSION_AUTH_UNCONFIRMED: native session for this key is unconfirmed. Retry sign in.');
+        setErrorText(message); pushToast(message, 'error');
+        return;
+      }
       authorizedAccessKeyRef.current = normalizedAccessKey;
       setSession(response); setDevices(nextDevices); setIsAuthorized(true);
 
