@@ -12,11 +12,15 @@ beforeEach(()=>{vi.stubGlobal('window',{setTimeout,clearTimeout});mocks.fetch.mo
 afterEach(()=>vi.unstubAllGlobals());
 describe('actual subscription-client atomic refresh and generation ownership',()=>{
   it.each(['invalidateProfileSync', 'clearSessionCache'] as const)('late connectivity probe cannot repopulate diagnostics after %s', async revoke => {
-    const client = new RemnawaveClient(); let release!: (value: unknown) => void;
-    mocks.probe.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
-    const pending = client.runConnectivityProbe(); const rejected = expect(pending).rejects.toThrow('CONNECTIVITY_PROBE_CANCELLED');
-    client[revoke](); release({ success: true, publicIp: '192.0.2.11', message: 'old-session' }); await rejected;
-    expect((await client.loadDiagnostics()).logLines.join('\n')).not.toContain('192.0.2.11');
+    for (const fails of [false, true]) {
+      const client = new RemnawaveClient(); let release!: (value: unknown) => void; let fail!: (error: Error) => void;
+      mocks.probe.mockImplementationOnce(() => new Promise((yes, no) => { release = yes; fail = no; }));
+      const pending = client.runConnectivityProbe(); const rejected = expect(pending).rejects.toThrow('CONNECTIVITY_PROBE_CANCELLED');
+      client[revoke]();
+      if (fails) fail(new Error('obsolete session error')); else release({ success: true, publicIp: '192.0.2.11', message: 'old-session' });
+      await rejected;
+      expect((await client.loadDiagnostics()).logLines.join('\n')).not.toContain('192.0.2.11');
+    }
   });
   it('a delayed probe from subscription A cannot enter subscription B diagnostics', async () => {
     const client = new RemnawaveClient(); client.hydrateCachedServers([], key);
