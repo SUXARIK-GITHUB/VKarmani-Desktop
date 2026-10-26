@@ -39,8 +39,10 @@ it('checks installation policy only after verified download and durable flush, c
   expect(backend.snapshot.payload.public.selectedServerId).toBe('editable-again');
 });
 
+const cleanRuntime = { bridge: 'tauri', tunnelActive: false, proxyOwnership: 'none', routeOwnership: 'none' };
 it.each([
-  { label: 'idle', active: false, runtime: { bridge: 'tauri', tunnelActive: false }, installAllowed: true },
+  { label: 'idle', active: false, runtime: { ...cleanRuntime }, installAllowed: true },
+  { label: 'foreign enabled Proxy without our journal', active: false, runtime: { ...cleanRuntime, systemProxyEnabled: true }, installAllowed: true },
   { label: 'active', active: true, runtime: { bridge: 'tauri', tunnelActive: true }, installAllowed: false },
   { label: 'unavailable', active: false, runtime: null, installAllowed: false },
   { label: 'unverified bridge', active: false, runtime: { bridge: 'web-preview', tunnelActive: false }, installAllowed: false },
@@ -48,7 +50,13 @@ it.each([
   { label: 'live PID despite idle UI', active: false, runtime: { bridge: 'tauri', tunnelActive: false, xrayPid: 999 }, installAllowed: false },
   { label: 'recovery before download', active: false, runtime: { bridge: 'tauri', tunnelActive: false }, installAllowed: false },
   { label: 'recovery during download', active: false, runtime: { bridge: 'tauri', tunnelActive: false }, installAllowed: false },
-  { label: 'automatic idle', active: false, runtime: { bridge: 'tauri', tunnelActive: false }, installAllowed: true }
+  { label: 'automatic idle', active: false, runtime: { ...cleanRuntime }, installAllowed: true },
+  ...['confirmed', 'missing', 'changed', 'unconfirmed', 'unavailable'].map(routeOwnership => ({ label: `pending route ${routeOwnership}`, active: false, runtime: { ...cleanRuntime, routeOwnership }, installAllowed: false })),
+  ...['owned', 'prepared', 'changed', 'restored-pending-journal', 'unavailable'].map(proxyOwnership => ({ label: `pending Proxy ${proxyOwnership}`, active: false, runtime: { ...cleanRuntime, proxyOwnership }, installAllowed: false })),
+  { label: 'missing route ownership', active: false, runtime: { bridge: 'tauri', tunnelActive: false, proxyOwnership: 'none' }, installAllowed: false },
+  { label: 'missing Proxy ownership', active: false, runtime: { bridge: 'tauri', tunnelActive: false, routeOwnership: 'none' }, installAllowed: false },
+  { label: 'both ownership fields missing', active: false, runtime: { bridge: 'tauri', tunnelActive: false }, installAllowed: false },
+  { label: 'cleanup changes during download', active: false, runtime: { ...cleanRuntime }, installAllowed: false }
 ])('actual App installer preserves connections and checks $label state', async ({ label, active, runtime, installAllowed }) => {
   const source = ts.createSourceFile('App.tsx', readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   let handler: ts.FunctionDeclaration | undefined;
@@ -60,7 +68,10 @@ it.each([
   const install = vi.fn();
   const close = vi.fn().mockResolvedValue(undefined);
   const recoveryModeRef = { current: label === 'recovery before download' };
-  mocks.check.mockResolvedValue({ download: vi.fn(async () => { if (label === 'recovery during download') recoveryModeRef.current = true; }), install, close });
+  mocks.check.mockResolvedValue({ download: vi.fn(async () => {
+    if (label === 'recovery during download') recoveryModeRef.current = true;
+    if (label === 'cleanup changes during download') Object.assign(runtime!, { routeOwnership: 'unconfirmed' });
+  }), install, close });
   const storage = await import('../src/services/storage'); await storage.loadPersistentSnapshot();
   const updater = await import('../src/services/updater');
   const connectionLease = { current: false };
@@ -83,6 +94,12 @@ it.each([
   expect(connectionLease.current).toBe(installAllowed);
   expect(close).toHaveBeenCalledTimes(label === 'recovery before download' ? 0 : 1);
   expect(document.body.inert).toBe(installAllowed);
+  expect(bindings.updaterActionLock.current).toBe(installAllowed);
+  if (!installAllowed) {
+    storage.saveSelectedServerId('editable-after-install-refusal');
+    await storage.flushPersistentWrites();
+    expect(backend.snapshot.payload.public.selectedServerId).toBe('editable-after-install-refusal');
+  }
 });
 
 it('does not check installation policy or run installer after signature/download failure', async () => {

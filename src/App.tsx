@@ -2720,6 +2720,9 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         if (connectionStateRef.current !== 'idle' || runtime?.tunnelActive || runtime?.xrayPid || runtime?.operation || managedReconnectRef.current) {
           throw new Error(tr(language, 'Обновление скачано и проверено. Отключите VPN и повторите установку. Соединение не изменено.', 'Update downloaded and verified. Disconnect VPN and retry installation. Connection unchanged.'));
         }
+        if (isTauriRuntime && (runtime?.proxyOwnership !== 'none' || runtime?.routeOwnership !== 'none')) {
+          throw new Error(tr(language, 'Очистка Proxy или маршрутов VKarmani не подтверждена. Установка отложена; настройки сети не изменены.', 'VKarmani Proxy or route cleanup is unconfirmed. Installation deferred; network settings unchanged.'));
+        }
       });
 
       if (!result.ok) {
