@@ -37,6 +37,43 @@ function appEffectContaining(fragment: string, bindings: Record<string, unknown>
   return new Function('bindings', 'const {' + Object.keys(bindings).join(',') + '}=bindings;' + js + ';return effect;')(bindings);
 }
 
+it.each(['logout', 'connection-switch', 'new-probe'] as const)('manual probe cannot publish a delayed result or error after %s', async phase => {
+  for (const fails of [false, true]) {
+    let resolve!: (value: unknown) => void; let reject!: (error: Error) => void;
+    const epoch = { current: 3 }; const attempt = { current: 5 }; const probeSeq = { current: 7 };
+    const update = vi.fn(); const toast = vi.fn(); const refresh = vi.fn(); const log = vi.fn();
+    const pending = appFunction('handleRunConnectivityProbe', { recoveryEpochRef: epoch, connectionAttemptSeqRef: attempt, postConnectProbeSeqRef: probeSeq,
+      runActionOnce: async (_: string, run: () => Promise<void>) => run(),
+      remnawaveClient: { runConnectivityProbe: () => new Promise((yes, no) => { resolve = yes; reject = no; }) },
+      setConnectivityProbe: update, refreshDiagnosticsAndRuntime: refresh, pushToast: toast, writeNativeRoutingLog: log,
+      tr: (_: unknown, _ru: string, en: string) => en, language: 'en' })();
+    if (phase === 'logout') epoch.current++; else if (phase === 'connection-switch') attempt.current++; else probeSeq.current++;
+    if (fails) reject(new Error('obsolete probe error')); else resolve({ success: true, message: 'obsolete session', publicIp: '192.0.2.33' });
+    await pending;
+    expect(update).not.toHaveBeenCalled(); expect(toast).not.toHaveBeenCalled(); expect(refresh).not.toHaveBeenCalled(); expect(log).not.toHaveBeenCalled();
+  }
+});
+
+it.each(['success', 'error', 'cancelled'] as const)('current manual probe handles %s without changing the VPN session', async outcome => {
+  const probe = { success: true, message: 'synthetic route observation' };
+  const update = vi.fn(); const toast = vi.fn(); const log = vi.fn(); const refresh = vi.fn();
+  const command = outcome === 'success' ? vi.fn().mockResolvedValue(probe)
+    : vi.fn().mockRejectedValue(new Error(outcome === 'cancelled' ? 'CONNECTIVITY_PROBE_CANCELLED' : 'synthetic probe failure'));
+  await appFunction('handleRunConnectivityProbe', { recoveryEpochRef: { current: 1 }, connectionAttemptSeqRef: { current: 2 }, postConnectProbeSeqRef: { current: 3 },
+    runActionOnce: async (_: string, run: () => Promise<void>) => run(), remnawaveClient: { runConnectivityProbe: command },
+    setConnectivityProbe: update, refreshDiagnosticsAndRuntime: refresh, pushToast: toast, writeNativeRoutingLog: log,
+    tr: (_: unknown, _ru: string, en: string) => en, language: 'en' })();
+  if (outcome === 'success') {
+    expect(update).toHaveBeenCalledExactlyOnceWith(probe); expect(refresh).toHaveBeenCalledTimes(1);
+    expect(toast).toHaveBeenCalledExactlyOnceWith('Route probe completed successfully.', 'success');
+    expect(log).toHaveBeenCalledTimes(1);
+  } else {
+    expect(update).not.toHaveBeenCalled(); expect(refresh).not.toHaveBeenCalled(); expect(log).not.toHaveBeenCalled();
+    if (outcome === 'error') expect(toast).toHaveBeenCalledExactlyOnceWith('synthetic probe failure', 'error');
+    else expect(toast).not.toHaveBeenCalled();
+  }
+});
+
 it.each(['healthy', 'logout', 'recovery', 'new-login', 'unmount'])('delayed bootstrap only commits the current profile/runtime: %s', async phase => {
   const old = { id: 'old', runtimeTemplate: {} }; const fresh = { id: 'fresh', runtimeTemplate: {} };
   let release!: (value: unknown) => void; const epoch = { current: 0 }; const ref = { current: [] as unknown[] };

@@ -1585,9 +1585,15 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
   }
 
   async function handleRunConnectivityProbe() {
+    const epoch = recoveryEpochRef.current;
+    const attempt = connectionAttemptSeqRef.current;
+    const probeSeq = postConnectProbeSeqRef.current;
+    const isCurrent = () => epoch === recoveryEpochRef.current
+      && attempt === connectionAttemptSeqRef.current && probeSeq === postConnectProbeSeqRef.current;
     await runActionOnce('probe', async () => {
       try {
         const probe = await remnawaveClient.runConnectivityProbe();
+        if (!isCurrent()) return;
         setConnectivityProbe(probe);
         void refreshDiagnosticsAndRuntime();
         pushToast(
@@ -1598,6 +1604,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         );
         void writeNativeRoutingLog('Запущена ручная проверка маршрута.', probe.message || probe.publicIp || 'probe-finished');
       } catch (error) {
+        if (!isCurrent() || (error instanceof Error && error.message === 'CONNECTIVITY_PROBE_CANCELLED')) return;
         pushToast(
           error instanceof Error
             ? error.message

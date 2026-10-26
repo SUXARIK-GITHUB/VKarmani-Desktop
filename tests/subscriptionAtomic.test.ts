@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-const mocks=vi.hoisted(()=>({fetch:vi.fn(),json:vi.fn(),cache:vi.fn()}));
-vi.mock('../src/services/runtime',async importOriginal=>({ ...await importOriginal<typeof import('../src/services/runtime')>(),fetchRemoteText:mocks.fetch,fetchRemoteJson:mocks.json,cacheNativeProfileSync:mocks.cache }));
+const mocks=vi.hoisted(()=>({fetch:vi.fn(),json:vi.fn(),cache:vi.fn(),probe:vi.fn()}));
+vi.mock('../src/services/runtime',async importOriginal=>({ ...await importOriginal<typeof import('../src/services/runtime')>(),fetchRemoteText:mocks.fetch,fetchRemoteJson:mocks.json,cacheNativeProfileSync:mocks.cache,runNativeConnectivityProbe:mocks.probe }));
 import { RemnawaveClient } from '../src/services/remnawave';
 import { parseXrayJsonSubscriptionToServers as parse } from '../src/services/remnawave/subscriptionParser';
 import { resolveConnectedProfile, buildServerRuntimeFingerprint } from '../src/utils/serverIdentity';
@@ -8,9 +8,43 @@ import { serverMeasurementIdentity } from '../src/utils/serverMeasurements';
 import { normalizeStoredSettings, saveSettings, loadSettings, loadSplitTunnelEntries } from '../src/services/storage';
 const key='https://sub.vkarmani.com/qa-synthetic-fixture';
 const config=(name:string)=>({remarks:name,outbounds:[{tag:'proxy',protocol:'vless',settings:{vnext:[{address:`${name.toLowerCase()}.example.test`,port:443,users:[{id:'00000000-0000-4000-8000-000000000001'}]}]}}]});
-beforeEach(()=>{vi.stubGlobal('window',{setTimeout,clearTimeout});mocks.fetch.mockReset();mocks.json.mockReset();mocks.cache.mockReset();mocks.cache.mockResolvedValue(undefined);});
+beforeEach(()=>{vi.stubGlobal('window',{setTimeout,clearTimeout});mocks.fetch.mockReset();mocks.json.mockReset();mocks.cache.mockReset();mocks.cache.mockResolvedValue(undefined);mocks.probe.mockReset();});
 afterEach(()=>vi.unstubAllGlobals());
 describe('actual subscription-client atomic refresh and generation ownership',()=>{
+  it.each(['invalidateProfileSync', 'clearSessionCache'] as const)('late connectivity probe cannot repopulate diagnostics after %s', async revoke => {
+    const client = new RemnawaveClient(); let release!: (value: unknown) => void;
+    mocks.probe.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const pending = client.runConnectivityProbe(); const rejected = expect(pending).rejects.toThrow('CONNECTIVITY_PROBE_CANCELLED');
+    client[revoke](); release({ success: true, publicIp: '192.0.2.11', message: 'old-session' }); await rejected;
+    expect((await client.loadDiagnostics()).logLines.join('\n')).not.toContain('192.0.2.11');
+  });
+  it('a delayed probe from subscription A cannot enter subscription B diagnostics', async () => {
+    const client = new RemnawaveClient(); client.hydrateCachedServers([], key);
+    let release!: (value: unknown) => void;
+    mocks.probe.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const pending = client.runConnectivityProbe(); const rejected = expect(pending).rejects.toThrow('CONNECTIVITY_PROBE_CANCELLED');
+    mocks.fetch.mockResolvedValue(JSON.stringify(config('NewAccount'))); await client.authorizeByAccessKey(key + '-B');
+    release({ success: true, publicIp: '192.0.2.12', message: 'old-A' }); await rejected;
+    expect((await client.loadDiagnostics()).logLines.join('\n')).not.toContain('192.0.2.12');
+  });
+  it('cache hydration under a different key invalidates a pending probe without a new HTTP login', async () => {
+    const client = new RemnawaveClient(); client.hydrateCachedServers([], key);
+    let release!: (value: unknown) => void;
+    mocks.probe.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const pending = client.runConnectivityProbe(); const rejected = expect(pending).rejects.toThrow('CONNECTIVITY_PROBE_CANCELLED');
+    client.hydrateCachedServers([], key + '-B'); release({ success: true, publicIp: '192.0.2.13' }); await rejected;
+    expect((await client.loadDiagnostics()).logLines.join('\n')).not.toContain('192.0.2.13');
+  });
+  it.each([false, true])('only the newest overlapping probe commits; stale rejection=%s', async fails => {
+    const client = new RemnawaveClient(); let resolve!: (value: unknown) => void; let reject!: (error: Error) => void;
+    mocks.probe.mockImplementationOnce(() => new Promise((yes, no) => { resolve = yes; reject = no; }));
+    const older = client.runConnectivityProbe(); const rejected = expect(older).rejects.toThrow('CONNECTIVITY_PROBE_CANCELLED');
+    const fresh = { success: true, publicIp: '192.0.2.22', message: 'current' }; mocks.probe.mockResolvedValueOnce(fresh);
+    expect(await client.runConnectivityProbe()).toBe(fresh);
+    if (fails) reject(new Error('obsolete native error')); else resolve({ success: true, publicIp: '192.0.2.21' });
+    await rejected;
+    const logs = (await client.loadDiagnostics()).logLines.join('\n'); expect(logs).toContain('192.0.2.22'); expect(logs).not.toContain('192.0.2.21');
+  });
   it.each(['authorizeByAccessKey', 'syncProfile'] as const)('binds catalog retention and endpoint candidates to the requested key: %s', async method => {
     const client = new RemnawaveClient();
     mocks.fetch.mockResolvedValue(JSON.stringify([config('AccountA1'), config('AccountA2')]));
