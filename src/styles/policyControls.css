@@ -11,3 +11,7 @@
 .split-tunnel-modal .settings-routing-control { margin-bottom:14px; }
 .vk-connect-disabled-reason { grid-column:1 / -1; min-width:0; font-size:12px; line-height:1.4; color:var(--muted); }
 .vk-connect-disabled-reason .vk-secondary-action { margin-top:6px; }
+/* Preserve card sizes; scroll the TUN rail instead of clipping its actions. */
+@media (max-height:760px) {
+  .vk-dashboard-side:has(.vk-tun-config-button) { overflow-y:auto; grid-template-rows:142px 114px minmax(max-content,1fr) !important; }
+}
