@@ -293,6 +293,35 @@ mod tests {
         }
     }
     #[test]
+    fn tun_admission_shared_fixture_matches_frontend_without_process_lookup() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            mode: String,
+            entries: Vec<SplitTunnelEntryPayload>,
+            blocked: bool,
+        }
+        let cases: Vec<Case> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/policies/tun-admission.json"
+        ))
+        .unwrap();
+        for case in cases {
+            let before = serde_json::to_value(&case.entries).unwrap();
+            assert_eq!(
+                ensure_tun_process_enforcement(Some("tun"), Some(&case.mode), &case.entries)
+                    .is_err(),
+                case.blocked,
+                "{}",
+                case.name
+            );
+            assert!(
+                ensure_tun_process_enforcement(Some("proxy"), Some(&case.mode), &case.entries)
+                    .is_ok()
+            );
+            assert_eq!(serde_json::to_value(&case.entries).unwrap(), before);
+        }
+    }
+    #[test]
     fn native_admission_blocks_every_process_dependent_tun_policy() {
         for entries in [
             vec![],

@@ -6,6 +6,7 @@ import { listNativeWindowsServices } from '../services/runtime';
 import { PolicyChoice } from './PolicyChoice';
 import { policyEntryDisplay } from '../utils/policyDisplay';
 import { activePolicyEntries } from '../utils/appPolicies';
+import { TunRoutingChoice } from './TunRoutingChoice';
 import '../styles/policies.css';
 
 interface SplitTunnelModalProps {
@@ -20,6 +21,7 @@ interface SplitTunnelModalProps {
   onChangePolicy: (entryId: string, policy: RoutingPolicy) => void;
   tunnelMode: TunnelMode;
   tunRoutingMode: TunRoutingMode;
+  onTunRoutingModeChange: (mode: TunRoutingMode) => void;
   onToggleEntry: (entryId: string) => void;
   onRemoveEntry: (entryId: string) => void;
   onPickExecutable: (policy?: RoutingPolicy) => Promise<void> | void;
@@ -43,6 +45,7 @@ export function SplitTunnelModal({
   onChangePolicy,
   tunnelMode,
   tunRoutingMode,
+  onTunRoutingModeChange,
   onRemoveEntry,
   onPickExecutable,
   onRefreshRunningApps
@@ -134,10 +137,8 @@ export function SplitTunnelModal({
         </header>
 
         <div className="vk-modal-scroll">
-          <p className="split-tunnel-help">
-            {tr(language, 'Маршрутизация отдельных приложений и служб в TUN временно заблокирована. Для подключения выберите «Все приложения» без активных правил «Напрямую». Правила сохранены.', 'App and service routing in TUN is temporarily blocked. Choose All applications without active Direct rules to connect. Saved rules are preserved.')} {' '}
-            {tr(language, 'Полный путь выбирает один файл, а имя .exe — все приложения с таким именем.', 'A full path targets one file; an .exe name targets all applications with that name.')}
-          </p>
+          <TunRoutingChoice language={language} mode={tunRoutingMode} entries={entries} onChange={onTunRoutingModeChange} />
+          <p className="split-tunnel-help">{tr(language, 'Полный путь выбирает один файл, а имя .exe — все приложения с таким именем.', 'A full path targets one file; an .exe name targets all applications with that name.')}</p>
           {tunnelMode === 'proxy' && <p className="split-tunnel-help policy-warning">{tr(language, 'Правила приложений не управляют режимом Proxy. Приложение с собственными настройками прокси может подключаться через него.', 'App rules do not control Proxy mode. An application with its own proxy settings may still use that proxy.')}</p>}
           <div className="policy-toolbar">
             <label className="split-field"><span>{tr(language, 'Поиск правил, программ и служб', 'Search rules, applications and services')}</span><input value={appSearch} onChange={event => setAppSearch(event.target.value)} placeholder={tr(language, 'Имя или путь…', 'Name or path…')} /></label>

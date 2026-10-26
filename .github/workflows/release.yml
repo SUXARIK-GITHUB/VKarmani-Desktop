@@ -153,31 +153,18 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: VKarmani Desktop ${{ github.ref_name }}
           releaseBody: |
-            ## VKarmani Desktop 0.13.84 Stable
+            ## VKarmani Desktop 0.13.85-rc.1 — TUN admission and controls
 
-            Этот выпуск публикуется по решению владельца после технических проверок. Нативные установка, чтение рабочей AppData, встроенная кнопка обновления, Proxy/Full TUN/DNS/egress и длительная работа на Windows 11 остаются NOT_RUN / OWNER_ACCEPTANCE_PENDING. CI не заменяет эти испытания; MASTER v2 остаётся активным.
+            Test candidate only: GitHub Draft, not Stable Latest. Full TUN packet/native acceptance remains NOT_RUN / OWNER_ACCEPTANCE_PENDING. Stable0.13.84 and all previous assets stay unchanged; MASTER v2 is ACTIVE.
 
-            ### Исправления
-
-            - Сохранность данных: guarded IO журналов Proxy/routes и DPAPI v2, отказ от перезаписи при ошибке чтения, согласованная загрузка настроек/правил/избранного; восстановление только после подтверждения точной резервной копии. Native схема и DPAPI v1/v2 архитектура сохранены.
-            - Авторизация: подтверждение сохранения ключа и native session для точной подписки до входа; каталог и cache привязаны к подписке, поздние ответы другой сессии отбрасываются. Logout требует подтверждённого revoke до удаления ключа/каталога.
-            - Xray lifecycle: проверки владельца TCP-listener и живого retained child, повторные проверки перед публикацией подключения/restart и отмена конкурирующих операций. Чужой Xray и занятые им порты не освобождаются автоматически. Listener не доказывает VPN-связность.
-            - Proxy: включение только при подтверждённом runtime/listener ownership; ошибка readback не превращается в выдуманное «выключен». Восстановление возвращает прежние Proxy/PAC settings и сохраняет journal при неподтверждённой очистке.
-            - TUN: точное route/LUID ownership, сохранение чужих маршрутов, rollback частичной настройки и TUN-free preflight; различение причин DNS ошибок без массового изменения Windows DNS/routes/firewall.
-            - Асинхронное состояние: задержанные ответы login/bootstrap/probe не пересекают logout/recovery/новую подписку и не перезаписывают более новую проверку. Native HTTP probe привязан к тому же запуску Xray до/после HTTP; текущая ошибка убирает старое OK.
-            - Уточнены флаги/страны, отдельные сообщения и обработка ошибок UI; существующий внешний вид сохранён.
-
-            ### Обновление и ограничения
-
-            - Дополнительное исправление после RC4: installer handoff отказывает даже при idle/noPID, если Proxy/route ownership не подтверждает полную очистку. Проверка выполняется после download/flush под lease; journal/настройки сети не очищаются автоматически, а чужой enabled Proxy без журнала VKarmani не блокирует установку.
-            - Tauri Updater сохраняет прежние public key и production endpoint. latest.json указывает на подписанный NSIS этого отдельного релиза v0.13.84. Техническая доставка и подписи проверяются отдельно от фактической кнопки в установленной копии.
-            - Перед обновлением из0.13.83 вручную отключить только собственную сессию VKarmani, подтвердить idle/cleanup, дождаться сохранения и сделать приватный полный backup в том же Windows профиле. Не останавливать Happ/чужой Xray и не менять Windows networking. Затем «Проверить обновление» → «Установить обновление»; после запуска проверить данные и версию. При неизвестном ownership/ошибке — STOP без reset.
-            - Selected-app/service routing и активные process DIRECT exceptions временно заблокированы по соображениям безопасности. Правила сохраняются. Strict Isolation и Kill Switch не реализованы; недоказанные защитные функции не включены.
-            - Full TUN и DNS leak protection требуют реальной приёмки. Исторические DNS leaks, native startup crash, внешний os error32, TCP/UDP timeouts и длительная стабильность не объявляются полностью исправленными.
-            - Полная поддержка Windows7/Linux не заявляется. История соединений, расширенная Diagnostics и другие некритические требования остаются в MASTER v2.
-            - Windows Authenticode отсутствует. Подписи Tauri Updater создаются прежним CI-ключом и не заменяют Authenticode.
-            - MSI ProductVersion0.13.84.0 выше исходного Stable083/0.13.83.0; UpgradeCode/product identity сохраняются. У RC1–RC4 уже0.13.84.0: RC-MSI→Stable-MSI same-version upgrade NOT_RUN, не применять force/reinstall или NSIS поверх MSI. Ручной путь требует согласованного типа установщика; native MSI/NSIS приёмка остаётся владельцу.
-            - Stable0.13.83 и Draft RC1–RC4 с их тегами/артефактами сохранены для истории и rollback. При неудачном обновлении сначала подтвердить owned cleanup/закрытый app, сохранить текущее состояние отдельно, затем прежний083 installer и полный согласованный backup под тем же SID; не смешивать snapshots и не переходить на raw076/v1.
+            - The Applications and services dialog now includes the existing All / Selected / Exclude mode choice. A concise contextual reason replaces the permanent blanket warning; the disabled Connect reason is visible with Configure TUN action.
+            - All mode with saved VPN rules is allowed without deleting or disabling those entries. Active DIRECT app/service rules still block all/exclude; disable only those rules explicitly to use Full TUN. Selected remains unavailable because pinned Xray process lookup can miss and fall through to DIRECT.
+            - A blocked connected Proxy-to-TUN switch now returns before changing preferences or attempting a native transition. Working Proxy, Happ and foreign networking are not modified.
+            - Shared frontend/client/Rust admission cases and synthetic native-state save/reload regressions preserve modes and saved VPN/DIRECT rules. CI unit/helper/config tests do not qualify actual VPN, UDP, DNS, rollback or packet isolation.
+            - Process lookup common/net: not found is not the cause of a pre-launch disabled button. Existing runtime logs append across launches; the supplied historical line is not attributed to this attempt without timestamp/runtime evidence.
+            - No Xray/Wintun/dependency/trust/DPAPI/route/DNS/Proxy backend changes. No WFP service, privileged helper, driver, Strict Isolation or Kill Switch is added; selected routing requires separately approved enforcement and isolated acceptance.
+            - Tauri Updater retains its key and production endpoint. This Draft must not replace public latest.json/Stable Latest. Windows Authenticode remains unavailable; Tauri signatures are checked separately.
+            - MSI ProductVersion0.13.85.0 exceeds Stable084/0.13.84.0. Native install/update/rollback remains owner-only NOT_RUN. Before any owner install, keep a private consistent full-tree same-profile backup and the previous084 installer; never use force or mix NSIS/MSI.
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           includeUpdaterJson: true
