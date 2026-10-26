@@ -122,11 +122,18 @@ fn install_routes(
             route: route.clone(),
             applied: false,
         });
-        backend.save(journal)?; // Durable intent before the OS mutation.
+        if let Err(error) = backend.save(journal) {
+            // No Create was called for this entry. Do not invent ownership or
+            // attempt another journal write as though network rollback failed.
+            journal.entries.pop();
+            return Err(error);
+        } // Durable intent before the OS mutation.
         if let Err(error) = backend.create(route) {
             // Failed Create does not confer ownership, even if another writer won the race.
             journal.entries.pop();
-            backend.save(journal)?;
+            if let Err(save) = backend.save(journal) {
+                return Err(format!("{error}; journal: {save}"));
+            }
             return Err(error);
         }
         // Create succeeded in this live process. Keep that proof for rollback
@@ -140,23 +147,32 @@ fn install_routes(
         {
             return Err("ROUTE_CREATE_UNCONFIRMED: запись не совпала с запросом.".into());
         }
-        if let Err(error) = backend.save(journal) {
-            // This process knows Create succeeded; after a crash an intent alone is not proof.
-            if backend
-                .read(route)?
-                .as_ref()
-                .is_some_and(|current| same_owned_route(route, current))
-                && backend.delete(route).is_ok()
-                && matches!(backend.read(route), Ok(None))
-            {
-                // An acknowledged delete alone is not proof of absence.
-                journal.entries.pop();
-                let _ = backend.save(journal);
-            }
-            return Err(error);
-        }
+        backend.save(journal)?;
     }
     Ok(())
+}
+
+fn install_routes_with_rollback(
+    backend: &mut impl RouteBackend,
+    journal: &mut RouteJournal,
+    routes: &[OwnedRoute],
+) -> Result<(), String> {
+    let Err(error) = install_routes(backend, journal, routes) else {
+        return Ok(());
+    };
+    // Install never deletes its own successful creates. Every such live proof
+    // stays applied=true until this one, verified rollback boundary handles it.
+    let created = journal.entries.iter().filter(|entry| entry.applied).count();
+    if created == 0 {
+        return Err(format!(
+            "ROUTE_SETUP_NOT_STARTED: Windows-маршруты этой попыткой не создавались; {error}"
+        ));
+    }
+    Err(match cleanup_routes(backend, journal) {
+        Ok(()) => format!("ROUTE_SETUP_ROLLED_BACK: создано {created}, отсутствие собственных маршрутов подтверждено; {error}"),
+        Err(cleanup) if journal.entries.is_empty() => format!("ROUTE_ROLLBACK_JOURNAL_PENDING: создано {created}, отсутствие собственных маршрутов подтверждено; журнал не завершён: {cleanup}; причина: {error}"),
+        Err(cleanup) => format!("ROUTE_ROLLBACK_UNCONFIRMED: создано {created}, восстановление не подтверждено; {error}; rollback: {cleanup}"),
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -268,7 +284,7 @@ mod windows {
         Ok(value)
     }
     pub(super) struct WindowsRoutes {
-        path: PathBuf,
+        pub(super) path: PathBuf,
     }
     impl RouteBackend for WindowsRoutes {
         fn read(&mut self, route: &OwnedRoute) -> Result<Option<OwnedRoute>, String> {
@@ -395,13 +411,7 @@ mod windows {
             owner_pid: std::process::id(),
             entries: Vec::new(),
         };
-        if let Err(error) = install_routes(&mut backend, &mut journal, &routes) {
-            return Err(match cleanup_routes(&mut backend, &mut journal) {
-                Ok(()) => error,
-                Err(cleanup) => format!("{error}; rollback: {cleanup}"),
-            });
-        }
-        Ok(())
+        install_routes_with_rollback(&mut backend, &mut journal, &routes)
     }
     #[test]
     fn read_only_native_route_query() {
@@ -411,6 +421,48 @@ mod windows {
         unsafe {
             FreeMibTable(table.cast());
         }
+    }
+    #[test]
+    fn journal_refuses_a_live_other_process_then_allows_confirmed_exited_owner() {
+        let _fixture = HELPER_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "vkarmani-journal-owner-{}",
+            crate::compat_storage::durable::random_state_id().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let mut command = Command::new(system_program("powershell").unwrap());
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::In.ReadToEnd() | Out-Null",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        hide_child_console(&mut command);
+        let mut child = OwnedXrayProcess::attach(command.spawn().unwrap()).unwrap();
+        let mut backend = WindowsRoutes {
+            path: root.join("owned-tun-routes-v1.dpapi"),
+        };
+        backend
+            .save(&RouteJournal {
+                version: 1,
+                owner_pid: child.id(),
+                entries: vec![],
+            })
+            .unwrap();
+        let original = fs::read(&backend.path).unwrap();
+        assert!(load(&backend)
+            .unwrap_err()
+            .starts_with("ROUTE_OWNER_ACTIVE:"));
+        assert_eq!(fs::read(&backend.path).unwrap(), original);
+        assert!(terminate_child_with_timeout(&mut child, Duration::from_secs(2)).is_some());
+        assert!(load(&backend).unwrap().unwrap().entries.is_empty());
+        drop(child);
+        backend.clear().unwrap();
+        fs::remove_dir(root).unwrap();
     }
     #[test]
     fn route_journal_reader_refuses_linked_journal_without_trusting_it() {
@@ -572,6 +624,8 @@ mod tests {
         saves: usize,
         fail_save_on: Option<usize>,
         delete_ack_without_removal: bool,
+        fail_save_from: Option<usize>,
+        clears: usize,
     }
     impl RouteBackend for Fake {
         fn read(&mut self, route: &OwnedRoute) -> Result<Option<OwnedRoute>, String> {
@@ -614,16 +668,251 @@ mod tests {
         }
         fn save(&mut self, j: &RouteJournal) -> Result<(), String> {
             self.saves += 1;
-            if self.fail_save || self.fail_save_on == Some(self.saves) {
+            if self.fail_save
+                || self.fail_save_on == Some(self.saves)
+                || self.fail_save_from.is_some_and(|from| self.saves >= from)
+            {
                 return Err("injected disk".into());
             }
             self.journal = Some(j.clone());
             Ok(())
         }
         fn clear(&mut self) -> Result<(), String> {
+            self.clears += 1;
             self.journal = None;
             Ok(())
         }
+    }
+    #[cfg(windows)]
+    struct DiskFake {
+        state: Fake,
+        disk: windows::WindowsRoutes,
+    }
+    #[cfg(windows)]
+    impl RouteBackend for DiskFake {
+        fn read(&mut self, r: &OwnedRoute) -> Result<Option<OwnedRoute>, String> {
+            self.state.read(r)
+        }
+        fn create(&mut self, r: &OwnedRoute) -> Result<(), String> {
+            self.state.create(r)
+        }
+        fn delete(&mut self, r: &OwnedRoute) -> Result<(), String> {
+            self.state.delete(r)
+        }
+        fn save(&mut self, j: &RouteJournal) -> Result<(), String> {
+            let prior = self.state.journal.clone();
+            self.state.save(j)?;
+            if let Err(error) = self.disk.save(j) {
+                self.state.journal = prior;
+                return Err(error);
+            }
+            Ok(())
+        }
+        fn clear(&mut self) -> Result<(), String> {
+            self.disk.clear()?;
+            self.state.clear()
+        }
+    }
+    #[cfg(windows)]
+    fn disk_fixture() -> (PathBuf, DiskFake, Vec<File>) {
+        let root = std::env::temp_dir().join(format!(
+            "vkarmani-route-transaction-{}",
+            crate::compat_storage::durable::random_state_id().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let guards = lock_runtime_parent_paths(&root.join("synthetic-config.json")).unwrap();
+        let backend = DiskFake {
+            state: Fake::default(),
+            disk: windows::WindowsRoutes {
+                path: root.join("owned-tun-routes-v1.dpapi"),
+            },
+        };
+        (root, backend, guards)
+    }
+    #[cfg(windows)]
+    fn disk_snapshot(backend: &DiskFake) -> RouteJournal {
+        let cipher = crate::compat_storage::read_state_file(&backend.disk.path, 32768)
+            .unwrap()
+            .unwrap();
+        let plain = decrypt_access_key(&cipher).unwrap();
+        assert!(!cipher.contains("interfaceLuid"));
+        serde_json::from_str(&plain).unwrap()
+    }
+    #[cfg(windows)]
+    fn finish_disk(root: PathBuf, mut backend: DiskFake, guards: Vec<File>) {
+        backend.disk.clear().unwrap();
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            0,
+            "no partial temporary files"
+        );
+        drop(guards);
+        fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    #[cfg(windows)]
+    fn disk_journal_first_and_repeated_save_keep_dpapi_with_live_runtime_pins() {
+        let (root, mut backend, guards) = disk_fixture();
+        let mut j = journal();
+        backend.save(&j).unwrap();
+        assert!(disk_snapshot(&backend).entries.is_empty());
+        j.entries.push(RouteEntry {
+            route: route("0.0.0.0"),
+            applied: false,
+        });
+        backend.save(&j).unwrap();
+        assert!(!disk_snapshot(&backend).entries[0].applied);
+        j.entries[0].applied = true;
+        backend.save(&j).unwrap();
+        assert!(disk_snapshot(&backend).entries[0].applied);
+        finish_disk(root, backend, guards);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn restarted_backend_recovers_applied_entries_without_touching_foreign_routes() {
+        let (root, mut backend, guards) = disk_fixture();
+        let mut foreign = route("0.0.0.0");
+        foreign.interface_luid += 1;
+        backend.state.routes.push(foreign.clone());
+        let mut j = journal();
+        install_routes_with_rollback(
+            &mut backend,
+            &mut j,
+            &[route("0.0.0.0"), route("128.0.0.0")],
+        )
+        .unwrap();
+        let mut recovered = disk_snapshot(&backend);
+        assert!(recovered.entries.iter().all(|e| e.applied));
+        backend.state = Fake {
+            routes: backend.state.routes.clone(),
+            ..Fake::default()
+        };
+        cleanup_routes(&mut backend, &mut recovered).unwrap();
+        assert_eq!(backend.state.routes, vec![foreign]);
+        assert_eq!(backend.state.deletes, 2);
+        assert!(!backend.disk.path.exists());
+        finish_disk(root, backend, guards);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn locked_initial_intent_changes_no_routes_and_preserves_last_good_cipher() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (root, mut backend, guards) = disk_fixture();
+        let mut j = journal();
+        backend.save(&j).unwrap();
+        let original = fs::read(&backend.disk.path).unwrap();
+        let blocker = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&backend.disk.path)
+            .unwrap();
+        backend.state.saves = 0;
+        let started = Instant::now();
+        let error =
+            install_routes_with_rollback(&mut backend, &mut j, &[route("0.0.0.0")]).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(error.starts_with("ROUTE_SETUP_NOT_STARTED:"));
+        // Windows reports 32 for a pinned parent and may report 5 for an open
+        // target; the writer verifies the latter conflict before bounded retry.
+        assert!(
+            error.contains("os error 32") || error.contains("os error 5"),
+            "actual held-file result: {error}"
+        );
+        assert!(!error.contains("rollback:"));
+        assert_eq!(
+            (
+                backend.state.creates,
+                backend.state.deletes,
+                backend.state.saves,
+                backend.state.clears
+            ),
+            (0, 0, 1, 0)
+        );
+        assert!(j.entries.is_empty());
+        drop(blocker);
+        assert_eq!(fs::read(&backend.disk.path).unwrap(), original);
+        install_routes_with_rollback(&mut backend, &mut j, &[route("0.0.0.0")]).unwrap();
+        cleanup_routes(&mut backend, &mut j).unwrap();
+        finish_disk(root, backend, guards);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn partial_create_and_rollback_save_failure_recover_from_durable_journal() {
+        for fail_rollback_save in [false, true] {
+            let (root, mut backend, guards) = disk_fixture();
+            let mut foreign = route("0.0.0.0");
+            foreign.interface_luid += 1;
+            backend.state.routes.push(foreign.clone());
+            backend.state.fail_create = Some(2);
+            backend.state.fail_save_from = fail_rollback_save.then_some(5);
+            let mut j = journal();
+            let error = install_routes_with_rollback(
+                &mut backend,
+                &mut j,
+                &[route("0.0.0.0"), route("128.0.0.0")],
+            )
+            .unwrap_err();
+            assert_eq!(backend.state.routes, vec![foreign.clone()]);
+            assert_eq!(backend.state.deletes, 1);
+            if fail_rollback_save {
+                assert!(error.starts_with("ROUTE_ROLLBACK_JOURNAL_PENDING:"));
+                let mut recovered = disk_snapshot(&backend);
+                assert_eq!(recovered.entries.len(), 1);
+                backend.state = Fake {
+                    routes: vec![foreign.clone()],
+                    ..Fake::default()
+                }; // new process/backend state
+                cleanup_routes(&mut backend, &mut recovered).unwrap();
+                assert_eq!(backend.state.deletes, 0); // removed route is already absent
+            } else {
+                assert!(error.starts_with("ROUTE_SETUP_ROLLED_BACK:"));
+            }
+            assert_eq!(backend.state.routes, vec![foreign]);
+            assert!(!backend.disk.path.exists());
+            finish_disk(root, backend, guards);
+        }
+    }
+    #[test]
+    #[cfg(windows)]
+    fn confirmation_save_failure_and_failed_delete_retain_proof_for_retry() {
+        let (root, mut backend, guards) = disk_fixture();
+        backend.state.fail_save_from = Some(2);
+        backend.state.fail_delete = true;
+        let mut j = journal();
+        let error =
+            install_routes_with_rollback(&mut backend, &mut j, &[route("0.0.0.0")]).unwrap_err();
+        assert!(error.starts_with("ROUTE_ROLLBACK_UNCONFIRMED:"));
+        assert!(j.entries[0].applied);
+        assert!(!disk_snapshot(&backend).entries[0].applied);
+        assert_eq!(backend.state.routes.len(), 1);
+        backend.state.fail_delete = false;
+        backend.state.fail_save_from = None;
+        cleanup_routes(&mut backend, &mut j).unwrap();
+        assert!(backend.state.routes.is_empty());
+        finish_disk(root, backend, guards);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn restarted_unconfirmed_intent_never_authorizes_deleting_matching_route() {
+        let (root, mut backend, guards) = disk_fixture();
+        let mut j = journal();
+        j.entries.push(RouteEntry {
+            route: route("0.0.0.0"),
+            applied: false,
+        });
+        backend.save(&j).unwrap();
+        let original = fs::read(&backend.disk.path).unwrap();
+        let mut recovered = disk_snapshot(&backend);
+        backend.state = Fake {
+            routes: vec![route("0.0.0.0")],
+            ..Fake::default()
+        };
+        assert!(cleanup_routes(&mut backend, &mut recovered)
+            .unwrap_err()
+            .starts_with("ROUTE_OWNER_CHANGED:"));
+        assert_eq!(backend.state.deletes, 0);
+        assert_eq!(fs::read(&backend.disk.path).unwrap(), original);
+        finish_disk(root, backend, guards);
     }
     #[test]
     fn summary_queries_actual_routes_and_does_not_confuse_journal_with_truth() {
@@ -724,8 +1013,8 @@ mod tests {
         };
         let mut j = journal();
         assert_eq!(
-            install_routes(&mut f, &mut j, &[route("0.0.0.0")]).unwrap_err(),
-            "injected disk"
+            install_routes_with_rollback(&mut f, &mut j, &[route("0.0.0.0")]).unwrap_err(),
+            "ROUTE_SETUP_ROLLED_BACK: создано 1, отсутствие собственных маршрутов подтверждено; injected disk"
         );
         assert!(f.routes.is_empty());
         assert!(j.entries.is_empty());
@@ -838,7 +1127,18 @@ mod tests {
         let mut j = journal();
         assert!(install_routes(&mut f, &mut j, &[route("0.0.0.0")]).is_err());
         assert_eq!(f.creates, 0);
+        assert!(
+            j.entries.is_empty(),
+            "an unsaved intent is not live ownership"
+        );
         f.fail_save = false;
+        // A *persisted* pre-Create intent from an interrupted older attempt
+        // is a different state from the failed-save case above.
+        j.entries.push(RouteEntry {
+            route: route("0.0.0.0"),
+            applied: false,
+        });
+        f.save(&j).unwrap();
         f.routes.push(route("0.0.0.0"));
         assert!(cleanup_routes(&mut f, &mut j).is_err());
         assert_eq!(f.deletes, 0);

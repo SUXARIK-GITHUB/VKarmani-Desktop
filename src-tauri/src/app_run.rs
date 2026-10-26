@@ -150,21 +150,21 @@ pub fn run() {
         }
         return;
     }
-    // Keep single-instance protection only for release builds. In dev mode we intentionally
-    // allow local restarts from the BAT launcher without getting an `unused_mut` warning.
-    #[cfg(debug_assertions)]
     let builder = tauri::Builder::default();
-
-    #[cfg(not(debug_assertions))]
-    let builder =
-        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    // The owner-test executable shares one routing journal, even when started
+    // directly instead of via the BAT's exclusive launcher lock.
+    let builder = if cfg!(not(debug_assertions)) || local_test_build() {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let _ = append_interface_event(
                 app,
                 "Повторный запуск: активируем уже открытое окно VKarmani.",
             );
             reveal_main_window(app);
             let _ = app.emit("vkarmani://tray-action", "show");
-        }));
+        }))
+    } else {
+        builder
+    };
 
     builder
         .manage(AppState::default())

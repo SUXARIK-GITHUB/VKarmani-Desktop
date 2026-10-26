@@ -447,7 +447,7 @@ mod windows {
             resources.push((name, size, hash, file));
         }
         let mut config_file = if let Some((path, hash)) = config {
-            source_locks.extend(lock_ancestors(path)?);
+            source_locks.extend(lock_runtime_parent_paths(path)?);
             Some(verified_file(path, None, hash)?)
         } else {
             None
@@ -535,7 +535,12 @@ mod windows {
 pub(crate) fn lock_runtime_parent_paths(path: &Path) -> Result<Vec<File>, String> {
     #[cfg(target_os = "windows")]
     {
-        windows::lock_ancestors(path)
+        // Runtime directories contain atomically replaced state/journals.
+        // Deny directory delete/rename, but permit the parent's write access
+        // required by MoveFileExW. Immutable core/file pins remain read-only.
+        let parent = path.parent().ok_or("RUNTIME_PARENT_REQUIRED")?;
+        crate::compat_storage::state_directory_guards(parent, false)
+            .map_err(|error| format!("RUNTIME_DIRECTORY_GUARD: {error}"))
     }
     #[cfg(not(target_os = "windows"))]
     {

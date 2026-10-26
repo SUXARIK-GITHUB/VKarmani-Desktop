@@ -1,6 +1,15 @@
 import { readFileSync } from 'node:fs';
 import { expect, it } from 'vitest';
 
+it('local owner-test startup keeps native single-instance protection before storage and network setup', () => {
+  const run=readFileSync(new URL('../src-tauri/src/app_run.rs',import.meta.url),'utf8');
+  const policy=run.indexOf('if cfg!(not(debug_assertions)) || local_test_build()');
+  const plugin=run.indexOf('tauri_plugin_single_instance::init(');
+  expect(policy).toBeGreaterThan(run.indexOf('validate_local_test_config(context.config())'));
+  expect(plugin).toBeGreaterThan(policy);
+  expect(plugin).toBeLessThan(run.indexOf('.setup(|app|'));
+});
+
 it('native TUN process admission precedes authorization, operation admission and prior-runtime teardown', () => {
   const commands = readFileSync(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
   const connect = commands.slice(commands.indexOf('fn request_connect_blocking('));
