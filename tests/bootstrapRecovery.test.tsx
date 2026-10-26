@@ -163,6 +163,7 @@ function logoutBindings() {
     remnawaveClient: { invalidateProfileSync: vi.fn(), clearSessionCache: vi.fn(), disconnect: vi.fn().mockResolvedValue(undefined) },
     isConnectionActionBusy: () => false, refreshDiagnosticsAndRuntime: vi.fn().mockResolvedValue(idle),
     clearStoredAccessKey: vi.fn().mockResolvedValue(undefined), clearLastKnownServers: vi.fn().mockResolvedValue(undefined),
+    revokeNativeSessionAuthorization: vi.fn().mockResolvedValue(undefined),
     setNativeSessionAuthorized: vi.fn().mockResolvedValue(false), connectedServerIdRef: { current: 'old' },
     authorizedAccessKeyRef: { current: 'synthetic-key' }, serversRef: { current: ['old'] }, selectedServerIdRef: { current: 'old' } };
   for (const name of ['setLogoutConfirmationOpen','cancelPing','clearPendingConnectionQueue','setConnectionStateSafe','setConnectedServerId',
@@ -205,7 +206,14 @@ it('a foreign proxy with no VKarmani ownership does not cause proxy restoration 
   expect(b.recoveryEpochRef.current).toBe(5); expect(b.profileSyncInFlightRef.current).toBe(false);
   expect(b.setAuthLoading).toHaveBeenCalledWith(false); expect(b.setIsSyncingProfile).toHaveBeenCalledWith(false);
   expect(b.remnawaveClient.clearSessionCache).toHaveBeenCalledTimes(1);
-  expect(b.remnawaveClient.clearSessionCache.mock.invocationCallOrder[0]).toBeGreaterThan(b.setNativeSessionAuthorized.mock.invocationCallOrder[0]);
+  expect(b.revokeNativeSessionAuthorization.mock.invocationCallOrder[0]).toBeLessThan(b.clearStoredAccessKey.mock.invocationCallOrder[0]);
+});
+
+it('unconfirmed native revoke retains credentials and caches instead of declaring successful logout', async () => {
+  const { bindings: b, run } = logoutBindings(); b.revokeNativeSessionAuthorization.mockRejectedValue(new Error('SESSION_REVOKE_UNCONFIRMED'));
+  await run(); expect(b.revokeNativeSessionAuthorization).toHaveBeenCalledTimes(1);
+  expect(b.clearStoredAccessKey).not.toHaveBeenCalled(); expect(b.clearLastKnownServers).not.toHaveBeenCalled();
+  expect(b.remnawaveClient.clearSessionCache).not.toHaveBeenCalled(); expect(b.setIsAuthorized).not.toHaveBeenCalledWith(false);
 });
 
 it('failed persistent profile deletion retains the client cache and does not report a successful logout', async () => {
