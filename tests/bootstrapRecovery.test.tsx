@@ -26,6 +26,70 @@ function profileWorkBindings() {
     remnawaveClient: { invalidateProfileSync: vi.fn() }, setAuthLoading: vi.fn(), setIsSyncingProfile: vi.fn() };
 }
 
+function appEffectContaining(fragment: string, bindings: Record<string, unknown>) {
+  let effect: ts.ArrowFunction | undefined;
+  const visit = (node: ts.Node) => {
+    if (ts.isCallExpression(node) && node.expression.getText(appSource) === 'useEffect' && node.arguments[0]
+      && ts.isArrowFunction(node.arguments[0]) && node.arguments[0].getText(appSource).includes(fragment)) effect = node.arguments[0];
+    ts.forEachChild(node, visit);
+  }; visit(appSource); expect(effect).toBeDefined();
+  const js = ts.transpileModule('const effect=' + effect!.getText(appSource), { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
+  return new Function('bindings', 'const {' + Object.keys(bindings).join(',') + '}=bindings;' + js + ';return effect;')(bindings);
+}
+
+it.each(['healthy', 'logout', 'recovery', 'new-login', 'unmount'])('delayed bootstrap only commits the current profile/runtime: %s', async phase => {
+  const old = { id: 'old', runtimeTemplate: {} }; const fresh = { id: 'fresh', runtimeTemplate: {} };
+  let release!: (value: unknown) => void; const epoch = { current: 0 }; const ref = { current: [] as unknown[] };
+  const client = { loadServers: vi.fn().mockResolvedValue([]), loadHistory: vi.fn().mockResolvedValue([]),
+    loadDevices: vi.fn().mockResolvedValue([]), loadRuntimeSnapshot: vi.fn(() => new Promise(resolve => { release = resolve; })),
+    hydrateCachedServers: vi.fn(), getProfileSyncInfo: vi.fn().mockReturnValue({ status: 'ready' }) };
+  const b: Record<string, any> = { isTauriRuntime: true, persistentStateReady: true, recoveryEpochRef: epoch,
+    remnawaveClient: client, serversRef: ref, loadStoredAccessKeySecure: vi.fn().mockResolvedValue('https://sub.vkarmani.com/synthetic'),
+    loadLastKnownServers: () => [], loadLastKnownServersBackup: vi.fn().mockResolvedValue([old]),
+    mergeServerMeasurements: (value: unknown) => value, pickPreferredServer: () => null,
+    initialProtocolStrategy: { current: 'auto' }, lastRuntimeTunnelActive: { current: false }, NativeStorageError };
+  for (const n of ['setIsBootstrapping','setServers','setSessionHistory','setDevices','setRuntimeStatus','setDiagnostics','setProxyStatus',
+    'setConnectionStateSafe','setProfileSyncInfo','refreshPrimaryExternalIp','reportPersistentFailure']) b[n] = vi.fn();
+  const cleanup = appEffectContaining('const bootstrap = async', b)();
+  await vi.waitFor(() => expect(client.loadRuntimeSnapshot).toHaveBeenCalled());
+  if (phase !== 'healthy') { epoch.current++; ref.current = [fresh]; }
+  if (phase === 'unmount') cleanup();
+  release({ runtime: { tunnelActive: true }, diagnostics: {}, proxyStatus: {} });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(ref.current).toEqual(phase === 'healthy' ? [old] : [fresh]);
+  expect(client.hydrateCachedServers).toHaveBeenCalledTimes(phase === 'healthy' ? 2 : 1);
+  expect(b.setRuntimeStatus).toHaveBeenCalledTimes(phase === 'healthy' ? 1 : 0);
+  if (phase === 'healthy') expect(client.hydrateCachedServers).toHaveBeenCalledWith([old], 'https://sub.vkarmani.com/synthetic');
+  else expect(client.hydrateCachedServers).not.toHaveBeenCalledWith([old], expect.anything());
+  if (phase === 'unmount') expect(b.setIsBootstrapping.mock.calls).toEqual([[true]]);
+});
+
+it('automatic key login waits for bootstrap and an explicit login suppresses the pending favorite action', async () => {
+  const read = vi.fn(); appEffectContaining('const normalizedStoredKey = storedKey.trim()', { persistentStateReady: true, isBootstrapping: true, loadStoredAccessKeySecure: read })();
+  expect(read).not.toHaveBeenCalled();
+  const tried = { current: false }; const authorize = vi.fn();
+  await appFunction('handleAuthorize', { hasTriedFavoriteAutoConnect: tried, authorizeWithAccessKey: authorize, accessKey: 'synthetic' })();
+  expect(tried.current).toBe(true); expect(authorize).toHaveBeenCalledWith('synthetic', false);
+});
+
+it('info-only login cannot autoconnect the previous React catalog or selected server under a different key', async () => {
+  const old = { id: 'old-account', runtimeTemplate: {} }; const connect = vi.fn();
+  const b: Record<string, any> = { isTauriRuntime: true, persistentStateReady: true, recoveryEpochRef: { current: 0 }, recoveryModeRef: { current: false },
+    settingsRef: { current: { autoConnect: true, profileSyncOnLogin: false } },
+    remnawaveClient: { authorizeByAccessKey: vi.fn().mockResolvedValue({}), loadDevices: vi.fn().mockResolvedValue([]),
+      loadServers: vi.fn().mockResolvedValue([]), getProfileSyncInfo: vi.fn().mockReturnValue({ status: 'idle', configCount: 0 }) },
+    saveStoredAccessKey: vi.fn().mockResolvedValue(true), setNativeSessionAuthorized: vi.fn().mockResolvedValue(true),
+    authorizedAccessKeyRef: { current: 'old-key' }, overviewAutoRefreshAtRef: { current: 0 }, serversRef: { current: [old] },
+    selectedServerIdRef: { current: old.id }, selectedServer: old, mergeServerMeasurements: (v: unknown) => v,
+    pickPreferredServer: (v: unknown[]) => v[0] ?? null, handleConnectionToggle: connect, NativeStorageError,
+    tr: (_: unknown, ru: string) => ru, language: 'ru', normalizeNativeError: (e: Error) => e };
+  for (const n of ['writeNativeInterfaceLog','setAuthLoading','setErrorText','setAccessKey','setSession','setDevices','setIsAuthorized',
+    'pushToast','setServers','setSelectedServerId','setProfileSyncInfo']) b[n] = vi.fn();
+  await appFunction('authorizeWithAccessKey', b)('https://sub.vkarmani.com/new-synthetic');
+  expect(connect).not.toHaveBeenCalled(); expect(b.serversRef.current).toEqual([]); expect(b.selectedServerIdRef.current).toBe('');
+  expect(b.setErrorText.mock.calls).toEqual([['']]);
+});
+
 it('contains render/import failures without displaying exception credentials, retry requests safe start', () => {
   const children = vi.fn((safe: boolean) => <div>{safe ? 'safe' : 'normal'}</div>);
   const boundary = new RootErrorBoundary({ children });
@@ -153,7 +217,7 @@ it('failed persistent profile deletion retains the client cache and does not rep
 it('a superseded login error cannot overwrite newer loading, show an error or authorize a stale key', async () => {
   const releases: Array<(value: unknown) => void> = []; const rejections: Array<(error: Error) => void> = [];
   const epoch = { current: 0 }; const client = { authorizeByAccessKey: vi.fn(() => new Promise((resolve, reject) => { releases.push(resolve); rejections.push(reject); })),
-    loadDevices: vi.fn().mockResolvedValue([]), loadServers: vi.fn().mockResolvedValue([]) };
+    loadDevices: vi.fn().mockResolvedValue([]), loadServers: vi.fn().mockResolvedValue([]), getProfileSyncInfo: vi.fn().mockReturnValue({ status: 'idle' }) };
   const b: Record<string, any> = { isTauriRuntime: true, persistentStateReady: true, recoveryEpochRef: epoch,
     recoveryModeRef: { current: false }, settingsRef: { current: {} }, remnawaveClient: client,
     authorizedAccessKeyRef: { current: '' }, overviewAutoRefreshAtRef: { current: 0 }, serversRef: { current: [] },
@@ -161,7 +225,7 @@ it('a superseded login error cannot overwrite newer loading, show an error or au
     saveStoredAccessKey: vi.fn().mockResolvedValue(true), setNativeSessionAuthorized: vi.fn().mockResolvedValue(true),
     pickPreferredServer: () => null, tr: (_: unknown, ru: string) => ru, language: 'ru', normalizeNativeError: (e: Error) => e };
   for (const name of ['writeNativeInterfaceLog','setAuthLoading','setErrorText','setAccessKey','setSession','setDevices','setIsAuthorized',
-    'pushToast','setProfileSyncInfo','handleConnectionToggle']) b[name] = vi.fn();
+    'pushToast','setProfileSyncInfo','setServers','setSelectedServerId','handleConnectionToggle']) b[name] = vi.fn();
   const authorize = appFunction('authorizeWithAccessKey', b);
   const old = authorize('https://sub.vkarmani.com/old-synthetic');
   const latest = authorize('https://sub.vkarmani.com/new-synthetic');
@@ -171,6 +235,7 @@ it('a superseded login error cannot overwrite newer loading, show an error or au
   releases[1]({ id: 'new' }); await latest;
   expect(b.saveStoredAccessKey).toHaveBeenCalledExactlyOnceWith('https://sub.vkarmani.com/new-synthetic');
   expect(b.setSession).toHaveBeenCalledExactlyOnceWith({ id: 'new' }); expect(b.setAuthLoading).toHaveBeenLastCalledWith(false);
+  expect(b.setErrorText.mock.calls).toEqual([[''],['']]);
 });
 
 it('profile invalidation releases stale busy flags, revokes client work and avoids UI writes on unmount', () => {

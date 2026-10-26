@@ -389,7 +389,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
   useEffect(() => {
     let cancelled = false;
 
-    if (!persistentStateReady) return;
+    if (!persistentStateReady || isBootstrapping) return;
     void loadStoredAccessKeySecure()
       .then((storedKey) => {
         if (!cancelled && storedKey.trim()) {
@@ -409,7 +409,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
     return () => {
       cancelled = true;
     };
-  }, [persistentStateReady, recoveryMode]);
+  }, [persistentStateReady, recoveryMode, isBootstrapping]);
 
 
   useEffect(() => {
@@ -550,14 +550,19 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
   }, [connectionState, runtimeStatus.runtimeId]);
 
   useEffect(() => {
+    if (isTauriRuntime && !persistentStateReady) return;
     let cancelled = false;
+    const bootstrapEpoch = recoveryEpochRef.current;
+    const isCurrentBootstrap = () => !cancelled && bootstrapEpoch === recoveryEpochRef.current;
 
     const bootstrap = async () => {
       setIsBootstrapping(true);
+      const storedProfileKey = await loadStoredAccessKeySecure();
+      if (!isCurrentBootstrap()) return;
 
       const localLastKnownServers = loadLastKnownServers();
+      remnawaveClient.hydrateCachedServers(localLastKnownServers, storedProfileKey);
       if (localLastKnownServers.length) {
-        remnawaveClient.hydrateCachedServers(localLastKnownServers);
         serversRef.current = localLastKnownServers;
         setServers(localLastKnownServers);
       }
@@ -570,7 +575,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         loadLastKnownServersBackup()
       ]);
 
-      if (cancelled) {
+      if (!isCurrentBootstrap()) {
         return;
       }
 
@@ -591,7 +596,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       const currentServersNeedSecureRuntimeCache = !serversRef.current.length || !serversRef.current.some((server: VpnServer) => server.runtimeTemplate);
       if (currentServersNeedSecureRuntimeCache && lastKnownBackupResult.status === 'fulfilled' && lastKnownBackupResult.value?.length) {
         const backupServers = mergeServerMeasurements(lastKnownBackupResult.value, serversRef.current);
-        remnawaveClient.hydrateCachedServers(backupServers);
+        remnawaveClient.hydrateCachedServers(backupServers, storedProfileKey);
         serversRef.current = backupServers;
         setServers(backupServers);
         const preferredServer = pickPreferredServer(backupServers, initialProtocolStrategy.current);
@@ -626,16 +631,16 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
       setIsBootstrapping(false);
     };
 
-    void bootstrap().catch(() => {
-      if (!cancelled) {
-        setIsBootstrapping(false);
-      }
+    void bootstrap().catch(error => {
+      if (isCurrentBootstrap() && error instanceof NativeStorageError) reportPersistentFailure(error);
+    }).finally(() => {
+      if (!cancelled) setIsBootstrapping(false);
     });
 
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [persistentStateReady]);
 
   useEffect(() => {
     if (!isTauriRuntime) {
@@ -2059,12 +2064,15 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
           return nextId;
         });
       } else {
-        serverPool = serversRef.current;
+        // The client owns the authenticated subscription's fallback. A React
+        // catalog/selection can still belong to the previous key or bootstrap.
+        serversRef.current = []; setServers([]);
+        selectedServerIdRef.current = ''; setSelectedServerId('');
+        setProfileSyncInfo(remnawaveClient.getProfileSyncInfo());
       }
 
       let preferredServerForAutoConnect = serverPool.find((server: VpnServer) => server.id === selectedServerIdRef.current)
-        ?? pickPreferredServer(serverPool, currentSettings.protocolStrategy)
-        ?? selectedServer;
+        ?? pickPreferredServer(serverPool, currentSettings.protocolStrategy);
 
       const shouldRunLoginSync = currentSettings.profileSyncOnLogin && !serverPool.length;
       const syncResult = shouldRunLoginSync
@@ -2116,6 +2124,8 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
   }
 
   async function handleAuthorize() {
+    // An explicit login supersedes the pending startup favorite action.
+    hasTriedFavoriteAutoConnect.current = true;
     await authorizeWithAccessKey(accessKey, false);
   }
 
