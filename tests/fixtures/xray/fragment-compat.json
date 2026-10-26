@@ -1,0 +1,31 @@
+{
+  "remarks": "Synthetic Auto compatibility",
+  "outbounds": [
+    {
+      "tag": "pool-raw", "protocol": "vless",
+      "settings": { "vnext": [{ "address": "raw.example.invalid", "port": 443, "users": [{ "id": "00000000-0000-4000-8000-000000000001", "encryption": "none" }] }] },
+      "streamSettings": {
+        "network": "raw", "security": "reality",
+        "realitySettings": { "serverName": "example.invalid", "fingerprint": "chrome", "publicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "shortId": "0123456789abcdef" },
+        "finalmask": { "tcp": [{ "type": "fragment", "settings": { "lengths": ["50-100"], "delays": ["1-3"], "packets": "tlshello", "maxSplit": "3" } }] }
+      }
+    },
+    {
+      "tag": "pool-xhttp", "protocol": "vless",
+      "settings": { "vnext": [{ "address": "xhttp.example.invalid", "port": 443, "users": [{ "id": "00000000-0000-4000-8000-000000000002", "encryption": "none" }] }] },
+      "streamSettings": { "network": "xhttp", "security": "tls", "tlsSettings": { "serverName": "example.invalid" }, "xhttpSettings": { "path": "/synthetic", "mode": "auto" } }
+    },
+    {
+      "tag": "pool-ws", "protocol": "trojan",
+      "settings": { "servers": [{ "address": "ws.example.invalid", "port": 443, "password": "synthetic-password" }] },
+      "streamSettings": { "network": "ws", "security": "tls", "tlsSettings": { "serverName": "example.invalid" }, "wsSettings": { "path": "/synthetic" } }
+    },
+    { "tag": "direct", "protocol": "freedom", "settings": {} }
+  ],
+  "routing": {
+    "balancers": [{ "tag": "synthetic-choice", "selector": ["pool-"], "strategy": { "type": "random" }, "fallbackTag": "pool-ws" }],
+    "rules": [{ "type": "field", "domain": ["domain:example.org"], "outboundTag": "direct" }, { "type": "field", "network": "tcp,udp", "balancerTag": "synthetic-choice" }]
+  },
+  "burstObservatory": { "subjectSelector": ["pool-"], "pingConfig": { "destination": "https://example.invalid/", "connectivity": "https://example.invalid/", "interval": "1h", "sampling": 2, "timeout": "5s" } },
+  "futureExtension": { "preserve": [null, false, ""] }
+}
