@@ -951,19 +951,19 @@ function proxyStatusFromRuntime(runtime: RuntimeStatus): ProxyStatus {
   };
 }
 
+function emptyProfileSyncInfo(): ProfileSyncInfo {
+  return { status: 'idle', source: 'demo', sourceLabel: 'Ожидание live sync', configCount: 0,
+    message: 'Серверы появятся после синхронизации вашего профиля Remnawave.' };
+}
+
 export class RemnawaveClient {
   private cachedServers: VpnServer[] = [];
+  private cachedProfileKey: string | null = null;
   private profileSyncGeneration = 0;
   invalidateProfileSync() { this.profileSyncGeneration++; }
   private cachedSession: RemnawaveSession | null = null;
   private cachedDevices: DeviceRecord[] = [buildLocalDeviceRecord()];
-  private profileSyncInfo: ProfileSyncInfo = {
-    status: 'idle',
-    source: 'demo',
-    sourceLabel: 'Ожидание live sync',
-    configCount: 0,
-    message: 'Серверы появятся после синхронизации вашего профиля Remnawave.'
-  };
+  private profileSyncInfo: ProfileSyncInfo = emptyProfileSyncInfo();
   private lastProbe: ConnectivityProbe | null = null;
   private runtimeSnapshotInFlight: Promise<{ runtime: RuntimeStatus; proxyStatus: ProxyStatus; diagnostics: DiagnosticsSnapshot }> | null = null;
 
@@ -994,21 +994,29 @@ export class RemnawaveClient {
 
   clearSessionCache() {
     this.invalidateProfileSync();
+    this.cachedProfileKey = null;
     this.cachedSession = null;
     this.cachedServers = [];
     this.cachedDevices = [buildLocalDeviceRecord()];
     this.lastProbe = null;
-    this.profileSyncInfo = {
-      status: 'idle', source: 'demo', sourceLabel: 'Ожидание live sync', configCount: 0,
-      message: 'Серверы появятся после синхронизации вашего профиля Remnawave.'
-    };
+    this.profileSyncInfo = emptyProfileSyncInfo();
+  }
+
+  private adoptProfileKey(key: string | null) {
+    if (this.cachedProfileKey !== key) {
+      this.cachedSession = null; this.cachedServers = [];
+      this.cachedDevices = [buildLocalDeviceRecord()]; this.lastProbe = null;
+      this.profileSyncInfo = emptyProfileSyncInfo();
+    }
+    this.cachedProfileKey = key;
   }
 
   updateCachedMeasurements(servers: VpnServer[]) {
     this.cachedServers = mergeServerMeasurements(this.cachedServers, servers);
   }
 
-  hydrateCachedServers(servers: VpnServer[]) {
+  hydrateCachedServers(servers: VpnServer[], accessKey?: string) {
+    this.adoptProfileKey(accessKey?.trim() ? resolveAccessKey(accessKey).normalized : null);
     const readyServers = servers.filter((server) => Boolean(server.runtimeTemplate));
     if (!readyServers.length) {
       return;
@@ -1029,6 +1037,8 @@ export class RemnawaveClient {
   async authorizeByAccessKey(accessKey: string, allowDemoFallback = allowDemoFallbackByEnv): Promise<RemnawaveSession> {
     const generation = ++this.profileSyncGeneration;
     const key = resolveAccessKey(accessKey);
+    // A full-profile fallback is valid only for the same subscription identity.
+    const previousServers = this.cachedProfileKey === key.normalized ? [...this.cachedServers] : [];
     const provisionalSession = makeProvisionalSession(accessKey, key);
     const candidates = buildInfoCandidates(key);
 
@@ -1038,6 +1048,7 @@ export class RemnawaveClient {
       }
 
       const demoSession = makeDemoSession(accessKey);
+      this.adoptProfileKey(key.normalized);
       this.cachedSession = demoSession;
       this.cachedDevices = [buildLocalDeviceRecord()];
       return demoSession;
@@ -1049,15 +1060,15 @@ export class RemnawaveClient {
     // Для ключей VKarmani основной полезный результат — рабочий Xray JSON профиль со списком серверов.
     try {
       const xrayJsonResult = await fetchParsableXrayJsonProfileCandidates(xrayJsonCandidates, {
-        expectedMinimumServers: this.cachedServers.length
+        expectedMinimumServers: previousServers.length
       });
       if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
       const importedServers = xrayJsonResult.servers;
-      const previousServers = [...this.cachedServers];
       const keepPreviousProfile = shouldKeepPreviousFullProfile(previousServers, importedServers);
       const activeServers = mergeServerMeasurements(keepPreviousProfile ? previousServers : importedServers, previousServers);
       const readyCount = readyServerCount(activeServers);
 
+      this.adoptProfileKey(key.normalized);
       this.cachedSession = provisionalSession;
       this.cachedDevices = [buildLocalDeviceRecord()];
       this.cachedServers = activeServers;
@@ -1086,6 +1097,7 @@ export class RemnawaveClient {
       if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
       const source: RemnawaveSource = result.url.includes('/api/sub/') ? 'public-api' : 'panel-api';
       const session = mapSessionFromPayload(accessKey, key, result.value, source, result.url);
+      this.adoptProfileKey(key.normalized);
       this.cachedSession = session;
       this.cachedDevices = extractDevicesFromPayload(result.value, session.userId);
       if (!this.cachedDevices.length) {
@@ -1100,6 +1112,7 @@ export class RemnawaveClient {
         throw new Error(`${xrayJsonFirstError} Info-проверка тоже не прошла: ${infoError}`);
       }
 
+      this.adoptProfileKey(key.normalized);
       this.cachedSession = provisionalSession;
       this.cachedDevices = [buildLocalDeviceRecord()];
       return provisionalSession;
@@ -1109,12 +1122,14 @@ export class RemnawaveClient {
   async syncProfile(accessKey: string, allowDemoFallback = allowDemoFallbackByEnv) {
     const generation = ++this.profileSyncGeneration;
     const key = resolveAccessKey(accessKey);
-    const candidates = buildXrayJsonProfileCandidates(key, this.cachedSession);
-    const previousServers = [...this.cachedServers];
-    const previousProfile = this.profileSyncInfo;
+    const sameProfile = this.cachedProfileKey === key.normalized;
+    const candidates = buildXrayJsonProfileCandidates(key, sameProfile ? this.cachedSession : null);
+    const previousServers = sameProfile ? [...this.cachedServers] : [];
+    const committedProfile = this.profileSyncInfo;
+    const previousProfile = sameProfile ? committedProfile : emptyProfileSyncInfo();
 
     this.profileSyncInfo = {
-      ...this.profileSyncInfo,
+      ...previousProfile,
       status: 'syncing',
       accessKeyKind: key.kind,
       message: 'Получаем и парсим Xray JSON профиль…'
@@ -1135,6 +1150,7 @@ export class RemnawaveClient {
       if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
       await cacheNativeProfileSync(activeServers.length, xrayJsonResult.url.includes('/api/sub/') ? 'Публичная Xray JSON подписка' : 'Panel API');
       if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
+      this.adoptProfileKey(key.normalized);
       this.cachedServers = activeServers;
       const readyCount = readyServerCount(activeServers);
       this.profileSyncInfo = {
@@ -1159,6 +1175,10 @@ export class RemnawaveClient {
     } catch (error) {
       if (generation !== this.profileSyncGeneration) throw new Error('PROFILE_SYNC_CANCELLED');
       const message = error instanceof Error ? error.message : 'Не удалось синхронизировать профиль.';
+      if (!sameProfile) {
+        this.profileSyncInfo = committedProfile;
+        throw new Error(message);
+      }
       const restoredCount = previousServers.length;
       this.cachedServers = previousServers;
       this.profileSyncInfo = {

@@ -11,6 +11,56 @@ const config=(name:string)=>({remarks:name,outbounds:[{tag:'proxy',protocol:'vle
 beforeEach(()=>{vi.stubGlobal('window',{setTimeout,clearTimeout});mocks.fetch.mockReset();mocks.json.mockReset();mocks.cache.mockReset();mocks.cache.mockResolvedValue(undefined);});
 afterEach(()=>vi.unstubAllGlobals());
 describe('actual subscription-client atomic refresh and generation ownership',()=>{
+  it.each(['authorizeByAccessKey', 'syncProfile'] as const)('binds catalog retention and endpoint candidates to the requested key: %s', async method => {
+    const client = new RemnawaveClient();
+    mocks.fetch.mockResolvedValue(JSON.stringify([config('AccountA1'), config('AccountA2')]));
+    await client.authorizeByAccessKey(key); mocks.fetch.mockClear();
+    mocks.fetch.mockResolvedValue(JSON.stringify(config('AccountB')));
+    await client[method](key + '-different');
+    expect(mocks.fetch.mock.calls.every(([url]) => !url.includes('/qa-synthetic-fixture/') && !url.includes('/qa-synthetic-fixture/json'))).toBe(true);
+    expect((await client.loadServers()).map(s => s.rawLabel)).toEqual(['AccountB']);
+  });
+  it('new-key info-only authorization does not inherit servers or metadata from the previous key', async () => {
+    const client = new RemnawaveClient(); mocks.fetch.mockResolvedValue(JSON.stringify([config('A1'),config('A2')]));
+    await client.authorizeByAccessKey(key);
+    mocks.fetch.mockRejectedValue(new Error('synthetic Xray profile unavailable')); mocks.json.mockResolvedValue({});
+    await client.authorizeByAccessKey(key + '-info');
+    expect(await client.loadServers()).toEqual([]);
+    expect(client.getProfileSyncInfo().rawUrl).toBeUndefined();
+  });
+  it('same-key full-profile fallback survives protected hydration, while unbound hydration cannot authorize retention', async () => {
+    const old = parse(JSON.stringify([config('A1'),config('A2')]));
+    for (const owner of [key, undefined]) {
+      const client = new RemnawaveClient(); client.hydrateCachedServers(old, owner);
+      mocks.fetch.mockRejectedValue(new Error('synthetic unavailable')); mocks.json.mockResolvedValue({});
+      await client.authorizeByAccessKey(key);
+      expect((await client.loadServers()).map(s => s.rawLabel)).toEqual(owner ? ['A1','A2'] : []);
+    }
+  });
+  it('failed replacement key leaves the old committed catalog/session intact', async () => {
+    const client = new RemnawaveClient(); mocks.fetch.mockResolvedValue(JSON.stringify(config('Committed')));
+    const previous = await client.authorizeByAccessKey(key); const servers = await client.loadServers();
+    mocks.fetch.mockRejectedValue(new Error('synthetic failure')); mocks.json.mockRejectedValue(new Error('synthetic info failure'));
+    await expect(client.authorizeByAccessKey(key + '-failed')).rejects.toThrow();
+    expect(client.getCachedSession()).toBe(previous); expect(await client.loadServers()).toEqual(servers);
+  });
+  it('an older native metadata acknowledgement cannot replace the newer subscription catalog', async () => {
+    const client = new RemnawaveClient(); let release!: () => void;
+    mocks.fetch.mockResolvedValue(JSON.stringify(config('A')));
+    mocks.cache.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    const pending = client.syncProfile(key); const rejected = expect(pending).rejects.toThrow('PROFILE_SYNC_CANCELLED');
+    await vi.waitFor(() => expect(mocks.cache).toHaveBeenCalled());
+    mocks.fetch.mockResolvedValue(JSON.stringify(config('B'))); const latest = await client.authorizeByAccessKey(key + '-b');
+    release(); await rejected;
+    expect(client.getCachedSession()).toBe(latest); expect((await client.loadServers()).map(s => s.rawLabel)).toEqual(['B']);
+  });
+  it('a failed different-key sync cannot return or relabel the previous account as its fallback', async () => {
+    const client = new RemnawaveClient(); mocks.fetch.mockResolvedValue(JSON.stringify(config('Committed')));
+    const session = await client.authorizeByAccessKey(key); const profile = client.getProfileSyncInfo(); const servers = await client.loadServers();
+    mocks.fetch.mockRejectedValue(new Error('synthetic unavailable'));
+    await expect(client.syncProfile(key + '-other', true)).rejects.toThrow();
+    expect(client.getCachedSession()).toBe(session); expect(client.getProfileSyncInfo()).toBe(profile); expect(await client.loadServers()).toEqual(servers);
+  });
   it('confirmed logout clears the old catalog so a different key cannot inherit its larger profile', async () => {
     const client = new RemnawaveClient();
     mocks.fetch.mockResolvedValue(JSON.stringify([config('OldA'), config('OldB')]));
@@ -76,11 +126,11 @@ describe('actual subscription-client atomic refresh and generation ownership',()
     mocks.fetch.mockResolvedValue(JSON.stringify([config('B'),config('A')]));const two=await client.syncProfile(key);expect(two.servers.map(s=>s.id)).toEqual([...ids].reverse());expect(two.servers.map(s=>s.sourceOrder)).toEqual([0,1]);
   });
   it.each(['not-json',JSON.stringify([config('A'),null]),JSON.stringify([config('A'),{outbounds:[],routing:{rules:[{outboundTag:'missing'}]}}])])('retains the complete previous cache for malformed/partial subscription %s',async text=>{
-    const client=new RemnawaveClient();const old=parse(JSON.stringify([config('PreviousA'),config('PreviousB')]));client.hydrateCachedServers(old);mocks.fetch.mockResolvedValue(text);
+    const client=new RemnawaveClient();const old=parse(JSON.stringify([config('PreviousA'),config('PreviousB')]));client.hydrateCachedServers(old,key);mocks.fetch.mockResolvedValue(text);
     await expect(client.syncProfile(key)).rejects.toThrow();expect(await client.loadServers()).toEqual(old);
   });
   it('does not commit before native metadata stage succeeds; failure preserves previous complete list',async()=>{
-    const client=new RemnawaveClient();const old=parse(JSON.stringify(config('Previous')));client.hydrateCachedServers(old);mocks.fetch.mockResolvedValue(JSON.stringify([config('A'),config('B')]));mocks.cache.mockRejectedValue(new Error('metadata stage failed'));
+    const client=new RemnawaveClient();const old=parse(JSON.stringify(config('Previous')));client.hydrateCachedServers(old,key);mocks.fetch.mockResolvedValue(JSON.stringify([config('A'),config('B')]));mocks.cache.mockRejectedValue(new Error('metadata stage failed'));
     await expect(client.syncProfile(key)).rejects.toThrow('metadata stage failed');expect(await client.loadServers()).toEqual(old);
   });
   it('ignores older refresh completion and cannot roll back a newer committed list',async()=>{
