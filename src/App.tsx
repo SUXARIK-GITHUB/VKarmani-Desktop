@@ -45,6 +45,7 @@ import {
   requestWindowHide,
   setNativeLaunchOnStartup,
   setNativeSessionAuthorized,
+  revokeNativeSessionAuthorization,
   setNativeTrayUpdateState,
   writeNativeInterfaceLog,
   writeNativeRoutingLog,
@@ -2828,10 +2829,10 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         }
 
         clearPendingConnectionQueue();
+        await revokeNativeSessionAuthorization();
         await clearStoredAccessKey();
         await clearLastKnownServers();
         authorizedAccessKeyRef.current = '';
-        await setNativeSessionAuthorized(false);
         remnawaveClient.clearSessionCache();
         setAccessKey('');
         setIsAuthorized(false);

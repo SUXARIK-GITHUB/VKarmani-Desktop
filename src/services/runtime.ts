@@ -657,3 +657,16 @@ export async function setNativeSessionAuthorized(authorized: boolean, accessKey?
     return false;
   }
 }
+
+// Explicit logout needs an acknowledgement; the best-effort synchronizer above
+// deliberately returns false for both a successful revoke and an IPC failure.
+export async function revokeNativeSessionAuthorization(): Promise<void> {
+  if (!isTauriRuntime) return;
+  let result: unknown;
+  try {
+    result = await invokeTauri<unknown>('set_session_authorized', { authorized: false });
+  } catch (error) {
+    throw new Error(`SESSION_REVOKE_FAILED: ${normalizeNativeError(error, 'Native session revoke failed.').message}`);
+  }
+  if (result !== false) throw new Error('SESSION_REVOKE_UNCONFIRMED');
+}
