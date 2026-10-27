@@ -254,12 +254,16 @@ pub(crate) fn ensure_tun_process_enforcement(
     }
     let mode = policy_mode.unwrap_or("selected");
     let active = active_policy_entries(entries, mode)?;
-    // Xray process lookup is not an OS enforcement boundary. A protected,
-    // unknown or short-lived process can miss a rule and take the fallback.
-    // Neither selected VPN routing nor DIRECT process exclusions are safe to
-    // advertise until a separately approved enforcement implementation exists.
-    if mode == "selected" || !active.is_empty() {
-        return Err("TUN_PROCESS_ENFORCEMENT_UNAVAILABLE: маршрутизация выбранных приложений и служб, включая правила Напрямую, временно заблокирована. Выберите Все приложения без активных правил Напрямую или Proxy. Сохранённые правила не удаляются.".into());
+    // Owner-authorized process-based split tunneling, not OS-level isolation.
+    // Keep validation; Xray lookup misses can still take the configured fallback.
+    if mode == "selected"
+        && !active
+            .iter()
+            .any(|e| e.policy.as_deref().unwrap_or("VPN") == "VPN")
+    {
+        return Err(
+            "RULE_SELECTION_EMPTY: selected mode requires an active VPN application/service".into(),
+        );
     }
     Ok(())
 }
@@ -267,26 +271,49 @@ pub(crate) fn ensure_tun_process_admission(
     network_mode: Option<&str>,
     policy_mode: Option<&str>,
     entries: &[SplitTunnelEntryPayload],
-    isolated_owner_test: bool,
 ) -> Result<(), String> {
-    if !isolated_owner_test {
-        return ensure_tun_process_enforcement(network_mode, policy_mode, entries);
+    ensure_tun_process_enforcement(network_mode, policy_mode, entries)
+}
+
+/// Pure release-binary acceptance probe: no AppHandle, storage, core or OS routes.
+pub(crate) fn verify_production_tun_admission(config: &tauri::Config) -> Result<Value, String> {
+    if cfg!(debug_assertions) || config.identifier != "com.vkarmani.desktop" || local_test_build() {
+        return Err("STANDARD_RELEASE_BUILD_REQUIRED".into());
     }
-    if network_mode.is_some_and(|v| v.eq_ignore_ascii_case("tun")) {
-        let mode = policy_mode.unwrap_or("selected");
-        let active = active_policy_entries(entries, mode)?;
-        if mode == "selected"
-            && !active
-                .iter()
-                .any(|e| e.policy.as_deref().unwrap_or("VPN") == "VPN")
+    validate_local_test_config(config)?;
+    #[derive(serde::Deserialize)]
+    struct Case {
+        name: String,
+        mode: String,
+        entries: Vec<SplitTunnelEntryPayload>,
+        blocked: bool,
+    }
+    let cases: Vec<Case> = serde_json::from_str(include_str!(
+        "../../tests/fixtures/policies/tun-admission.json"
+    ))
+    .map_err(|_| "TUN_ACCEPTANCE_FIXTURE_INVALID")?;
+    for case in &cases {
+        if ensure_tun_process_admission(Some("tun"), Some(&case.mode), &case.entries).is_err()
+            != case.blocked
         {
-            return Err(
-                "RULE_SELECTION_EMPTY: selected mode requires an active VPN application/service"
-                    .into(),
-            );
+            return Err(format!("TUN_ACCEPTANCE_FAILED: {}", case.name));
         }
     }
-    Ok(())
+    let unknown_service = SplitTunnelEntryPayload {
+        kind: "service".into(),
+        value: "MissingSyntheticService".into(),
+        enabled: true,
+        policy: Some("VPN".into()),
+    };
+    if build_policy_plan(&[unknown_service], &[]).is_ok()
+        || ensure_tun_process_admission(Some("tun"), Some("invalid"), &[]).is_ok()
+    {
+        return Err("TUN_ACCEPTANCE_NEGATIVE_FAILED".into());
+    }
+    Ok(json!({"status":"PASS","identifier":config.identifier,
+        "version":env!("CARGO_PKG_VERSION"),"debugAssertions":cfg!(debug_assertions),
+        "localTest":local_test_build(),"policyCases":cases.len(),
+        "invalidModeAndUnknownServiceRejected":true,"networkMutated":false}))
 }
 pub(crate) fn build_split_tunnel_rule_plan_for_mode(
     entries: &[SplitTunnelEntryPayload],
@@ -347,16 +374,12 @@ mod tests {
         }
     }
     #[test]
-    fn native_admission_blocks_every_process_dependent_tun_policy() {
-        for entries in [
-            vec![],
-            vec![entry("app.exe", "VPN")],
-            vec![entry("app.exe", "DIRECT")],
-        ] {
+    fn native_admission_allows_process_policies_but_keeps_empty_selected_refusal() {
+        for entries in [vec![], vec![entry("app.exe", "DIRECT")]] {
             assert!(
                 ensure_tun_process_enforcement(Some("tun"), Some("selected"), &entries)
                     .unwrap_err()
-                    .starts_with("TUN_PROCESS_ENFORCEMENT_UNAVAILABLE")
+                    .starts_with("RULE_SELECTION_EMPTY")
             );
         }
         for mode in ["all", "exclude"] {
@@ -372,14 +395,16 @@ mod tests {
                 direct.kind = kind.into();
                 assert!(
                     ensure_tun_process_enforcement(Some("tun"), Some(mode), &[direct.clone()])
-                        .unwrap_err()
-                        .starts_with("TUN_PROCESS_ENFORCEMENT_UNAVAILABLE")
+                        .is_ok()
                 );
                 direct.enabled = false;
                 assert!(ensure_tun_process_enforcement(Some("tun"), Some(mode), &[direct]).is_ok());
             }
         }
         assert!(ensure_tun_process_enforcement(Some("tun"), None, &[]).is_err());
+        assert!(
+            ensure_tun_process_enforcement(Some("tun"), None, &[entry("app.exe", "VPN")]).is_ok()
+        );
         assert!(ensure_tun_process_enforcement(Some("tun"), Some("invalid"), &[]).is_err());
         assert!(ensure_tun_process_enforcement(
             Some("proxy"),
@@ -389,25 +414,37 @@ mod tests {
         .is_ok());
     }
     #[test]
-    fn isolated_owner_test_admission_keeps_modes_rules_and_empty_selection_validation() {
+    fn production_admission_keeps_modes_rules_and_empty_selection_without_test_flags() {
         let entries = vec![
             entry("C:/A/app.exe", "VPN"),
             entry("D:/B/app.exe", "DIRECT"),
         ];
         let before = serde_json::to_value(&entries).unwrap();
         for mode in ["all", "selected", "exclude"] {
-            assert!(ensure_tun_process_admission(Some("tun"), Some(mode), &entries, true).is_ok());
-            assert!(
-                ensure_tun_process_admission(Some("tun"), Some(mode), &entries, false).is_err()
-            );
+            assert!(ensure_tun_process_admission(Some("tun"), Some(mode), &entries).is_ok());
         }
         assert!(
-            ensure_tun_process_admission(Some("tun"), Some("selected"), &[], true)
+            ensure_tun_process_admission(Some("tun"), Some("selected"), &[])
                 .unwrap_err()
                 .starts_with("RULE_SELECTION_EMPTY")
         );
-        assert!(ensure_tun_process_admission(Some("tun"), Some("wrong"), &entries, true).is_err());
+        assert!(ensure_tun_process_admission(Some("tun"), Some("wrong"), &entries).is_err());
         assert_eq!(serde_json::to_value(&entries).unwrap(), before);
+    }
+    #[test]
+    fn production_binary_probe_requires_standard_release_configuration() {
+        let mut config: tauri::Config =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        if cfg!(debug_assertions) {
+            assert!(verify_production_tun_admission(&config).is_err());
+        } else {
+            assert_eq!(
+                verify_production_tun_admission(&config).unwrap()["status"],
+                "PASS"
+            );
+        }
+        config.identifier = LOCAL_TEST_ID.into();
+        assert!(verify_production_tun_admission(&config).is_err());
     }
     fn service(name: &str, exe: &str, pid: u32, kind: &str) -> WindowsServiceInfo {
         WindowsServiceInfo {

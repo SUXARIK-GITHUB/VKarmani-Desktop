@@ -1274,7 +1274,7 @@ export class RemnawaveClient {
     // working native connection or enter partial-start rollback.
     if (isTauriRuntime) {
       if (options.tunnelMode === 'tun' && isTunProcessRoutingBlocked(options.splitTunnelEntries ?? [], options.tunRoutingMode ?? 'selected')) {
-        throw new Error('TUN_PROCESS_ENFORCEMENT_UNAVAILABLE: выберите «Все приложения» без активных правил «Напрямую» или Proxy. Маршрутизация отдельных приложений и служб временно заблокирована; правила сохранены. / Choose All applications without active Direct rules, or Proxy. App and service routing is temporarily blocked; saved rules are preserved.');
+        throw new Error('RULE_SELECTION_EMPTY: выберите хотя бы одно включённое приложение или службу через VPN. / Select at least one enabled VPN application or service.');
       }
       await flushPersistentWrites();
     }

@@ -764,7 +764,6 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         network_mode.as_deref(),
         tun_routing_mode.as_deref(),
         split_tunnel_entries.as_deref().unwrap_or_default(),
-        local_test_build() && app.config().identifier == LOCAL_TEST_ID,
     )
     .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
     let state = app.state::<AppState>();

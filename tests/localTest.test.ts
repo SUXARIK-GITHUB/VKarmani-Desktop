@@ -9,10 +9,10 @@ const entries = normalizeStoredRules([
   {id:'service',kind:'service',value:'DedicatedSvc',policy:'VPN',enabled:false,schemaVersion:2}
 ]);
 
-it.each(['all','selected','exclude'] as const)('only the explicitly marked owner test permits the old %s process graph, retaining all records', mode => {
+it.each(['all','selected','exclude'] as const)('production and owner test admit the same %s process graph, retaining all records', mode => {
   const before = structuredClone(entries);
   vi.stubEnv('VITE_VKARMANI_LOCAL_TEST', '');
-  expect(isTunProcessRoutingBlocked(entries, mode)).toBe(true);
+  expect(isTunProcessRoutingBlocked(entries, mode)).toBe(false);
   vi.stubEnv('VITE_VKARMANI_LOCAL_TEST', '1');
   expect(isTunProcessRoutingBlocked(entries, mode)).toBe(false);
   expect(tunProcessRoutingBlockMessage(entries, mode, 'ru')).toBe('');

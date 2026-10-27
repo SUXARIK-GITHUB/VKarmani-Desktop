@@ -25,7 +25,8 @@ it('persists selected→all→exclude→all and reloads settings/rules without d
     const restored = await (await import('../src/services/storage')).loadPersistentSnapshot();
     expect(restored.settings).toMatchObject({tunnelMode:'tun',tunRoutingMode:mode,themeGlow:false});
     expect(restored.entries).toEqual(entries);
-    expect(isTunProcessRoutingBlocked(restored.entries,mode)).toBe(mode==='selected');
+    expect(isTunProcessRoutingBlocked(restored.entries,mode)).toBe(false);
+    expect(isTunProcessRoutingBlocked(restored.entries.map(entry=>({...entry,enabled:false})),'selected')).toBe(true);
   }
 });
 

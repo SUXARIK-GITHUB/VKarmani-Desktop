@@ -150,6 +150,16 @@ pub fn run() {
         }
         return;
     }
+    if std::env::args().any(|value| value == "--verify-production-tun") {
+        match verify_production_tun_admission(context.config()) {
+            Ok(value) => println!("{value}"),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     let builder = tauri::Builder::default();
     // The owner-test executable shares one routing journal, even when started
     // directly instead of via the BAT's exclusive launcher lock.

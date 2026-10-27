@@ -19,7 +19,7 @@ it.each(policyMatrix)('actual native-client admission matches shared policy: $na
   const before = structuredClone(row.entries);
   const result = remnawaveClient.connect(server, { tunnelMode: 'tun', tunRoutingMode: row.mode as TunRoutingMode, splitTunnelEntries: row.entries as SplitTunnelEntry[] });
   if (row.blocked) {
-    await expect(result).rejects.toThrow('TUN_PROCESS_ENFORCEMENT_UNAVAILABLE');
+    await expect(result).rejects.toThrow('RULE_SELECTION_EMPTY');
     expect(native.flush).not.toHaveBeenCalled(); expect(native.connect).not.toHaveBeenCalled();
   } else {
     await result; expect(native.connect).toHaveBeenCalledOnce();
@@ -29,12 +29,12 @@ it.each(policyMatrix)('actual native-client admission matches shared policy: $na
   expect(native.proxy).not.toHaveBeenCalled(); expect(native.disconnect).not.toHaveBeenCalled();
 });
 describe('native connect cleanup is scoped to the exact returned runtime', () => {
-  it.each(['selected', 'all', 'exclude'] as const)('refuses unenforced application routing in %s before native work', async tunRoutingMode => {
+  it.each(['selected', 'all', 'exclude'] as const)('passes authorized application routing in %s to native without changing rules', async tunRoutingMode => {
     native.connect.mockResolvedValueOnce(status());
-    await expect(remnawaveClient.connect(server, { tunnelMode: 'tun', tunRoutingMode,
-      splitTunnelEntries: [{ id: 'private-rule', kind: 'app', value: 'C:/Private/app.exe', enabled: true, policy: tunRoutingMode === 'selected' ? 'VPN' : 'DIRECT' }] }))
-      .rejects.toThrow('TUN_PROCESS_ENFORCEMENT_UNAVAILABLE');
-    expect(native.connect).not.toHaveBeenCalled(); expect(native.proxy).not.toHaveBeenCalled();
+    const entries: SplitTunnelEntry[] = [{ id: 'fixture-rule', kind: 'app', value: 'C:/Fixture/app.exe', enabled: true, policy: tunRoutingMode === 'selected' ? 'VPN' : 'DIRECT' }];
+    await remnawaveClient.connect(server, { tunnelMode: 'tun', tunRoutingMode, splitTunnelEntries: entries });
+    expect(native.connect).toHaveBeenCalledWith(server,'tun',entries,'ipv4',false,undefined,tunRoutingMode);
+    expect(native.proxy).not.toHaveBeenCalled();
     expect(native.rollback).not.toHaveBeenCalled(); expect(native.disconnect).not.toHaveBeenCalled();
   });
   it.each(['all', 'exclude'] as const)('keeps ordinary %s TUN available with inactive VPN rules and disabled DIRECT intent', async tunRoutingMode => {
