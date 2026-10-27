@@ -31,7 +31,7 @@ export const defaultSettings: AppSettings = {
   autoInstallUpdates: false,
   themeGlow: true,
   sortServersByPing: false,
-  tunRoutingMode: 'all',
+  tunRoutingMode: 'selected',
   releaseChannel: 'stable',
   protocolStrategy: 'auto',
   profileSyncOnLogin: true,
@@ -46,7 +46,7 @@ export const defaultSettings: AppSettings = {
 
 export function normalizeStoredSettings(value: unknown, hasLegacyRules = false): AppSettings {
   if (!value || typeof value !== 'object') {
-    return { ...defaultSettings, tunRoutingMode: hasLegacyRules ? 'selected' : 'all' };
+    return { ...defaultSettings, tunRoutingMode: hasLegacyRules ? 'selected' : defaultSettings.tunRoutingMode };
   }
 
   const candidate = value as Partial<AppSettings>;
@@ -68,7 +68,7 @@ export function normalizeStoredSettings(value: unknown, hasLegacyRules = false):
     'probeOnConnect'
   ];
 
-  const next: AppSettings = { ...defaultSettings, tunRoutingMode: hasLegacyRules ? 'selected' : 'all' };
+  const next: AppSettings = { ...defaultSettings, tunRoutingMode: hasLegacyRules ? 'selected' : defaultSettings.tunRoutingMode };
   if (candidate.tunRoutingMode === 'all' || candidate.tunRoutingMode === 'selected' || candidate.tunRoutingMode === 'exclude') next.tunRoutingMode = candidate.tunRoutingMode;
 
   for (const key of booleanKeys) {

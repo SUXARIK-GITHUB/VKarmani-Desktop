@@ -196,7 +196,7 @@ describe('persistent preference and legacy TUN mode',()=>{
   try{for(const sortServersByPing of [false,true,false]){saveSettings({...normalizeStoredSettings({}),sortServersByPing});expect(loadSettings().sortServersByPing).toBe(sortServersByPing);}}finally{vi.unstubAllGlobals();}
  });
  it('fresh empty TUN selects all; legacy existing rules retain selected scope; explicit modes survive',()=>{
-  expect(normalizeStoredSettings({tunnelMode:'tun'}).tunRoutingMode).toBe('all');expect(normalizeStoredSettings({tunnelMode:'tun'},true).tunRoutingMode).toBe('selected');for(const tunRoutingMode of ['all','selected','exclude'] as const)expect(normalizeStoredSettings({tunRoutingMode},true).tunRoutingMode).toBe(tunRoutingMode);
+  expect(normalizeStoredSettings({tunnelMode:'tun'}).tunRoutingMode).toBe('selected');expect(normalizeStoredSettings({tunnelMode:'tun'},true).tunRoutingMode).toBe('selected');for(const tunRoutingMode of ['all','selected','exclude'] as const)expect(normalizeStoredSettings({tunRoutingMode},true).tunRoutingMode).toBe(tunRoutingMode);
  });
 });
 

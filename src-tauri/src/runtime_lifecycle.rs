@@ -128,8 +128,16 @@ pub(crate) fn spawn_xray_runtime_child(
         .env("XRAY_LOCATION_CONFIG", config_dir)
         .arg("run")
         .arg("-config")
-        .arg(config_path)
-        .stdin(Stdio::null())
+        .arg(if integrity.stdin_config.is_some() {
+            Path::new("stdin:")
+        } else {
+            config_path
+        })
+        .stdin(if integrity.stdin_config.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     hide_child_console(&mut command);
@@ -139,9 +147,15 @@ pub(crate) fn spawn_xray_runtime_child(
         .map_err(|error| format_xray_spawn_error(&error, core_path))?;
     let stdout = child.stdout.take().ok_or("STDOUT_PIPE_MISSING")?;
     let stderr = child.stderr.take().ok_or("STDERR_PIPE_MISSING")?;
-    let owned = OwnedXrayProcess::attach(child)?.with_integrity(integrity);
+    let input = integrity.stdin_config.clone();
+    let mut owned = OwnedXrayProcess::attach(child)?.with_integrity(integrity);
     drain_runtime_log(stdout, log_path.to_path_buf());
     drain_runtime_log(stderr, log_path.to_path_buf());
+    if let Some(result) = write_owned_stdin(&mut owned, input)? {
+        result
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "CONFIG_STDIN_DEADLINE")??;
+    }
     Ok(owned)
 }
 

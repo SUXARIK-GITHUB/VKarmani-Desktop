@@ -30,33 +30,61 @@ it.each(['ru', 'en'] as const)('has an in-modal mode choice and no blanket warni
   expect(html).toContain('Discord.exe'); expect(html).toContain('brave.exe');
 });
 
-it('places a concise limitation with an All applications action beside the selected mode', () => {
+it.each((['ru', 'en'] as const).flatMap(language => (['all', 'selected', 'exclude'] as const).map(mode => ({ language, mode }))))('omits redundant executable help while retaining saved identities and controls ($language/$mode)', ({ language, mode }) => {
+  const entries: SplitTunnelEntry[] = [
+    { id: 'exact', kind: 'app', value: 'C:/Exact Folder/Discord.exe', enabled: true, policy: 'VPN', schemaVersion: 2 },
+    { id: 'by-name', kind: 'app', value: 'brave.exe', enabled: false, policy: 'DIRECT', schemaVersion: 2 },
+    { id: 'service', kind: 'service', value: 'DedicatedSvc', enabled: false, policy: 'VPN', schemaVersion: 2 }
+  ];
+  const before = structuredClone(entries);
+  const html = renderToStaticMarkup(modal(mode, entries, language));
+  expect(html).not.toContain('Полный путь выбирает один файл');
+  expect(html).not.toContain('A full path targets one file');
+  expect(html).toContain('C:/Exact Folder/Discord.exe');
+  expect(html).toContain('brave.exe');
+  expect(html).toContain('DedicatedSvc');
+  const routingChoices = html.match(/role="radiogroup" aria-label="(?:Маршрутизация приложений|App routing)">([\s\S]*?)<\/div>/)?.[1];
+  expect(routingChoices?.match(/role="radio"/g)).toHaveLength(3);
+  expect(html.match(/class="split-entry /g)).toHaveLength(3);
+  expect(html).toContain(language === 'ru' ? 'Поиск правил, программ и служб' : 'Search rules, applications and services');
+  expect(html).toContain(language === 'ru' ? 'Выбрать .exe' : 'Choose .exe');
+  expect(html).toContain(language === 'ru' ? 'Добавить службу' : 'Add service');
+  expect(entries).toEqual(before);
+  expect(isTunProcessRoutingBlocked(entries, mode)).toBe(false);
+});
+
+it('keeps the selected choice without the obsolete warning or forced-All action', () => {
   const html = renderToStaticMarkup(modal('selected'));
-  expect(html).toContain('Selected-app routing is unavailable');
-  expect(html).toContain('Switch to All applications');
+  expect(html).not.toContain('Selected-app routing is unavailable');
+  expect(html).not.toContain('Switch to All applications');
+  expect(html).toContain('aria-checked="true" tabindex="0" class="active">Selected through VPN');
+  expect(isTunProcessRoutingBlocked(rules, 'selected')).toBe(false);
   expect(html).not.toContain('Add at least one');
 });
 
-it('keeps active DIRECT intent visible in both settings and modal; never presents all as sufficient', () => {
+it('preserves DIRECT intent and ordinary-build admission without obsolete modal/settings banners', () => {
   const direct = normalizeStoredRules(matrix[2].entries);
   for (const html of [renderToStaticMarkup(modal('all', direct)), renderToStaticMarkup(<SettingsTab settings={{...defaultSettings,tunnelMode:'tun'}} splitTunnelEntries={direct} language="en" onToggleSetting={noop} onTunnelModeChange={noop} onIpStackChange={noop} onTunRoutingModeChange={noop} onLanguageChange={noop} onRoutingExclusionsChange={noop} />)]) {
-    expect(html).toContain('Disable active DIRECT rules');
+    expect(html).not.toContain('Disable active DIRECT rules');
   }
   expect(direct[0]).toMatchObject({enabled:true,policy:'DIRECT'});
+  expect(isTunProcessRoutingBlocked(direct, 'all')).toBe(false);
 });
 
-it('renders the disabled reason as visible text and an actionable TUN control, not just a title', () => {
-  const reason = 'Selected-app routing is unavailable';
+it('removes the extra CTA banner/action while retaining the actual disabled reason on the control', () => {
+  const reason = 'Select at least one enabled VPN application or service.';
   const html = renderToStaticMarkup(<OverviewTab connectionState="idle" connectLabel="Connect" selectedServer={null} selectedServerId="" servers={[]} allServerCount={0} searchValue="" sessionDurationText="00:00:00" language="en" showDiagnostics={false} tunnelMode="tun" onToggleConnection={noop} onTunnelModeChange={noop} onSelectServer={noop} onSearchChange={noop} onRefreshServers={noop} onRefreshPing={noop} onToggleFavoriteServer={noop} favoriteServerIds={[]} trafficReceivedText="0" trafficSentText="0" trafficChartBars={[]} vpnExternalIp="" packetLossText="" canConnect={false} connectDisabledReason={reason} activeSplitTunnelCount={3} onOpenSplitTunnel={noop}/>);
-  expect(html).toContain('>' + reason + '<');
-  expect(html).toContain('Configure TUN');
+  expect(html).toContain('title="' + reason + '"');
+  expect(html).not.toContain('vk-connect-disabled-reason');
+  expect(html).not.toContain('Configure TUN');
 });
 
-it.each(['selected','all','exclude'] as const)('blocked connected Proxy→TUN (%s) preserves the prior connection and preferences before admission', async mode => {
+it.each(['empty','direct-only','disabled-vpn'] as const)('invalid selected Proxy→TUN (%s) preserves the prior connection and preferences before admission', async selection => {
+  const mode = 'selected' as const;
   const source = ts.createSourceFile('App.tsx', readFileSync(new URL('../src/App.tsx', import.meta.url),'utf8'), ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
   let handler: ts.FunctionDeclaration | undefined;
   const visit=(node:ts.Node)=>{if(ts.isFunctionDeclaration(node)&&node.name?.text==='handleTunnelModeChange')handler=node;ts.forEachChild(node,visit);};visit(source);
-  const entries: SplitTunnelEntry[] = mode === 'selected' ? rules : normalizeStoredRules(matrix[2].entries);
+  const entries: SplitTunnelEntry[] = selection === 'empty' ? [] : selection === 'direct-only' ? normalizeStoredRules(matrix[2].entries) : rules.map(entry=>({...entry,enabled:false}));
   const mutate=vi.fn(()=>{throw new Error('blocked policy changed a working preference');});
   const bindings={settingsRef:{current:{...defaultSettings,tunnelMode:'proxy',tunRoutingMode:mode}},connectionStateRef:{current:'connected'},splitTunnelEntriesRef:{current:entries},pendingTunnelModeRef:{current:null},pushToast:vi.fn(),tr:(_:string,ru:string)=>ru,language:'ru',isTunProcessRoutingBlocked,isSelectedTunPolicyEmpty:()=>false,isConnectionActionBusy:()=>false,connectionActionLock:{current:false},getConnectedRuntimeServer:()=>null,getServerById:()=>null,selectedServerIdRef:{current:''},selectedServer:null,writeNativeInterfaceLog:noop,updateTunnelModePreference:mutate,refreshDiagnosticsAndRuntime:vi.fn(),scheduleConnectionQueueFlush:noop,flushQueuedConnectionWork:noop,normalizeNativeError:()=>({message:'synthetic'}),writeNativeRoutingLog:noop};
   Object.assign(bindings, { tunProcessRoutingBlockMessage });

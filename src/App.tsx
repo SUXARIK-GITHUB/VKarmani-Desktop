@@ -76,6 +76,7 @@ import {
 } from './services/storage';
 import { storageFailure } from './services/nativeState';
 import { checkForUpdates, installAvailableUpdate } from './services/updater';
+import { isLocalTestBuild } from './services/localTest';
 import type { PendingServerSwitch } from './types/appState';
 import type {
   AppSettings,
@@ -397,7 +398,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
           const normalizedStoredKey = storedKey.trim();
           setAccessKey(normalizedStoredKey);
 
-          if (!recoveryMode && settingsRef.current.autoConnectFavorite && !hasTriedFavoriteAutoConnect.current) {
+          if (!isLocalTestBuild() && !recoveryMode && settingsRef.current.autoConnectFavorite && !hasTriedFavoriteAutoConnect.current) {
             hasTriedFavoriteAutoConnect.current = true;
             void authorizeWithAccessKey(normalizedStoredKey, true);
           }
@@ -469,7 +470,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
   }, [activeTab]);
 
   useEffect(() => {
-    if (recoveryMode || !persistentStateReady || !settings.runAsAdmin || hasTriedAdminLaunch.current) {
+    if (isLocalTestBuild() || recoveryMode || !persistentStateReady || !settings.runAsAdmin || hasTriedAdminLaunch.current) {
       return;
     }
 
@@ -478,7 +479,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
   }, [settings.runAsAdmin, persistentStateReady, recoveryMode]);
 
   useEffect(() => {
-    if (recoveryMode || !isTauriRuntime || !persistentStateReady) {
+    if (isLocalTestBuild() || recoveryMode || !isTauriRuntime || !persistentStateReady) {
       return;
     }
 
@@ -2113,7 +2114,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         }));
       }
 
-      if (!recoveryModeRef.current && connectFavoriteAfterLaunch) {
+      if (!isLocalTestBuild() && !recoveryModeRef.current && connectFavoriteAfterLaunch) {
         const favoriteServer = favoriteServerIdsRef.current
           .map((id) => serverPool.find((server: VpnServer) => server.id === id && server.runtimeTemplate) ?? serverPool.find((server: VpnServer) => server.id === id))
           .find((server): server is VpnServer => Boolean(server));
@@ -2128,7 +2129,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
         }
       }
 
-      if (!recoveryModeRef.current && (currentSettings.autoConnect || connectFavoriteAfterLaunch) && preferredServerForAutoConnect) {
+      if (!isLocalTestBuild() && !recoveryModeRef.current && (currentSettings.autoConnect || connectFavoriteAfterLaunch) && preferredServerForAutoConnect) {
         void handleConnectionToggle(preferredServerForAutoConnect);
       }
     } catch (error) {
@@ -2760,7 +2761,7 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
 
 
   useEffect(() => {
-    if (recoveryMode || !persistentStateReady || !settings.autoUpdate || hasAutoCheckedUpdates.current) {
+    if (isLocalTestBuild() || recoveryMode || !persistentStateReady || !settings.autoUpdate || hasAutoCheckedUpdates.current) {
       return;
     }
 

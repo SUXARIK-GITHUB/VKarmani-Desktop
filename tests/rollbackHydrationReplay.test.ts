@@ -19,9 +19,9 @@ it.each(['ensureAdminLaunch', 'setNativeLaunchOnStartup'])('defers %s until nati
   const call = vi.fn().mockResolvedValue(undefined);
   const attempted = { current: false };
   const js = ts.transpileModule('const effect=' + effect!.arguments[0].getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
-  const run = (ready: boolean, recoveryMode = false) => new Function('bindings', 'const {persistentStateReady,recoveryMode,settings,hasTriedAdminLaunch,isTauriRuntime,ensureAdminLaunch,setNativeLaunchOnStartup}=bindings;' + js + ';effect();')({
+  const run = (ready: boolean, recoveryMode = false, local = false) => new Function('bindings', 'const {isLocalTestBuild,persistentStateReady,recoveryMode,settings,hasTriedAdminLaunch,isTauriRuntime,ensureAdminLaunch,setNativeLaunchOnStartup}=bindings;' + js + ';effect();')({
     persistentStateReady: ready, recoveryMode, settings: { runAsAdmin: true, launchOnStartup: false }, hasTriedAdminLaunch: attempted,
-    isTauriRuntime: true, ensureAdminLaunch: call, setNativeLaunchOnStartup: call
+    isLocalTestBuild: () => local, isTauriRuntime: true, ensureAdminLaunch: call, setNativeLaunchOnStartup: call
   });
   run(false);
   expect(call).not.toHaveBeenCalled();
@@ -30,6 +30,8 @@ it.each(['ensureAdminLaunch', 'setNativeLaunchOnStartup'])('defers %s until nati
   run(true, true);
   expect(call).not.toHaveBeenCalled(); expect(attempted.current).toBe(false);
   expect(effect!.arguments[1].getText(source)).toContain('recoveryMode');
+  run(true, false, true);
+  expect(call).not.toHaveBeenCalled(); expect(attempted.current).toBe(false);
   run(true);
   expect(call).toHaveBeenCalledExactlyOnceWith(command === 'ensureAdminLaunch');
 });

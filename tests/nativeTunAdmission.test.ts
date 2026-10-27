@@ -1,14 +1,32 @@
 import { readFileSync } from 'node:fs';
 import { expect, it } from 'vitest';
 
+it('local owner-test startup keeps native single-instance protection before storage and network setup', () => {
+  const run=readFileSync(new URL('../src-tauri/src/app_run.rs',import.meta.url),'utf8');
+  const policy=run.indexOf('if cfg!(not(debug_assertions)) || local_test_build()');
+  const plugin=run.indexOf('tauri_plugin_single_instance::init(');
+  expect(policy).toBeGreaterThan(run.indexOf('validate_local_test_config(context.config())'));
+  expect(plugin).toBeGreaterThan(policy);
+  expect(plugin).toBeLessThan(run.indexOf('.setup(|app|'));
+});
+
 it('native TUN process admission precedes authorization, operation admission and prior-runtime teardown', () => {
   const commands = readFileSync(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
   const connect = commands.slice(commands.indexOf('fn request_connect_blocking('));
-  const gate = connect.indexOf('ensure_tun_process_enforcement(');
+  const gate = connect.indexOf('ensure_tun_process_admission(');
   expect(gate).toBeGreaterThan(0);
+  expect(connect.slice(gate, connect.indexOf('let state = app.state'))).not.toContain('local_test_build');
   for (const boundary of ['ensure_native_session_authorized(', 'acquire_operation_lock(', 'resolve_core_path(', 'stop_managed_or_starting_runtime(']) {
     expect(connect.indexOf(boundary), boundary).toBeGreaterThan(gate);
   }
+});
+
+it('release-binary policy probe returns before Builder, storage and WebView startup', () => {
+  const run=readFileSync(new URL('../src-tauri/src/app_run.rs',import.meta.url),'utf8');
+  const probe=run.indexOf('value == "--verify-production-tun"');
+  expect(probe).toBeGreaterThan(run.indexOf('validate_local_test_config(context.config())'));
+  expect(probe).toBeLessThan(run.indexOf('let builder = tauri::Builder::default()'));
+  expect(run.slice(probe,run.indexOf('let builder = tauri::Builder::default()'))).toContain('return;');
 });
 
 it('validates a TUN-free projection before stopping, with full TUN construction only after owned stop', () => {

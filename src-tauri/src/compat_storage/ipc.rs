@@ -2,7 +2,7 @@ use super::durable::{DurableSnapshot, DurableStore, StateCommit, StatePatch};
 use super::*;
 
 pub(crate) fn app_durable_store(app: &AppHandle) -> Result<DurableStore, StateStorageError> {
-    let root = app.path().app_local_data_dir().map_err(|_| {
+    let root = application_data_root(app).map_err(|_| {
         StateStorageError::new(
             "STATE_PATH_UNAVAILABLE",
             "Не удалось определить каталог состояния.",

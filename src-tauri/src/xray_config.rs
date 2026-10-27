@@ -606,6 +606,88 @@ pub(crate) fn build_xray_config(
     )
 }
 
+// Xray v26.4.25 has one Int32Range per fragment setting. A constant
+// sequence repeats the same range forever, so this conversion is lossless.
+// Never flatten a per-fragment sequence or change the canonical provider graph.
+fn adapt_fragment_masks_for_pinned_core(config: &mut Value) -> Result<(), String> {
+    fn range_bounds(value: &Value, minimum: i32) -> Option<(i32, i32)> {
+        let bounds = if let Some(n) = value.as_i64().and_then(|n| i32::try_from(n).ok()) {
+            Some((n, n))
+        } else if let Some(s) = value.as_str() {
+            s.parse::<i32>().ok().map(|n| (n, n)).or_else(|| {
+                let (a, b) = s.split_once('-')?;
+                Some((a.parse::<i32>().ok()?, b.parse::<i32>().ok()?))
+            })
+        } else {
+            None
+        };
+        bounds
+            .filter(|(a, b)| *a >= minimum && *b >= minimum)
+            .map(|(a, b)| (a.min(b), a.max(b)))
+    }
+    let Some(outbounds) = config.get_mut("outbounds").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for (index, outbound) in outbounds.iter_mut().enumerate() {
+        let Some(masks) = outbound
+            .pointer_mut("/streamSettings/finalmask/tcp")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for (mask_index, mask) in masks.iter_mut().enumerate() {
+            if mask.get("type").and_then(Value::as_str) != Some("fragment") {
+                continue;
+            }
+            let path =
+                format!("outbounds[{index}].streamSettings.finalmask.tcp[{mask_index}].settings");
+            let error = |field: &str, reason: &str| {
+                format!("XRAY_COMPAT: {path}.{field}: {reason} (Xray 26.4.25)")
+            };
+            let settings = mask
+                .get_mut("settings")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| error("length", "fragment settings required"))?;
+            for (plural, singular, minimum) in [("lengths", "length", 1), ("delays", "delay", 0)] {
+                if let Some(value) = settings.get(plural) {
+                    if settings
+                        .keys()
+                        .any(|key| xray_json_field_matches(key, singular))
+                    {
+                        return Err(error(plural, "conflicts with singular field"));
+                    }
+                    let values = value
+                        .as_array()
+                        .ok_or_else(|| error(plural, "expected an array"))?;
+                    let first = values.first().and_then(|v| range_bounds(v, minimum));
+                    if first.is_none() || values.iter().any(|v| range_bounds(v, minimum).is_none())
+                    {
+                        return Err(error(plural, "invalid integer/range bounds"));
+                    }
+                    if values.iter().any(|v| range_bounds(v, minimum) != first) {
+                        return Err(error(plural,"per-fragment sequence requires a newer core; automatic reduction refused"));
+                    }
+                    let range = values[0].clone();
+                    settings.remove(plural);
+                    settings.insert(singular.into(), range);
+                }
+                if let Some(value) = settings.get(singular) {
+                    if range_bounds(value, minimum).is_none() {
+                        return Err(error(singular, "invalid integer/range bounds"));
+                    }
+                } else if singular == "length"
+                    && !settings
+                        .keys()
+                        .any(|key| xray_json_field_matches(key, singular))
+                {
+                    return Err(error(singular, "positive fragment length required"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn build_xray_config_with_plan(
     template: &RuntimeTemplate,
     network_mode: &str,
@@ -820,7 +902,7 @@ pub(crate) fn build_xray_config_with_plan(
             "settings": {}
         });
 
-        if let Some(full_runtime_config) = build_from_full_xray_config_template(
+        if let Some(mut full_runtime_config) = build_from_full_xray_config_template(
             template,
             full_config,
             inbounds.clone(),
@@ -834,55 +916,54 @@ pub(crate) fn build_xray_config_with_plan(
                 send_through_ip,
             },
         ) {
+            adapt_fragment_masks_for_pinned_core(&mut full_runtime_config)?;
             return Ok((full_runtime_config, plan, routing_exclusion_plan));
         }
         return Err("Не удалось применить client adapter к полному Xray config; неполный fallback запрещён.".into());
     }
 
-    Ok((
-        json!({
-            "log": log_object,
-            "dns": {
-                "queryStrategy": dns_query_strategy,
-                "servers": ["1.1.1.1", "8.8.8.8", "localhost"]
-            },
-            "api": {
-                "tag": "api",
-                "services": ["StatsService"]
-            },
-            "policy": {
-                "levels": {
-                    "0": {
-                        "statsUserUplink": true,
-                        "statsUserDownlink": true
-                    }
-                },
-                "system": {
-                    "statsInboundUplink": true,
-                    "statsInboundDownlink": true,
-                    "statsOutboundUplink": true,
-                    "statsOutboundDownlink": true
+    let mut config = json!({
+        "log": log_object,
+        "dns": {
+            "queryStrategy": dns_query_strategy,
+            "servers": ["1.1.1.1", "8.8.8.8", "localhost"]
+        },
+        "api": {
+            "tag": "api",
+            "services": ["StatsService"]
+        },
+        "policy": {
+            "levels": {
+                "0": {
+                    "statsUserUplink": true,
+                    "statsUserDownlink": true
                 }
             },
-            "stats": {},
-            "inbounds": inbounds,
-            "routing": {
-                "domainStrategy": domain_strategy,
-                "rules": routing_rules
-            },
-            "outbounds": [
-                outbound,
-                direct_outbound,
-                {
-                    "tag": "block",
-                    "protocol": "blackhole",
-                    "settings": {}
-                }
-            ]
-        }),
-        plan,
-        routing_exclusion_plan,
-    ))
+            "system": {
+                "statsInboundUplink": true,
+                "statsInboundDownlink": true,
+                "statsOutboundUplink": true,
+                "statsOutboundDownlink": true
+            }
+        },
+        "stats": {},
+        "inbounds": inbounds,
+        "routing": {
+            "domainStrategy": domain_strategy,
+            "rules": routing_rules
+        },
+        "outbounds": [
+            outbound,
+            direct_outbound,
+            {
+                "tag": "block",
+                "protocol": "blackhole",
+                "settings": {}
+            }
+        ]
+    });
+    adapt_fragment_masks_for_pinned_core(&mut config)?;
+    Ok((config, plan, routing_exclusion_plan))
 }
 
 pub(crate) fn value_as_valid_port(value: &Value) -> Option<u16> {
@@ -1208,5 +1289,213 @@ mod tun_policy_tests {
         assert!(bind_tun_outbounds(&mut config, "Wi-Fi")
             .unwrap_err()
             .starts_with("TUN_BINDING_CONFLICT"));
+    }
+}
+
+#[cfg(test)]
+mod fragment_compat_tests {
+    use super::*;
+    fn template(config: Value) -> RuntimeTemplate {
+        RuntimeTemplate {
+            family: "xray".into(),
+            protocol: "vless".into(),
+            outbound: config["outbounds"][0].clone(),
+            full_config: Some(config),
+            remarks: None,
+            primary_outbound_tag: Some("pool-raw".into()),
+            profile_kind: Some("auto".into()),
+        }
+    }
+    fn fixture() -> Value {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/xray/fragment-compat.json"
+        ))
+        .unwrap()
+    }
+    #[test]
+    fn singleton_fragment_arrays_adapt_only_runtime_in_proxy_and_tun() {
+        let original = fixture();
+        for mode in ["proxy", "tun"] {
+            let input = template(original.clone());
+            let (runtime, _, _) =
+                build_xray_config(&input, mode, "ipv4", None, &[], None, None).unwrap();
+            let mut expected = original["outbounds"][0].clone();
+            expected["streamSettings"]["finalmask"]["tcp"][0]["settings"] =
+                json!({"length":"50-100","delay":"1-3","packets":"tlshello","maxSplit":"3"});
+            assert_eq!(runtime["outbounds"][0], expected);
+            for i in 1..4 {
+                assert_eq!(runtime["outbounds"][i], original["outbounds"][i]);
+            }
+            assert_eq!(
+                runtime["routing"]["balancers"],
+                original["routing"]["balancers"]
+            );
+            assert_eq!(runtime["futureExtension"], original["futureExtension"]);
+            assert_eq!(input.full_config.as_ref().unwrap(), &original);
+        }
+    }
+    #[test]
+    fn nonrepresentable_or_invalid_fragment_fields_fail_without_values_or_mask_removal() {
+        for (field, value) in [
+            ("lengths", json!(["3-5", "10-20"])),
+            ("delays", json!(["1-3", "4-6"])),
+            ("lengths", json!([])),
+            ("lengths", json!(null)),
+            ("lengths", json!(["0-10"])),
+            ("lengths", json!([false])),
+            ("delays", json!(["private-provider-value"])),
+        ] {
+            let mut original = fixture();
+            original["outbounds"][0]["streamSettings"]["finalmask"]["tcp"][0]["settings"][field] =
+                value;
+            let input = template(original.clone());
+            let error = build_xray_config(&input, "proxy", "ipv4", None, &[], None, None)
+                .err()
+                .expect("unsupported fragment must fail");
+            assert!(error.contains(&format!("settings.{field}")), "{error}");
+            assert!(!error.contains("private-provider-value"));
+            assert_eq!(input.full_config.as_ref().unwrap(), &original);
+        }
+    }
+    #[test]
+    fn constant_sequences_legacy_ranges_and_conflicts_have_explicit_semantics() {
+        for settings in [
+            json!({"length":64,"delay":0,"packets":"tlshello","maxSplit":"3","extension":{"keep":true}}),
+            json!({"lengths":["100-50","50-100"],"delays":[0,"0"],"packets":"tlshello","maxSplit":"3","extension":{"keep":true}}),
+        ] {
+            let mut source = fixture();
+            source["outbounds"][0]["streamSettings"]["finalmask"]["tcp"][0]["settings"] =
+                settings.clone();
+            let input = template(source.clone());
+            let (runtime, _, _) =
+                build_xray_config(&input, "proxy", "ipv4", None, &[], None, None).unwrap();
+            let actual =
+                &runtime["outbounds"][0]["streamSettings"]["finalmask"]["tcp"][0]["settings"];
+            assert_eq!(actual["maxSplit"], settings["maxSplit"]);
+            assert_eq!(actual["extension"], settings["extension"]);
+            assert_eq!(actual["delay"], json!(0));
+            assert!(actual.get("lengths").is_none());
+            assert_eq!(input.full_config.as_ref().unwrap(), &source);
+        }
+        for (plural, singular) in [("lengths", "length"), ("delays", "Delay")] {
+            let mut source = fixture();
+            source["outbounds"][0]["streamSettings"]["finalmask"]["tcp"][0]["settings"][singular] =
+                json!(10);
+            let error =
+                build_xray_config(&template(source), "proxy", "ipv4", None, &[], None, None)
+                    .err()
+                    .unwrap();
+            assert!(error.contains(&format!("settings.{plural}: conflicts")));
+        }
+    }
+    #[test]
+    fn independent_node_selection_keeps_transport_chain_and_exact_default_target() {
+        let mut source = fixture();
+        source["routing"] = json!({"rules":[]});
+        source["outbounds"][1]["streamSettings"]["sockopt"] = json!({"dialerProxy":"pool-raw"});
+        for selected in 0..3 {
+            for mode in ["proxy", "tun"] {
+                let mut input = template(source.clone());
+                input.profile_kind = Some("node".into());
+                input.primary_outbound_tag = source["outbounds"][selected]["tag"]
+                    .as_str()
+                    .map(String::from);
+                input.outbound = source["outbounds"][selected].clone();
+                let (runtime, _, _) =
+                    build_xray_config(&input, mode, "ipv4", None, &[], None, None).unwrap();
+                let rules = runtime["routing"]["rules"].as_array().unwrap();
+                let fallback = rules
+                    .iter()
+                    .find(|r| {
+                        r["ruleTag"]
+                            .as_str()
+                            .is_some_and(|s| s.ends_with("provider-default"))
+                    })
+                    .unwrap();
+                assert_eq!(
+                    fallback["outboundTag"],
+                    source["outbounds"][selected]["tag"]
+                );
+                assert_eq!(runtime["outbounds"][1], source["outbounds"][1]);
+                assert_eq!(input.full_config.as_ref().unwrap(), &source);
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    fn core_test(runtime: &Value) -> Result<(), String> {
+        let core =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../resources/core/windows/xray.exe");
+        validate_core_sidecar_path(&core, "xray.exe")?;
+        let projection = config_preflight_projection(runtime)?;
+        assert!(projection["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v["protocol"] != "tun"));
+        let mut command = Command::new(&core);
+        command
+            .current_dir(core.parent().unwrap())
+            .env_remove("XRAY_LOCATION_CONFDIR")
+            .args(["run", "-test", "-config", "stdin:"])
+            .stdin(Stdio::piped());
+        run_command_with_timeout_and_input(
+            command,
+            Duration::from_secs(8),
+            "synthetic config only",
+            Some(serde_json::to_vec(&projection).unwrap()),
+        )
+        .map(|_| ())
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn pinned_core_accepts_fragment_runtime_without_starting_tun_or_network() {
+        let _fixture = HELPER_TEST_LOCK.lock().unwrap();
+        for chained in [false, true] {
+            let mut source = fixture();
+            if chained {
+                source["outbounds"][1]["streamSettings"]["sockopt"] =
+                    json!({"dialerProxy":"pool-raw"});
+            }
+            for mode in ["proxy", "tun"] {
+                let (runtime, _, _) = build_xray_config(
+                    &template(source.clone()),
+                    mode,
+                    "ipv4",
+                    None,
+                    &[],
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(core_test(&runtime), Ok(()));
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "Owner-authorized encrypted profile only; never upload input or connect"]
+    fn owner_encrypted_profile_runtime_compatibility() {
+        let _fixture = HELPER_TEST_LOCK.lock().unwrap();
+        let path =
+            std::env::var_os("VKARMANI_TEST_PROFILE_DPAPI").expect("Encrypted input path required");
+        let cipher = fs::read_to_string(path).expect("Encrypted input unavailable");
+        let plain = decrypt_access_key(&cipher).expect("Same-user encrypted input required");
+        let templates: Vec<RuntimeTemplate> = serde_json::from_str(&plain)
+            .map_err(|_| "INVALID_TEMPLATE_INPUT")
+            .unwrap();
+        let mut passed = 0;
+        for (index, input) in templates.iter().enumerate() {
+            for mode in ["proxy", "tun"] {
+                let (runtime, _, _) = build_xray_config(input, mode, "ipv4", None, &[], None, None)
+                    .map_err(|_| "RUNTIME_ADAPTER_REJECTED")
+                    .unwrap();
+                assert!(
+                    core_test(&runtime).is_ok(),
+                    "profile index {index}, mode {mode}: configuration rejected"
+                );
+                passed += 1;
+            }
+        }
+        println!("Private profile config-only checks passed: {passed}; actual connections NOT_RUN");
     }
 }

@@ -1,12 +1,15 @@
 [
   {"name":"all empty","mode":"all","entries":[],"blocked":false},
   {"name":"all saved VPN apps","mode":"all","entries":[{"id":"discord","kind":"app","value":"Discord.exe","enabled":true,"policy":"VPN","schemaVersion":2},{"id":"brave","kind":"app","value":"brave.exe","enabled":true,"policy":"VPN","schemaVersion":2},{"id":"third","kind":"app","value":"third.exe","enabled":true,"policy":"VPN","schemaVersion":2}],"blocked":false},
-  {"name":"all active DIRECT","mode":"all","entries":[{"id":"brave","kind":"app","value":"brave.exe","enabled":true,"policy":"DIRECT","schemaVersion":2}],"blocked":true},
+  {"name":"all active DIRECT","mode":"all","entries":[{"id":"brave","kind":"app","value":"brave.exe","enabled":true,"policy":"DIRECT","schemaVersion":2}],"blocked":false},
   {"name":"all disabled DIRECT","mode":"all","entries":[{"id":"brave","kind":"app","value":"brave.exe","enabled":false,"policy":"DIRECT","schemaVersion":2}],"blocked":false},
-  {"name":"selected VPN","mode":"selected","entries":[{"id":"discord","kind":"app","value":"Discord.exe","enabled":true,"policy":"VPN","schemaVersion":2}],"blocked":true},
+  {"name":"selected VPN","mode":"selected","entries":[{"id":"discord","kind":"app","value":"Discord.exe","enabled":true,"policy":"VPN","schemaVersion":2}],"blocked":false},
   {"name":"selected empty","mode":"selected","entries":[],"blocked":true},
-  {"name":"exclude DIRECT","mode":"exclude","entries":[{"id":"brave","kind":"app","value":"brave.exe","enabled":true,"policy":"DIRECT","schemaVersion":2}],"blocked":true},
+  {"name":"exclude DIRECT","mode":"exclude","entries":[{"id":"brave","kind":"app","value":"brave.exe","enabled":true,"policy":"DIRECT","schemaVersion":2}],"blocked":false},
   {"name":"exclude VPN only","mode":"exclude","entries":[{"id":"discord","kind":"app","value":"Discord.exe","enabled":true,"policy":"VPN","schemaVersion":2}],"blocked":false},
-  {"name":"all DIRECT service","mode":"all","entries":[{"id":"service","kind":"service","value":"DedicatedSvc","enabled":true,"policy":"DIRECT","schemaVersion":2}],"blocked":true},
-  {"name":"all legacy VPN","mode":"all","entries":[{"id":"legacy","kind":"app","value":"Discord.exe","enabled":true}],"blocked":false}
+  {"name":"all DIRECT service","mode":"all","entries":[{"id":"service","kind":"service","value":"DedicatedSvc","enabled":true,"policy":"DIRECT","schemaVersion":2}],"blocked":false},
+  {"name":"all legacy VPN","mode":"all","entries":[{"id":"legacy","kind":"app","value":"Discord.exe","enabled":true}],"blocked":false},
+  {"name":"selected DIRECT only","mode":"selected","entries":[{"id":"direct","kind":"app","value":"brave.exe","enabled":true,"policy":"DIRECT","schemaVersion":2}],"blocked":true},
+  {"name":"selected disabled VPN","mode":"selected","entries":[{"id":"vpn","kind":"app","value":"Discord.exe","enabled":false,"policy":"VPN","schemaVersion":2}],"blocked":true},
+  {"name":"selected VPN and DIRECT","mode":"selected","entries":[{"id":"vpn","kind":"app","value":"C:/A/app.exe","enabled":true,"policy":"VPN","schemaVersion":2},{"id":"direct","kind":"app","value":"D:/B/app.exe","enabled":true,"policy":"DIRECT","schemaVersion":2}],"blocked":false}
 ]

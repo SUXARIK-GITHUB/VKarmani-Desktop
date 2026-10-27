@@ -8,9 +8,11 @@ import { StorageRecoveryNotice } from '../src/components/StorageRecoveryNotice';
 import { LogoutConfirmModal } from '../src/components/LogoutConfirmModal';
 import { NativeStorageError, storageFailure } from '../src/services/nativeState';
 import { connectionFailureState } from '../src/utils/runtimeSnapshot';
+import { isLocalTestBuild } from '../src/services/localTest';
 
 const appSource = ts.createSourceFile('App.tsx', readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 function appFunction(name: string, bindings: Record<string, unknown>) {
+  bindings = { isLocalTestBuild, ...bindings };
   let found: ts.FunctionDeclaration | undefined;
   const visit = (node: ts.Node) => { if (ts.isFunctionDeclaration(node) && node.name?.text === name) found = node; ts.forEachChild(node, visit); };
   visit(appSource); expect(found).toBeDefined();
@@ -27,6 +29,7 @@ function profileWorkBindings() {
 }
 
 function appEffectContaining(fragment: string, bindings: Record<string, unknown>) {
+  bindings = { isLocalTestBuild, ...bindings };
   let effect: ts.ArrowFunction | undefined;
   const visit = (node: ts.Node) => {
     if (ts.isCallExpression(node) && node.expression.getText(appSource) === 'useEffect' && node.arguments[0]

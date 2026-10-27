@@ -15,6 +15,15 @@ beforeEach(() => {
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 describe('076 UI with authoritative encrypted v2 storage', () => {
+  it('uses selected for fresh state without enabling rules or writing defaults over native state', async () => {
+    const original=structuredClone(backend.snapshot);
+    const storage=await import('../src/services/storage');
+    const loaded=await storage.loadPersistentSnapshot();
+    expect(loaded.settings.tunRoutingMode).toBe('selected');
+    expect(loaded.entries).toEqual([]);
+    expect(backend.snapshot).toEqual(original);
+    expect(invoke.mock.calls.map(([command])=>command)).toEqual(['load_state_snapshot']);
+  });
   it.each([null, '', 'future', 42, {}, [], ['all']])('blocks invalid present TUN policy %j without broadening it or overwriting originals', async tunRoutingMode => {
     backend.snapshot.payload.public.settings = { tunnelMode: 'tun', autoConnect: true, tunRoutingMode, futureOption: { keep: true } };
     const original = structuredClone(backend.snapshot);
@@ -42,7 +51,7 @@ describe('076 UI with authoritative encrypted v2 storage', () => {
     backend.snapshot.payload.public.settings = { language: 'en' };
     backend.snapshot.payload.public.splitTunnelEntries = hasRules ? [{ id: 'legacy', kind: 'app', value: 'app.exe', policy: 'VPN', enabled: true }] : [];
     const storage = await import('../src/services/storage');
-    expect((await storage.loadPersistentSnapshot()).settings).toMatchObject({ tunRoutingMode: hasRules ? 'selected' : 'all', autoConnect: false, language: 'en' });
+    expect((await storage.loadPersistentSnapshot()).settings).toMatchObject({ tunRoutingMode: 'selected', autoConnect: false, language: 'en' });
   });
   it('keeps newer per-rule metadata when the076 editor hydrates and saves supported fields', async () => {
     backend.snapshot.payload.public.splitTunnelEntries = [{id:'rule-a',kind:'app',value:'app.exe',enabled:true,policy:'VPN',schemaVersion:2,futureMetadata:{keep:true}}];

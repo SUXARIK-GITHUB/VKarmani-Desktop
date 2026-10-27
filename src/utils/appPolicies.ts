@@ -80,16 +80,10 @@ export function isSelectedTunPolicyEmpty(entries: SplitTunnelEntry[], mode: TunR
 }
 
 export function isTunProcessRoutingBlocked(entries: SplitTunnelEntry[], mode: TunRoutingMode): boolean {
-  return mode === 'selected' || activePolicyEntries(entries, mode).length > 0;
+  return isSelectedTunPolicyEmpty(entries, mode);
 }
 
 export function tunProcessRoutingBlockMessage(entries: SplitTunnelEntry[], mode: TunRoutingMode, language: UiLanguage): string {
   if (!isTunProcessRoutingBlocked(entries, mode)) return '';
-  const selected = mode === 'selected'
-    ? tr(language, 'Маршрутизация выбранных приложений недоступна. Перейдите к «Все приложения».', 'Selected-app routing is unavailable. Switch to All applications.')
-    : '';
-  const direct = activePolicyEntries(entries, mode).some(entry => entry.policy === 'DIRECT')
-    ? tr(language, 'Отключите активные DIRECT-правила для Full TUN. Записи сохранятся.', 'Disable active DIRECT rules for Full TUN. Saved entries are preserved.')
-    : '';
-  return [selected, direct].filter(Boolean).join(' ');
+  return tr(language, 'Выберите хотя бы одно включённое приложение или службу через VPN.', 'Select at least one enabled VPN application or service.');
 }

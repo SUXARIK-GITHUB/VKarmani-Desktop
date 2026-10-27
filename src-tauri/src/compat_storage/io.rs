@@ -601,6 +601,8 @@ mod tests {
                 crate::compat_storage::durable::random_state_id().unwrap()
             ));
             fs::create_dir(&directory).unwrap();
+            let runtime_pins =
+                lock_runtime_parent_paths(&directory.join("synthetic-config.json")).unwrap();
             let target = directory.join("owned-tun-routes-v1.dpapi");
             atomic_write_state_text(&target, "old").unwrap();
             let reader = OpenOptions::new()
@@ -629,6 +631,7 @@ mod tests {
             });
             let actual = fs::read_to_string(&target).unwrap();
             fs::remove_file(target).unwrap();
+            drop(runtime_pins);
             fs::remove_dir(directory).unwrap();
             assert!(
                 result.is_ok(),

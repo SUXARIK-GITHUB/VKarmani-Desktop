@@ -25,9 +25,17 @@ fn capture_stream(mut stream: impl Read) -> Result<Vec<u8>, String> {
     }
 }
 pub(crate) fn run_command_with_timeout(
+    command: Command,
+    timeout: Duration,
+    context: &str,
+) -> Result<String, String> {
+    run_command_with_timeout_and_input(command, timeout, context, None)
+}
+pub(crate) fn run_command_with_timeout_and_input(
     mut command: Command,
     timeout: Duration,
     context: &str,
+    input: Option<Vec<u8>>,
 ) -> Result<String, String> {
     static WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     if WORKERS
@@ -57,6 +65,7 @@ pub(crate) fn run_command_with_timeout(
     )?;
     let stdout = child.stdout.take().ok_or("Missing command stdout")?;
     let stderr = child.stderr.take().ok_or("Missing command stderr")?;
+    let input_result = write_owned_stdin(&mut child, input)?;
     let (tx_out, rx_out) = std::sync::mpsc::sync_channel(1);
     let (tx_err, rx_err) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
@@ -79,6 +88,11 @@ pub(crate) fn run_command_with_timeout(
         std::thread::sleep(Duration::from_millis(20));
     };
     drop(child); // Close job/descendant output handles before collecting readers.
+    if let Some(result) = input_result {
+        result
+            .recv_timeout(Duration::from_millis(500))
+            .map_err(|_| "CONFIG_STDIN_DEADLINE")??;
+    }
     let remaining = || {
         deadline
             .saturating_duration_since(Instant::now())
@@ -99,6 +113,25 @@ pub(crate) fn run_command_with_timeout(
             redact_sensitive(&String::from_utf8_lossy(text))
         ))
     }
+}
+
+pub(crate) fn write_owned_stdin(
+    child: &mut OwnedXrayProcess,
+    input: Option<Vec<u8>>,
+) -> Result<Option<std::sync::mpsc::Receiver<Result<(), String>>>, String> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    let mut pipe = child.stdin.take().ok_or("CONFIG_STDIN_MISSING")?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = pipe
+            .write_all(&input)
+            .map_err(|_| "CONFIG_STDIN_WRITE_FAILED".to_string());
+        drop(pipe); // EOF is part of Xray's existing stdin: protocol.
+        let _ = tx.send(result);
+    });
+    Ok(Some(rx))
 }
 
 #[cfg(all(test, target_os = "windows"))]
@@ -139,5 +172,41 @@ mod tests {
         .unwrap_err()
         .starts_with("COMMAND_TIMEOUT"));
         assert!(start.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn stdin_delivers_bytes_and_eof_and_does_not_hang_on_early_exit() {
+        let _fixture = HELPER_TEST_LOCK.lock().unwrap();
+        let mut command = powershell("[Console]::Out.Write([Console]::In.ReadToEnd())");
+        command.stdin(Stdio::piped());
+        assert_eq!(
+            run_command_with_timeout_and_input(
+                command,
+                Duration::from_secs(8),
+                "synthetic stdin EOF",
+                Some(b"synthetic-no-secret".to_vec())
+            )
+            .unwrap(),
+            "synthetic-no-secret"
+        );
+        let mut command = powershell("exit 0");
+        command.stdin(Stdio::piped());
+        assert!(run_command_with_timeout_and_input(
+            command,
+            Duration::from_secs(8),
+            "synthetic stdin closed",
+            Some(vec![b'x'; 1024 * 1024])
+        )
+        .is_err());
+        let mut command = powershell("Start-Sleep -Seconds 20");
+        command.stdin(Stdio::piped());
+        assert!(run_command_with_timeout_and_input(
+            command,
+            Duration::from_millis(200),
+            "synthetic blocked stdin",
+            Some(vec![b'x'; 1024 * 1024])
+        )
+        .unwrap_err()
+        .starts_with("COMMAND_TIMEOUT"));
     }
 }

@@ -158,7 +158,7 @@ pub(crate) fn push_candidate_dir(candidates: &mut Vec<PathBuf>, value: Option<Pa
 }
 
 pub(crate) fn app_logs_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let base = app.path().app_local_data_dir().map_err(|error| {
+    let base = application_data_root(app).map_err(|error| {
         format!("Не удалось определить каталог данных приложения для логов: {error}")
     })?;
     let logs_root = base.join("logs");
@@ -585,7 +585,7 @@ pub(crate) fn candidate_core_paths(app: &AppHandle) -> Vec<PathBuf> {
         );
     }
 
-    if let Ok(app_local) = app.path().app_local_data_dir() {
+    if let Ok(app_local) = application_data_root(app) {
         push_unique_path(&mut paths, app_local.join("core").join("xray.exe"));
     }
 
@@ -692,11 +692,15 @@ Set-Acl -LiteralPath $path -AclObject $acl
 pub(crate) fn harden_runtime_output_dir(_path: &Path) {}
 
 pub(crate) fn runtime_output_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let base = app
-        .path()
-        .app_local_data_dir()
-        .or_else(|_| app.path().app_config_dir())
-        .map_err(|error| format!("Не удалось определить каталог данных: {error}"))?;
+    let base = if local_test_build() {
+        application_data_root(app)
+    } else {
+        app.path()
+            .app_local_data_dir()
+            .or_else(|_| app.path().app_config_dir())
+            .map_err(|error| error.to_string())
+    }
+    .map_err(|error| format!("Не удалось определить каталог данных: {error}"))?;
 
     let path = base.join("runtime");
     fs::create_dir_all(&path)

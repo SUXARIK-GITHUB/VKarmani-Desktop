@@ -335,10 +335,6 @@ export function OverviewTab({
         </article>
 
         <div className={`vk-power-actions ${tunnelMode === 'tun' ? 'with-tun-tools' : ''}`}>
-          {connectionState === 'idle' && !canConnect && connectDisabledReason && <div className="vk-connect-disabled-reason" role="status">
-            <span>{connectDisabledReason}</span>
-            {tunnelMode === 'tun' && <button type="button" className="vk-secondary-action" onClick={onOpenSplitTunnel}>{tr(language, 'Настроить TUN', 'Configure TUN')}</button>}
-          </div>}
           <button
             type="button"
             className={`vk-primary-power ${connectionState}`}
