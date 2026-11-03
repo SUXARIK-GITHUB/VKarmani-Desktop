@@ -682,6 +682,23 @@ pub(crate) fn validate_xray_config_with_core(
     config_path: &Path,
     expected_config_hash: &str,
 ) -> Result<(), String> {
+    check_xray_config_with_core(core_path, config_path, expected_config_hash, false)
+}
+
+pub(crate) fn compile_xray_tun_config_with_core(
+    core_path: &Path,
+    config_path: &Path,
+    expected_config_hash: &str,
+) -> Result<(), String> {
+    check_xray_config_with_core(core_path, config_path, expected_config_hash, true)
+}
+
+fn check_xray_config_with_core(
+    core_path: &Path,
+    config_path: &Path,
+    expected_config_hash: &str,
+    compile_only: bool,
+) -> Result<(), String> {
     let integrity = prepare_core_launch(core_path, Some((config_path, expected_config_hash)))?;
     let core_path = integrity.core.as_path();
     let config_path = integrity
@@ -699,10 +716,14 @@ pub(crate) fn validate_xray_config_with_core(
         .env(
             "XRAY_LOCATION_CONFIG",
             config_path.parent().unwrap_or(core_working_dir),
-        )
-        .arg("run")
-        .arg("-test")
-        .arg("-config")
+        );
+    if compile_only {
+        // The pinned core's converter builds the typed config without core.New.
+        command.args(["convert", "pb", "-debug", "-type"]);
+    } else {
+        command.args(["run", "-test", "-config"]);
+    }
+    command
         .arg(if integrity.stdin_config.is_some() {
             Path::new("stdin:")
         } else {
@@ -714,8 +735,18 @@ pub(crate) fn validate_xray_config_with_core(
             Stdio::null()
         });
 
-    run_command_with_timeout_and_input(command, Duration::from_secs(8), "xray config test", integrity.stdin_config.clone())
-        .map(|_| ())
+    let result = run_command_with_timeout_and_input(
+        command,
+        Duration::from_secs(8),
+        "xray config test",
+        integrity.stdin_config.clone(),
+    )
+    .map(|_| ());
+    if compile_only {
+        // Converter output can include provider settings. Never log it.
+        return result.map_err(|_| "XRAY_TUN_CONFIG_COMPILE_FAILED".into());
+    }
+    result
         .map_err(|error| format!("Xray-core не принял runtime-конфиг. Подключение остановлено до запуска процесса: {error}"))
 }
 
@@ -982,6 +1013,10 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         validate_xray_config_with_core(&core_path, &projection_path, &sha256_hex_bytes(&bytes))
             .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
     }
+    if tun_interface_plan.is_some() {
+        compile_xray_tun_config_with_core(&core_path, &config_path, &config_hash)
+            .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
+    }
     _operation_guard.check()?;
     _operation_guard.stage("stopping")?;
     stop_managed_or_starting_runtime(
@@ -1024,10 +1059,11 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     }
     ensure_runtime_ports_available()?;
 
-    // Full TUN construction can happen only after the old owned child stops.
-    // Projection success is not full TUN readiness or egress proof.
+    // TUN construction belongs exclusively to the owned runtime launch.
     _operation_guard.stage("validating")?;
-    validate_xray_config_with_core(&core_path, &config_path, &config_hash)?;
+    if tun_interface_plan.is_none() {
+        validate_xray_config_with_core(&core_path, &config_path, &config_hash)?;
+    }
     _operation_guard.check()?;
 
     if normalized_network_mode == "tun" {

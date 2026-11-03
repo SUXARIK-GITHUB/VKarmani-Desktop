@@ -29,14 +29,21 @@ it('release-binary policy probe returns before Builder, storage and WebView star
   expect(run.slice(probe,run.indexOf('let builder = tauri::Builder::default()'))).toContain('return;');
 });
 
-it('validates a TUN-free projection before stopping, with full TUN construction only after owned stop', () => {
+it('checks both TUN configurations before stopping and only the owned child constructs the adapter', () => {
   const commands = readFileSync(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
   const connect = commands.slice(commands.indexOf('fn request_connect_blocking('));
   const validation = connect.indexOf('validate_xray_config_with_core(');
   const stop = connect.indexOf('stop_managed_or_starting_runtime(');
   expect(validation).toBeGreaterThan(0);
   expect(validation).toBeLessThan(stop);
-  expect(connect.indexOf('validate_xray_config_with_core(&core_path, &config_path')).toBeGreaterThan(stop);
+  const compile = connect.indexOf('compile_xray_tun_config_with_core(&core_path, &config_path');
+  const available = connect.indexOf('ensure_tun_alias_available()');
+  const spawn = connect.indexOf('spawn_xray_runtime_child(');
+  expect(compile).toBeGreaterThan(validation);
+  expect(compile).toBeLessThan(stop);
+  expect(available).toBeGreaterThan(stop);
+  expect(spawn).toBeGreaterThan(available);
+  expect(connect).toMatch(/if tun_interface_plan\.is_none\(\) \{\s*validate_xray_config_with_core\(&core_path, &config_path/);
   expect(connect.indexOf('config_preflight_projection(&config)')).toBeLessThan(validation);
   expect(connect.indexOf('PreparedRuntimeConfig::write(')).toBeLessThan(validation);
   expect(connect.indexOf('prepared_config.commit()')).toBeGreaterThan(stop);

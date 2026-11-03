@@ -713,7 +713,7 @@ fn prepare_network_config(
     };
     // Xray constructs/starts its TUN adapter inside core.New even for -test.
     // Check provider transports without constructing another live TUN. The
-    // unchanged full config is validated only after confirmed owned-child stop.
+    // Full config is compiled without creating an adapter.
     let projection = config_preflight_projection(&config)?;
     let projection_bytes =
         serde_json::to_vec_pretty(&projection).map_err(|_| "NETWORK_CONFIG_SERIALIZE")?;
@@ -877,7 +877,7 @@ fn try_self_restart_xray_runtime(
             )));
         }
         if let Err(error) =
-            validate_xray_config_with_core(&core_path, &config_path, &runtime.config_hash)
+            compile_xray_tun_config_with_core(&core_path, &config_path, &runtime.config_hash)
         {
             return Err(Box::new((runtime, error)));
         }
