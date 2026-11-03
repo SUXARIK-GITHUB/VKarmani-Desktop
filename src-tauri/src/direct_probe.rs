@@ -144,7 +144,7 @@ mod windows {
         }
         Err("DIRECT_NO_PHYSICAL_ROUTE".into())
     }
-    fn dns_servers(index: u32, luid: u64) -> Result<Vec<String>, String> {
+    pub(super) fn dns_servers(index: u32, luid: u64) -> Result<Vec<String>, String> {
         // Aligned OS-owned result buffer, bounded retries if adapters change
         // between calls. No DNS request and no private adapter data persisted.
         let mut size = 15 * 1024u32;
@@ -426,6 +426,11 @@ mod windows {
 #[cfg(target_os = "windows")]
 pub(crate) fn read_physical_binding() -> Result<DefaultRouteSnapshot, String> {
     windows::binding_snapshot()
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn read_interface_dns(index: u32, luid: u64) -> Result<Vec<String>, String> {
+    windows::dns_servers(index, luid)
 }
 pub(crate) fn direct_tcp_probe(
     address: std::net::SocketAddr,

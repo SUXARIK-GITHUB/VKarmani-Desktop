@@ -795,7 +795,11 @@ fn try_self_restart_xray_runtime(
             Ok(value) => value,
             Err(error) => return Err(Box::new((runtime, error))),
         };
-        if runtime.physical_binding.as_ref() != Some(&fresh) {
+        if !runtime
+            .physical_binding
+            .as_ref()
+            .is_some_and(|active| same_tun_physical_binding(active, &fresh))
+        {
             prepared_network = match prepare_network_config(&runtime, fresh) {
                 Ok(value) => Some(value),
                 Err(error) => return Err(Box::new((runtime, error))),
@@ -879,6 +883,11 @@ fn try_self_restart_xray_runtime(
         }
     }
 
+    if runtime.network_mode == "tun" {
+        if let Err(error) = ensure_tun_alias_available() {
+            return Err(Box::new((runtime, error)));
+        }
+    }
     let mut child =
         match spawn_xray_runtime_child(&core_path, &config_path, &log_path, &runtime.config_hash) {
             Ok(child) => child,
@@ -897,11 +906,15 @@ fn try_self_restart_xray_runtime(
     }
 
     if runtime.network_mode == "tun" {
+        let Some(interface) = runtime.tun_interface_plan else {
+            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+            return Err(Box::new((runtime, "TUN_INTERFACE_PLAN_MISSING".into())));
+        };
         let tun_name = runtime
             .tun_interface_name
             .clone()
             .unwrap_or_else(|| TUN_INTERFACE_NAME.to_string());
-        if let Err(error) = configure_tun_routes(app, &tun_name, &runtime.tun_server_ips) {
+        if let Err(error) = configure_tun_routes(app, &tun_name, interface) {
             let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
             return Err(Box::new((
                 runtime,
@@ -909,7 +922,7 @@ fn try_self_restart_xray_runtime(
             )));
         }
         std::thread::sleep(Duration::from_millis(250));
-        if let Err(error) = confirm_tun_routes_ready(app) {
+        if let Err(error) = confirm_tun_routes_ready(app, interface) {
             let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
             return Err(Box::new((runtime, error)));
         }
@@ -1177,7 +1190,9 @@ fn sync_physical_network(app: &AppHandle, state: &tauri::State<AppState>) {
             return;
         }
     };
-    if operation.check().is_err() || current_physical_binding().ok().as_ref() != Some(&fresh) {
+    if operation.check().is_err()
+        || confirm_tun_physical_binding(Some(&fresh), current_physical_binding()).is_err()
+    {
         return;
     }
     let runtime_to_stop = {

@@ -934,8 +934,27 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     )
     .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
 
+    let mut tun_interface_plan = None;
     #[cfg(target_os = "windows")]
     if let Some(route) = physical_route.as_ref() {
+        let disabled_components = read_windows_registry_value(
+            r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters",
+            "DisabledComponents",
+        )
+        .and_then(|value| parse_windows_registry_dword(&value));
+        let interface = TunInterfacePlan {
+            ipv6_guard: !ipv6_globally_disabled(disabled_components),
+            adapter_dns: split_tunnel_plan.default_vpn,
+        };
+        for inbound in config["inbounds"]
+            .as_array_mut()
+            .ok_or("TUN_CONFIG_INBOUNDS")?
+        {
+            if inbound["protocol"] == "tun" {
+                inbound["settings"]["gateway"] = json!(interface.gateways());
+            }
+        }
+        tun_interface_plan = Some(interface);
         bind_tun_outbounds(&mut config, &route.interface_alias)
             .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
     }
@@ -1144,6 +1163,9 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     };
 
     _operation_guard.stage("starting")?;
+    if tun_interface_plan.is_some() {
+        ensure_tun_alias_available()?;
+    }
     let child = match spawn_xray_runtime_child(&core_path, &config_path, &log_path, &config_hash) {
         Ok(child) => child,
         Err(error) => {
@@ -1184,13 +1206,13 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         return Err(error);
     }
 
-    if normalized_network_mode == "tun" {
+    if let Some(interface) = tun_interface_plan {
         _operation_guard.stage("configuring-routes")?;
-        configure_tun_routes(&app, TUN_INTERFACE_NAME, &outbound_ips).map_err(|error| {
+        configure_tun_routes(&app, TUN_INTERFACE_NAME, interface).map_err(|error| {
             format!("Не удалось подготовить Windows-маршруты для TUN режима: {error}")
         })?;
         std::thread::sleep(Duration::from_millis(250));
-        confirm_tun_routes_ready(&app)?;
+        confirm_tun_routes_ready(&app, interface)?;
         // Xray v26.10.31 can keep its listeners alive while rejecting dials
         // bound to a physical interface that changed after preflight.
         confirm_tun_physical_binding(physical_route.as_ref(), current_physical_binding())?;
@@ -1254,6 +1276,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
             } else {
                 None
             },
+            tun_interface_plan,
             tun_server_ips: if normalized_network_mode == "tun" {
                 outbound_ips.clone()
             } else {
@@ -2439,6 +2462,30 @@ fn parse_windows_registry_dword(value: &str) -> Option<u32> {
         return u32::from_str_radix(hex, 16).ok();
     }
     trimmed.parse::<u32>().ok()
+}
+
+#[cfg(target_os = "windows")]
+fn ipv6_globally_disabled(value: Option<u32>) -> bool {
+    // Microsoft DisabledComponents bits 0 and 4 disable all tunnel and
+    // non-tunnel IPv6 respectively. Route admission also verifies live state.
+    value.is_some_and(|mask| mask & 0x11 == 0x11)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+#[test]
+fn only_explicit_global_ipv6_disable_allows_omitting_the_guard() {
+    for value in [
+        None,
+        Some(0),
+        Some(0x01),
+        Some(0x10),
+        Some(0x20),
+        Some(0xaf),
+    ] {
+        assert!(!ipv6_globally_disabled(value));
+    }
+    assert!(ipv6_globally_disabled(Some(0x11)));
+    assert!(ipv6_globally_disabled(Some(0xff)));
 }
 
 #[cfg(target_os = "windows")]

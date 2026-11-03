@@ -447,6 +447,7 @@ mod tests {
                 traffic_inbound_tags: ["http-in".into(), "socks-in".into()],
                 network_mode: "proxy".into(),
                 tun_interface_name: None,
+                tun_interface_plan: None,
                 tun_server_ips: Vec::new(),
                 self_restart_count: 0,
                 last_self_restart_at: None,

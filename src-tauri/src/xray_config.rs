@@ -1,5 +1,35 @@
 use super::*;
 
+// Host addresses on the disposable adapter, not LAN prefixes or next hops.
+pub(crate) const TUN_GATEWAY_IPV4: &str = "172.19.0.1/32";
+pub(crate) const TUN_GATEWAY_IPV6: &str = "fdfe:dcba:9876::1/128";
+pub(crate) const TUN_MTU: u32 = 1400;
+pub(crate) const TUN_DNS: [&str; 2] = ["1.1.1.1", "8.8.8.8"];
+
+#[derive(Clone, Copy)]
+pub(crate) struct TunInterfacePlan {
+    pub(crate) ipv6_guard: bool,
+    pub(crate) adapter_dns: bool,
+}
+
+impl TunInterfacePlan {
+    pub(crate) fn gateways(self) -> &'static [&'static str] {
+        if self.ipv6_guard {
+            &[TUN_GATEWAY_IPV4, TUN_GATEWAY_IPV6]
+        } else {
+            &[TUN_GATEWAY_IPV4]
+        }
+    }
+
+    pub(crate) fn dns(self) -> &'static [&'static str] {
+        if self.adapter_dns {
+            &TUN_DNS
+        } else {
+            &[]
+        }
+    }
+}
+
 pub(crate) fn tune_outbound_for_performance(outbound: &mut Value) {
     let Some(outbound_map) = outbound.as_object_mut() else {
         return;
@@ -579,9 +609,12 @@ fn build_from_full_xray_config_template(
         set_client_owned_xray_field(log, key, value.clone());
     }
     set_client_owned_xray_field(log, "access", json!("none"));
-    map.entry("dns").or_insert(
-        json!({"queryStrategy":dns_query_strategy,"servers":["1.1.1.1","8.8.8.8","localhost"]}),
-    );
+    if !map.keys().any(|key| xray_json_field_matches(key, "dns")) {
+        map.insert(
+            "dns".into(),
+            json!({"queryStrategy":dns_query_strategy,"servers":["1.1.1.1","8.8.8.8","localhost"]}),
+        );
+    }
     let api = map.entry("api").or_insert(json!({})).as_object_mut()?;
     set_client_owned_xray_field(api, "tag", json!(api_tag));
     api.retain(|name, _| !xray_json_field_matches(name, "listen"));
@@ -969,12 +1002,19 @@ pub(crate) fn build_xray_config_with_plan(
     }
 
     if network_mode == "tun" {
+        let interface = TunInterfacePlan {
+            ipv6_guard: true,
+            adapter_dns: plan.default_vpn,
+        };
         inbounds.push(json!({
             "tag": "tun-in",
             "protocol": "tun",
             "settings": {
                 "name": TUN_INTERFACE_NAME,
-                "MTU": 1400,
+                "MTU": TUN_MTU,
+                "gateway": interface.gateways(),
+                "dns": interface.dns(),
+                "autoSystemRoutingTable": [],
                 "userLevel": 0
             },
             "sniffing": {
@@ -1367,25 +1407,6 @@ pub(crate) fn bind_tun_outbounds(config: &mut Value, interface: &str) -> Result<
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) fn find_tun_interface_index(interface_name: &str) -> Result<u32, String> {
-    owned_interface_index(interface_name)
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn wait_for_tun_interface(interface_name: &str) -> Result<u32, String> {
-    let deadline = Instant::now() + Duration::from_secs(6);
-    loop {
-        if let Ok(index) = find_tun_interface_index(interface_name) {
-            return Ok(index);
-        }
-        if Instant::now() >= deadline {
-            return Err("TUN interface deadline exceeded".into());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 #[cfg(test)]
 mod tun_policy_tests {
     use super::*;
@@ -1486,6 +1507,65 @@ mod fragment_compat_tests {
             "../../tests/fixtures/xray/fragment-compat.json"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn tun_host_addresses_and_dns_follow_adapter_policy_without_core_routes() {
+        let mut source = fixture();
+        source.as_object_mut().unwrap().remove("dns");
+        let provider_dns = json!({"servers":["9.9.9.9"], "queryStrategy":"UseIPv4"});
+        source["DNS"] = provider_dns.clone();
+        source["routing"]["domainStrategy"] = json!("IPOnDemand");
+        let input = template(source);
+        for (mode, default_vpn) in [("tun", true), ("tun", false), ("proxy", false)] {
+            let plan = SplitTunnelRulePlan {
+                process_matches: vec!["synthetic".into()],
+                direct_process_matches: vec![],
+                resolved_apps: 1,
+                resolved_services: 0,
+                skipped_notes: vec![],
+                default_vpn,
+            };
+            let (runtime, _, _) =
+                build_xray_config_with_plan(&input, mode, "ipv4", None, Some(plan), None, None)
+                    .unwrap();
+            let tun = runtime["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["protocol"] == "tun");
+            if mode == "tun" {
+                let settings = &tun.unwrap()["settings"];
+                assert_eq!(
+                    settings["gateway"],
+                    json!([TUN_GATEWAY_IPV4, TUN_GATEWAY_IPV6])
+                );
+                assert_eq!(settings["MTU"], TUN_MTU);
+                assert_eq!(settings["autoSystemRoutingTable"], json!([]));
+                assert!(settings.get("autoSystemWfpBlockLeak").is_none());
+                assert_eq!(
+                    settings["dns"],
+                    if default_vpn {
+                        json!(TUN_DNS)
+                    } else {
+                        json!([])
+                    }
+                );
+            } else {
+                assert!(tun.is_none());
+            }
+            assert_eq!(runtime["DNS"], provider_dns);
+            assert!(runtime.get("dns").is_none());
+            assert_eq!(runtime["routing"]["domainStrategy"], "IPOnDemand");
+        }
+        assert_eq!(
+            TunInterfacePlan {
+                ipv6_guard: false,
+                adapter_dns: false
+            }
+            .gateways(),
+            &[TUN_GATEWAY_IPV4]
+        );
     }
 
     #[test]

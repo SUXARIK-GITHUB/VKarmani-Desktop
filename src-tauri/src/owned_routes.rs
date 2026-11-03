@@ -1,5 +1,13 @@
 use super::*;
 
+fn tun_destinations(interface: TunInterfacePlan) -> &'static [&'static str] {
+    if interface.ipv6_guard {
+        &["0.0.0.0", "128.0.0.0", "::", "8000::"]
+    } else {
+        &["0.0.0.0", "128.0.0.0"]
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OwnedRoute {
@@ -334,6 +342,41 @@ mod windows {
             String::from_utf16_lossy(&row.Alias[..end]),
         ))
     }
+    pub(super) fn ensure_alias_available() -> Result<(), String> {
+        let mut table = null_mut();
+        let status = unsafe { GetIfTable2(&mut table) };
+        if status != 0 || table.is_null() {
+            return Err(format!("TUN_INTERFACE_TABLE_UNAVAILABLE: Win32 {status}"));
+        }
+        let count = unsafe { (*table).NumEntries } as usize;
+        let present = if count <= 8192 {
+            let rows = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!((*table).Table).cast::<MIB_IF_ROW2>(),
+                    count,
+                )
+            };
+            rows.iter().any(|row| {
+                let end = row
+                    .Alias
+                    .iter()
+                    .position(|&unit| unit == 0)
+                    .unwrap_or(row.Alias.len());
+                String::from_utf16_lossy(&row.Alias[..end]).eq_ignore_ascii_case(TUN_INTERFACE_NAME)
+            })
+        } else {
+            unsafe { FreeMibTable(table.cast()) };
+            return Err("TUN_INTERFACE_TABLE_LIMIT".into());
+        };
+        unsafe { FreeMibTable(table.cast()) };
+        if present {
+            return Err(
+                "TUN_INTERFACE_ALREADY_PRESENT: existing adapter ownership cannot be established"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
     fn verify_owned_interface(luid: u64) -> Result<(), String> {
         let mut row: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };
         row.InterfaceLuid = NET_LUID_LH { Value: luid };
@@ -394,6 +437,137 @@ mod windows {
             }
         }
         Ok(value)
+    }
+
+    fn interface_row(luid: u64, family: u16) -> (u32, MIB_IPINTERFACE_ROW) {
+        let mut row = unsafe { std::mem::zeroed::<MIB_IPINTERFACE_ROW>() };
+        unsafe { InitializeIpInterfaceEntry(&mut row) };
+        row.Family = family;
+        row.InterfaceLuid = NET_LUID_LH { Value: luid };
+        (unsafe { GetIpInterfaceEntry(&mut row) }, row)
+    }
+
+    fn ready_address(
+        row: &MIB_UNICASTIPADDRESS_ROW,
+        status: u32,
+        index: u32,
+        luid: u64,
+        prefix: u8,
+    ) -> bool {
+        status == 0
+            && row.InterfaceIndex == index
+            && unsafe { row.InterfaceLuid.Value == luid }
+            && row.OnLinkPrefixLength == prefix
+            && row.DadState == IpDadStatePreferred
+            && row.SkipAsSource == 0
+    }
+
+    #[test]
+    fn tun_address_must_be_preferred_and_belong_to_the_current_luid() {
+        let mut row = unsafe { std::mem::zeroed::<MIB_UNICASTIPADDRESS_ROW>() };
+        row.InterfaceIndex = 42;
+        row.InterfaceLuid = NET_LUID_LH { Value: 99 };
+        row.OnLinkPrefixLength = 32;
+        row.DadState = IpDadStatePreferred;
+        assert!(ready_address(&row, 0, 42, 99, 32));
+        assert!(!ready_address(&row, ERROR_NOT_FOUND, 42, 99, 32));
+        assert!(!ready_address(&row, 0, 42, 100, 32));
+        assert!(!ready_address(&row, 0, 43, 99, 32));
+        assert!(!ready_address(&row, 0, 42, 99, 128));
+        for state in [
+            IpDadStateTentative,
+            IpDadStateDuplicate,
+            IpDadStateDeprecated,
+        ] {
+            row.DadState = state;
+            assert!(!ready_address(&row, 0, 42, 99, 32));
+        }
+        row.DadState = IpDadStatePreferred;
+        row.SkipAsSource = 1;
+        assert!(!ready_address(&row, 0, 42, 99, 32));
+    }
+
+    pub(super) fn ready(alias: &str, interface: TunInterfacePlan) -> Result<(u32, u64), String> {
+        let index = find_index(alias)?;
+        let (luid, actual) = interface_identity(index)?;
+        validate_owned_interface(luid, luid, &actual)?;
+        let mut link = unsafe { std::mem::zeroed::<MIB_IF_ROW2>() };
+        link.InterfaceLuid = NET_LUID_LH { Value: luid };
+        let status = unsafe { GetIfEntry2(&mut link) };
+        if status != 0 || link.InterfaceIndex != index || link.OperStatus != 1 {
+            return Err(format!(
+                "TUN_INTERFACE_NOT_READY: index={index}, LUID={luid}, Win32 {status}"
+            ));
+        }
+        for (gateway, prefix) in interface.gateways().iter().zip([32, 128]) {
+            let ip = gateway.split_once('/').expect("fixed TUN prefix").0;
+            let mut row = unsafe { std::mem::zeroed::<MIB_UNICASTIPADDRESS_ROW>() };
+            unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+            row.InterfaceLuid = NET_LUID_LH { Value: luid };
+            row.Address = address(ip)?;
+            let family = unsafe { row.Address.si_family };
+            let status = unsafe { GetUnicastIpAddressEntry(&mut row) };
+            if !ready_address(&row, status, index, luid, prefix) {
+                return Err(format!("TUN_ADDRESS_NOT_READY: index={index}, LUID={luid}, family={family}, dad={}, Win32 {status}", row.DadState));
+            }
+            let (status, ip_interface) = interface_row(luid, family);
+            if status != 0 || ip_interface.InterfaceIndex != index || ip_interface.NlMtu != TUN_MTU
+            {
+                return Err(format!("TUN_MTU_UNCONFIRMED: index={index}, LUID={luid}, family={family}, MTU={}, Win32 {status}", ip_interface.NlMtu));
+            }
+        }
+        if !interface.ipv6_guard && interface_row(luid, AF_INET6).0 != ERROR_NOT_FOUND {
+            return Err(
+                "TUN_IPV6_GUARD_REQUIRED: live adapter did not confirm disabled IPv6".into(),
+            );
+        }
+        if interface.adapter_dns && read_interface_dns(index, luid)? != interface.dns() {
+            return Err(format!("TUN_DNS_UNCONFIRMED: index={index}, LUID={luid}"));
+        }
+        Ok((index, luid))
+    }
+
+    pub(super) fn confirm_effective_routes(
+        index: u32,
+        luid: u64,
+        interface: TunInterfacePlan,
+    ) -> Result<(), String> {
+        // Read-only lookups in each journal-owned half. No socket or traffic.
+        let samples = ["24.0.0.1", "198.51.100.1", "2001:db8::1", "a000::1"];
+        for sample in &samples[..tun_destinations(interface).len()] {
+            let mut row = unsafe { std::mem::zeroed::<MIB_IPFORWARD_ROW2>() };
+            let mut source = unsafe { std::mem::zeroed::<SOCKADDR_INET>() };
+            let destination = address(sample)?;
+            let mut selected_index = 0;
+            let selection = unsafe {
+                GetBestInterfaceEx(
+                    (&destination as *const SOCKADDR_INET).cast(),
+                    &mut selected_index,
+                )
+            };
+            let status = unsafe {
+                GetBestRoute2(
+                    null(),
+                    index,
+                    null(),
+                    &destination,
+                    0,
+                    &mut row,
+                    &mut source,
+                )
+            };
+            if status != 0
+                || selection != 0
+                || selected_index != index
+                || row.InterfaceIndex != index
+                || unsafe { row.InterfaceLuid.Value != luid }
+                || row.DestinationPrefix.PrefixLength != 1
+                || row.Metric != 6
+            {
+                return Err(format!("TUN_EFFECTIVE_ROUTE_UNCONFIRMED: index={index}, LUID={luid}, Win32 {status}/{selection}, selectedIndex={selected_index}, routeMetric={}", row.Metric));
+            }
+        }
+        Ok(())
     }
     fn row(route: &OwnedRoute) -> Result<MIB_IPFORWARD_ROW2, String> {
         let mut value: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
@@ -495,16 +669,23 @@ mod windows {
         }
         Ok(())
     }
-    pub(super) fn configure(app: &AppHandle, interface_name: &str) -> Result<(), String> {
+    pub(super) fn configure(
+        app: &AppHandle,
+        interface_name: &str,
+        interface: TunInterfacePlan,
+    ) -> Result<(), String> {
         cleanup(app)?;
-        let index = wait_for_tun_interface(interface_name)?;
-        let (luid, alias) = interface_identity(index)?;
-        if alias != TUN_INTERFACE_NAME {
-            return Err("Неподтверждённый TUN interface".into());
-        }
-        let routes = ["0.0.0.0", "128.0.0.0", "::", "8000::"]
-            .into_iter()
-            .map(|ip| OwnedRoute {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let (index, luid) = loop {
+            match ready(interface_name, interface) {
+                Ok(value) => break value,
+                Err(error) if Instant::now() >= deadline => return Err(error),
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        let routes = tun_destinations(interface)
+            .iter()
+            .map(|&ip| OwnedRoute {
                 destination: ip.into(),
                 prefix: 1,
                 next_hop: if ip.contains(':') { "::" } else { "0.0.0.0" }.into(),
@@ -736,29 +917,49 @@ pub(crate) fn cleanup_tun_routes_for_app(
         Ok(())
     }
 }
-#[cfg(target_os = "windows")]
-pub(crate) fn owned_interface_index(alias: &str) -> Result<u32, String> {
-    windows::find_index(alias)
-}
 pub(crate) fn configure_tun_routes(
     app: &AppHandle,
     interface_name: &str,
-    _server_ips: &[String],
+    interface: TunInterfacePlan,
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        windows::configure(app, interface_name)
+        windows::configure(app, interface_name, interface)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, interface_name);
+        let _ = (app, interface_name, interface);
         Err("Windows TUN only".into())
     }
 }
 
-pub(crate) fn confirm_tun_routes_ready(app: &AppHandle) -> Result<(), String> {
+pub(crate) fn ensure_tun_alias_available() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::ensure_alias_available()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Windows TUN only".into())
+    }
+}
+
+pub(crate) fn confirm_tun_routes_ready(
+    app: &AppHandle,
+    interface: TunInterfacePlan,
+) -> Result<(), String> {
     let (status, routes) = owned_route_summary(app);
-    if status == "confirmed" && complete_tun_route_set(&routes) {
+    #[cfg(target_os = "windows")]
+    if status == "confirmed" && complete_tun_route_set(&routes, interface) {
+        let (index, luid) = windows::ready(TUN_INTERFACE_NAME, interface)?;
+        if routes[0].interface_luid != luid {
+            return Err("TUN_ROUTES_NOT_READY: adapter generation changed".into());
+        }
+        windows::confirm_effective_routes(index, luid, interface)?;
+        let _ = append_runtime_event(app, &format!(
+            "TUN_LINK_CONFIRMED: index={index}, LUID={luid}, Preferred, MTU={TUN_MTU}, ownedRoutes={}, adapterDnsConfigured={}",
+            routes.len(), interface.adapter_dns,
+        ));
         return Ok(());
     }
     Err(format!(
@@ -767,12 +968,13 @@ pub(crate) fn confirm_tun_routes_ready(app: &AppHandle) -> Result<(), String> {
     ))
 }
 
-fn complete_tun_route_set(routes: &[OwnedRoute]) -> bool {
-    routes.len() == 4
+fn complete_tun_route_set(routes: &[OwnedRoute], interface: TunInterfacePlan) -> bool {
+    let destinations = tun_destinations(interface);
+    routes.len() == destinations.len()
         && routes.iter().all(|route| {
             valid_owned_route(route) && route.interface_luid == routes[0].interface_luid
         })
-        && ["0.0.0.0", "128.0.0.0", "::", "8000::"]
+        && destinations
             .iter()
             .all(|destination| routes.iter().any(|route| route.destination == *destination))
 }
@@ -1290,12 +1492,21 @@ mod tests {
     #[test]
     fn ready_requires_all_four_routes_on_one_interface_generation() {
         let mut routes = ["0.0.0.0", "128.0.0.0", "::", "8000::"].map(route);
-        assert!(complete_tun_route_set(&routes));
-        assert!(!complete_tun_route_set(&routes[..3]));
+        let mut interface = TunInterfacePlan {
+            ipv6_guard: true,
+            adapter_dns: true,
+        };
+        assert!(complete_tun_route_set(&routes, interface));
+        assert!(!complete_tun_route_set(&routes[..3], interface));
         routes[2].interface_luid += 1;
-        assert!(!complete_tun_route_set(&routes));
+        assert!(!complete_tun_route_set(&routes, interface));
         routes[2] = routes[3].clone();
-        assert!(!complete_tun_route_set(&routes));
+        assert!(!complete_tun_route_set(&routes, interface));
+        interface.ipv6_guard = false;
+        assert!(complete_tun_route_set(&routes[..2], interface));
+        assert!(!complete_tun_route_set(&routes, interface));
+        routes[0].metric = 7;
+        assert!(!complete_tun_route_set(&routes[..2], interface));
     }
     #[test]
     fn successful_exact_restore_100_cycles_no_foreign_routes_deleted() {

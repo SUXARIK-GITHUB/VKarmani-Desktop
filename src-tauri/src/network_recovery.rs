@@ -27,13 +27,26 @@ pub(crate) enum OwnedRecoveryOutcome<T> {
     Failed(Box<(T, String)>),
 }
 
+pub(crate) fn same_tun_physical_binding(
+    a: &DefaultRouteSnapshot,
+    b: &DefaultRouteSnapshot,
+) -> bool {
+    // DNS observations are retained for diagnostics, but rebind_tun_config
+    // consumes only the physical path. Xray/Windows resolve using live DNS.
+    a.interface_index == b.interface_index
+        && a.interface_luid == b.interface_luid
+        && a.interface_alias == b.interface_alias
+        && a.source_ip == b.source_ip
+        && a.next_hop == b.next_hop
+}
+
 pub(crate) fn confirm_tun_physical_binding(
     expected: Option<&DefaultRouteSnapshot>,
     observed: Result<DefaultRouteSnapshot, String>,
 ) -> Result<(), String> {
     let expected = expected.ok_or("NETWORK_TUN_BINDING_UNAVAILABLE")?;
     let observed = observed?;
-    if &observed != expected {
+    if !same_tun_physical_binding(expected, &observed) {
         return Err("NETWORK_TUN_BINDING_CHANGED".into());
     }
     Ok(())
@@ -105,14 +118,15 @@ impl PhysicalRecoveryPolicy {
             self.candidate = None;
             return false;
         };
-        if &observed == active && !self.resume_pending {
+        if same_tun_physical_binding(active, &observed) && !self.resume_pending {
             self.candidate = None;
             return false;
         }
         match &self.candidate {
             Some((prior, since))
-                if prior == &observed && now.saturating_sub(*since) >= STABLE_MS => {}
-            Some((prior, _)) if prior == &observed => return false,
+                if same_tun_physical_binding(prior, &observed)
+                    && now.saturating_sub(*since) >= STABLE_MS => {}
+            Some((prior, _)) if same_tun_physical_binding(prior, &observed) => return false,
             _ => {
                 self.candidate = Some((observed, now));
                 return false;
@@ -345,16 +359,15 @@ mod tests {
         assert!(!policy.observe(3_628_000, 2, &active, Some(active.clone()))); // Cooldown.
     }
     #[test]
-    fn dhcp_dns_gateway_luid_and_alias_each_require_fresh_stable_observation() {
+    fn dhcp_gateway_luid_and_alias_each_require_fresh_stable_observation() {
         let active = binding();
-        for change in 0..6 {
+        for change in 0..5 {
             let mut next = active.clone();
             match change {
                 0 => next.source_ip = "192.0.2.14".into(),
-                1 => next.dns_servers = vec!["192.0.2.54".into()],
-                2 => next.next_hop = "192.0.2.2".into(),
-                3 => next.interface_luid = 1313,
-                4 => next.interface_index = 13,
+                1 => next.next_hop = "192.0.2.2".into(),
+                2 => next.interface_luid = 1313,
+                3 => next.interface_index = 13,
                 _ => next.interface_alias = "Wi-Fi".into(),
             }
             let mut policy = PhysicalRecoveryPolicy::default();
@@ -363,6 +376,23 @@ mod tests {
             assert!(!policy.observe(8000, 1, &active, Some(next.clone())));
             assert!(policy.observe(12000, 1, &active, Some(next)));
         }
+    }
+    #[test]
+    fn dns_observations_do_not_restart_or_reset_a_physical_recovery_candidate() {
+        let mut active = binding();
+        active.dns_servers.push("192.0.2.54".into());
+        let mut observed = active.clone();
+        let mut policy = PhysicalRecoveryPolicy::default();
+        observed.dns_servers.reverse();
+        assert!(!policy.observe(0, 1, &active, Some(observed.clone())));
+        observed.dns_servers.push("2001:db8::53".into());
+        assert!(!policy.observe(4_000, 1, &active, Some(observed.clone())));
+        assert!(confirm_tun_physical_binding(Some(&active), Ok(observed.clone())).is_ok());
+        assert!(!policy.observe(8_000, 1, &active, Some(observed.clone())));
+        observed.source_ip = "192.0.2.14".into();
+        assert!(!policy.observe(12_000, 1, &active, Some(observed.clone())));
+        observed.dns_servers.clear();
+        assert!(policy.observe(16_000, 1, &active, Some(observed)));
     }
     #[test]
     fn rebind_preserves_provider_graph_policy_and_only_replaces_confirmed_owned_fields() {

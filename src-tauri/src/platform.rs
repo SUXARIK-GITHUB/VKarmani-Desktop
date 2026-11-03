@@ -5,7 +5,13 @@ pub(crate) const HTTP_PORT: u16 = 10809;
 pub(crate) const XRAY_API_PORT: u16 = 10810;
 pub(crate) const MAX_REMOTE_FETCH_BYTES: u64 = 2 * 1024 * 1024;
 pub(crate) const MAX_REMOTE_FETCH_REDIRECTS: usize = 3;
-pub(crate) const PROXY_BYPASS: &str = "<local>";
+// WinINet expects wildcard patterns. Enumerate 172.16–31 without bypassing
+// the surrounding public IPv4 ranges.
+pub(crate) const PROXY_BYPASS: &str = concat!(
+    "<local>;localhost;127.*;10.*;192.168.*;169.254.*;",
+    "172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;",
+    "172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*"
+);
 pub(crate) const IPIFY_URL: &str = "https://api.ipify.org?format=json";
 pub(crate) const APP_USER_AGENT: &str = concat!("VKarmani-Desktop/", env!("CARGO_PKG_VERSION"));
 #[cfg(all(target_os = "windows", not(debug_assertions)))]
