@@ -710,7 +710,10 @@ fn validate_runtime_transport_fields(config: &Value) -> Result<(), String> {
                 .transpose()?
                 .unwrap_or_default();
             let tls = packets.eq_ignore_ascii_case("tlshello");
-            if !tls && !packets.is_empty() && string_range_min(packets).is_none_or(|min| min <= 0) {
+            if !tls
+                && !packets.is_empty()
+                && !matches!(string_range_min(packets), Some(min) if min > 0)
+            {
                 return Err(error("packets", "expected a positive packet range"));
             }
             for (plural, singular, is_length) in
@@ -744,7 +747,7 @@ fn validate_runtime_transport_fields(config: &Value) -> Result<(), String> {
                 }
             }
             if field(settings, "maxSplit", &path)?
-                .is_some_and(|v| range_min(v).is_none_or(|min| min < 0))
+                .is_some_and(|v| !matches!(range_min(v), Some(min) if min >= 0))
             {
                 return Err(error("maxSplit", "expected a nonnegative integer/range"));
             }
