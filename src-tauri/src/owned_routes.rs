@@ -197,7 +197,9 @@ mod windows {
                     SetupDiGetDevicePropertyW, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL,
                     DIGCF_PRESENT, DIREG_DRV, HDEVINFO, SP_DEVINFO_DATA,
                 },
-                Properties::{DEVPROPKEY, DEVPROP_TYPE_STRING},
+                Properties::{
+                    DEVPKEY_Device_IsPresent, DEVPROPKEY, DEVPROP_TYPE_BOOLEAN, DEVPROP_TYPE_STRING,
+                },
             },
             Foundation::{
                 CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
@@ -207,14 +209,17 @@ mod windows {
             NetworkManagement::{
                 IpHelper::*,
                 Ndis::{
-                    IfOperStatusUp, MediaConnectStateConnected, MediaConnectStateDisconnected,
+                    IfOperStatusDown, IfOperStatusNotPresent, IfOperStatusUp,
+                    MediaConnectStateConnected, MediaConnectStateDisconnected,
                     MediaConnectStateUnknown, NET_LUID_LH,
                 },
             },
             Networking::WinSock::*,
             System::{
                 Com::CLSIDFromString,
-                Registry::{RegCloseKey, RegGetValueW, KEY_QUERY_VALUE, RRF_RT_REG_SZ},
+                Registry::{
+                    RegCloseKey, RegGetValueW, KEY_QUERY_VALUE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+                },
                 Threading::{
                     GetCurrentProcess, GetProcessTimes, OpenProcess, WaitForSingleObject,
                     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
@@ -451,10 +456,11 @@ mod windows {
     enum WintunName {
         Missing,
         Unique([u8; 16]),
+        Retired { guid: [u8; 16], luid: u64 },
         Duplicate,
     }
 
-    fn named_wintun_device() -> Result<WintunName, String> {
+    fn named_wintun_device(only_present: bool) -> Result<WintunName, String> {
         // WintunOpenAdapter uses this device property, which Windows adapter
         // renames do not update. Reading it via SetupAPI has no Wintun side effects.
         const NET_CLASS: GUID = GUID::from_u128(0x4d36e972_e325_11ce_bfc1_08002be10318);
@@ -468,7 +474,12 @@ mod windows {
         for enumerator in [r"SWD\Wintun", r"ROOT\Wintun"] {
             let enumerator: Vec<u16> = enumerator.encode_utf16().chain(Some(0)).collect();
             let devices = unsafe {
-                SetupDiGetClassDevsW(&NET_CLASS, enumerator.as_ptr(), null_mut(), DIGCF_PRESENT)
+                SetupDiGetClassDevsW(
+                    &NET_CLASS,
+                    enumerator.as_ptr(),
+                    null_mut(),
+                    if only_present { DIGCF_PRESENT } else { 0 },
+                )
             };
             if devices == INVALID_HANDLE_VALUE as HDEVINFO {
                 return Err(fail("SetupDiGetClassDevsW", win32_error()));
@@ -542,6 +553,11 @@ mod windows {
                         &mut bytes,
                     )
                 };
+                let retired_luid = if only_present {
+                    None
+                } else {
+                    read_retired_wintun_luid(devices.0, &node, key)
+                };
                 unsafe { RegCloseKey(key) };
                 if status != 0 {
                     return Err(fail("NetCfgInstanceId", status));
@@ -555,13 +571,76 @@ mod windows {
                         "TUN_INTERFACE_OWNER_UNKNOWN: invalid Wintun NetCfgInstanceId".into(),
                     );
                 }
-                matched = Some(guid_bytes(parsed));
+                let guid = guid_bytes(parsed);
+                matched = Some(match retired_luid {
+                    Some(luid) => WintunName::Retired { guid, luid },
+                    None => WintunName::Unique(guid),
+                });
             }
             if !ended {
                 return Err("TUN_INTERFACE_TABLE_LIMIT: Wintun devices".into());
             }
         }
-        Ok(matched.map_or(WintunName::Missing, WintunName::Unique))
+        Ok(matched.unwrap_or(WintunName::Missing))
+    }
+
+    fn read_retired_wintun_luid(
+        devices: HDEVINFO,
+        node: &SP_DEVINFO_DATA,
+        key: windows_sys::Win32::System::Registry::HKEY,
+    ) -> Option<u64> {
+        let (mut present, mut kind) = (0xff, 0);
+        let read = unsafe {
+            SetupDiGetDevicePropertyW(
+                devices,
+                node,
+                &DEVPKEY_Device_IsPresent,
+                &mut kind,
+                &mut present,
+                1,
+                null_mut(),
+                0,
+            )
+        };
+        if read == 0 || kind != DEVPROP_TYPE_BOOLEAN || present != 0 {
+            return None;
+        }
+        let read_dword = |name: &str| {
+            let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let mut value = 0u32;
+            let mut size = 4;
+            let status = unsafe {
+                RegGetValueW(
+                    key,
+                    null(),
+                    name.as_ptr(),
+                    RRF_RT_REG_DWORD,
+                    null_mut(),
+                    (&mut value as *mut u32).cast(),
+                    &mut size,
+                )
+            };
+            (status == 0 && size == 4).then_some(value)
+        };
+        let index = read_dword("NetLuidIndex")?;
+        let kind = read_dword("*IfType")?;
+        if index == 0 || index >= 1 << 24 || kind != IF_TYPE_PROP_VIRTUAL {
+            return None;
+        }
+        // NET_LUID: 24 reserved bits, 24 NetLuidIndex bits, 16 IfType bits.
+        Some((u64::from(kind) << 48) | (u64::from(index) << 24))
+    }
+
+    fn is_retired_wintun(current: &AdapterObservation, historical: WintunName) -> bool {
+        // Xray v26.10.31 passes MD5("vkarmani-tun") as the requested Windows
+        // GUID. The GUID corroborates absence here. It never grants ownership.
+        let requested = guid_bytes(GUID::from_u128(0x9a83a959_4093_3468_b11a_96a80880587e));
+        current.identity.is_wintun()
+            && current.identity.guid == requested
+            && current.media == MediaConnectStateUnknown
+            && [IfOperStatusDown, IfOperStatusNotPresent].contains(&current.oper_status)
+            && matches!(historical, WintunName::Retired { guid, luid }
+                if guid == current.identity.guid && luid == current.identity.luid)
     }
 
     enum AdapterSnapshot {
@@ -578,6 +657,12 @@ mod windows {
         let named_device = match named_device {
             WintunName::Missing => None,
             WintunName::Unique(guid) => Some(guid),
+            WintunName::Retired { .. } => {
+                return Err(
+                    "TUN_INTERFACE_SNAPSHOT_INCONSISTENT: present query returned a retired node"
+                        .into(),
+                )
+            }
             WintunName::Duplicate => {
                 return Err(
                     "TUN_INTERFACE_DUPLICATE_WINTUN_NAME: multiple present devices match".into(),
@@ -685,7 +770,32 @@ mod windows {
         // transition time to settle. An incomplete pair never authorizes reuse.
         let deadline = Instant::now() + Duration::from_secs(2);
         wait_for_adapter_snapshot(
-            || reconcile_wintun_name(observe_windows_alias()?, named_wintun_device()?, starting),
+            || {
+                let current = observe_windows_alias()?;
+                let present = named_wintun_device(true)?;
+                if let Some(row) = current.as_ref().filter(|row| {
+                    !starting
+                        && matches!(present, WintunName::Missing)
+                        && row.media == MediaConnectStateUnknown
+                        && row.identity.is_wintun()
+                }) {
+                    if is_retired_wintun(row, named_wintun_device(false)?) {
+                        verify_idle_configuration(row, true)?;
+                        let same = observe_windows_alias()?.is_some_and(|after| {
+                            after.index == row.index
+                                && after.identity == row.identity
+                                && after.media == row.media
+                                && after.oper_status == row.oper_status
+                        });
+                        if same && matches!(named_wintun_device(true)?, WintunName::Missing) {
+                            // This is a retained Windows row, with no openable
+                            // device. Permit ordinary creation, never reuse.
+                            return Ok(AdapterSnapshot::Absent);
+                        }
+                    }
+                }
+                reconcile_wintun_name(current, present, starting)
+            },
             || {
                 if Instant::now() >= deadline {
                     return false;
@@ -790,7 +900,10 @@ mod windows {
 
     // Xray may replace interface addresses and DNS at start and flush routes at
     // close. Even an owned interface may have externally configured state.
-    fn verify_idle_configuration(current: &AdapterObservation) -> Result<(), String> {
+    fn verify_idle_configuration(
+        current: &AdapterObservation,
+        retired: bool,
+    ) -> Result<(), String> {
         let luid = current.identity.luid;
         let mut addresses = null_mut();
         let status = unsafe { GetUnicastIpAddressTable(AF_UNSPEC, &mut addresses) };
@@ -810,7 +923,9 @@ mod windows {
             }
             .iter()
             .filter(|row| unsafe { row.InterfaceLuid.Value == luid })
-            .all(|row| row.InterfaceIndex == current.index && expected_idle_address(row));
+            .all(|row| {
+                !retired && row.InterfaceIndex == current.index && expected_idle_address(row)
+            });
         unsafe { FreeMibTable(addresses.cast()) };
 
         let mut routes = null_mut();
@@ -831,16 +946,25 @@ mod windows {
             }
             .iter()
             .filter(|row| unsafe { row.InterfaceLuid.Value == luid })
-            .all(|row| row.InterfaceIndex == current.index && row.Protocol == MIB_IPPROTO_LOCAL);
+            .all(|row| {
+                !retired && row.InterfaceIndex == current.index && row.Protocol == MIB_IPPROTO_LOCAL
+            });
         unsafe { FreeMibTable(routes.cast()) };
 
-        let dns = read_interface_dns(current.index, luid).map_err(|error| {
-            format!(
-                "TUN_INTERFACE_DNS_UNCONFIRMED: {error}; {}",
-                current.details()
-            )
-        })?;
-        let dns_ok = dns.is_empty() || dns == TUN_DNS;
+        let dns_ok = if retired {
+            // A retained NDIS row must have neither IP interface. Do not
+            // substitute absent DNS data from GetAdaptersAddresses for this.
+            interface_row(luid, AF_INET).0 == ERROR_NOT_FOUND
+                && interface_row(luid, AF_INET6).0 == ERROR_NOT_FOUND
+        } else {
+            let dns = read_interface_dns(current.index, luid).map_err(|error| {
+                format!(
+                    "TUN_INTERFACE_DNS_UNCONFIRMED: {error}; {}",
+                    current.details()
+                )
+            })?;
+            dns.is_empty() || dns == TUN_DNS
+        };
         if !addresses_ok || !routes_ok || !dns_ok {
             return Err(format!(
                 "TUN_INTERFACE_CONFIGURATION_UNKNOWN: expected addresses={addresses_ok}, local routes only={routes_ok}, expected DNS={dns_ok}; {}",
@@ -871,7 +995,7 @@ mod windows {
         let Some(current) = observe_reusable_adapter(app)? else {
             return Ok(None);
         };
-        verify_idle_configuration(&current)?;
+        verify_idle_configuration(&current, false)?;
         let after = observe_adapter(false)?
             .ok_or("TUN_INTERFACE_OWNER_UNKNOWN: alias disappeared during admission")?;
         if after.identity != current.identity
@@ -1137,10 +1261,37 @@ mod windows {
     }
 
     #[test]
+    fn tun_adapter_retired_row_requires_nonpresent_matching_pnp_generation() {
+        let (mut row, _) = adapter_fixture();
+        row.identity.guid = guid_bytes(GUID::from_u128(0x9a83a959_4093_3468_b11a_96a80880587e));
+        row.identity.luid = 14918723538255872;
+        row.media = MediaConnectStateUnknown;
+        row.oper_status = IfOperStatusDown;
+        let historical = WintunName::Retired {
+            guid: row.identity.guid,
+            luid: row.identity.luid,
+        };
+        assert!(is_retired_wintun(&row, historical));
+        assert!(!is_retired_wintun(
+            &row,
+            WintunName::Unique(row.identity.guid)
+        ));
+        assert!(!is_retired_wintun(&row, WintunName::Duplicate));
+        row.identity.luid += 1 << 24;
+        assert!(!is_retired_wintun(&row, historical));
+        row.identity.luid -= 1 << 24;
+        row.media = MediaConnectStateConnected;
+        assert!(!is_retired_wintun(&row, historical));
+        row.media = MediaConnectStateUnknown;
+        row.oper_status = IfOperStatusUp;
+        assert!(!is_retired_wintun(&row, historical));
+    }
+
+    #[test]
     fn tun_adapter_pnp_enumeration_is_read_only() {
         // Query the same device property as WintunOpenAdapter without loading
         // wintun.dll or triggering its orphan cleanup. No adapter is required.
-        named_wintun_device().unwrap();
+        named_wintun_device(true).unwrap();
     }
 
     #[test]
