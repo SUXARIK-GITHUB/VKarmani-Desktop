@@ -117,7 +117,8 @@ Assert-WindowsX64Pe $WintunPath 'wintun.dll'
 
 Write-Host '[xray-check] Running xray.exe version...'
 try {
-  & $XrayPath version
+  $versionOutput = @(& $XrayPath version)
+  $versionOutput | Write-Host
 } catch {
   throw "xray.exe failed to run on this Windows runner: $($_.Exception.Message). The release workflow must run scripts/fetch-xray-windows.ps1 before verification/build so the installer contains an official Windows x64 Xray-core binary."
 }
@@ -125,4 +126,9 @@ try {
 if ($LASTEXITCODE -ne 0) {
   throw "xray.exe version failed with exit code $LASTEXITCODE"
 }
-Write-Host '[xray-check] OK: xray.exe version runs on Windows runner'
+$manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$version = ([string]$manifest.xrayCoreVersion) -creplace '^v', ''
+if ($version -cnotmatch '^\d+\.\d+\.\d+$' -or $versionOutput[0] -cnotmatch ('^Xray ' + [regex]::Escape($version) + ' .*windows/amd64\)$')) {
+  throw "Bundled Xray version does not match core-manifest.json"
+}
+Write-Host '[xray-check] OK: xray.exe version matches core-manifest.json'

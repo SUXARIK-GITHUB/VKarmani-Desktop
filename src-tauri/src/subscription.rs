@@ -276,7 +276,7 @@ fn verify_stored_subscription(key: &str, now: u64) -> Result<Option<u64>, Subscr
             url,
             Some("application/json".into()),
             Some(format!(
-                "Xray/26.4.25 VKarmani-Desktop/{}",
+                "Xray/26.10.31 VKarmani-Desktop/{}",
                 env!("CARGO_PKG_VERSION")
             )),
             deadline,

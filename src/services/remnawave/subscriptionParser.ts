@@ -1421,7 +1421,6 @@ function buildStreamFromStructuredOptions(base: {
   const fingerprint = pickString(source, ['fp', 'fingerprint', 'client-fingerprint', 'clientFingerprint', 'securityOptions.fingerprint', 'tlsSettings.fingerprint', 'realitySettings.fingerprint']);
   const publicKey = pickString(source, ['publicKey', 'public-key', 'pbk', 'securityOptions.publicKey', 'securityOptions.public-key', 'reality-opts.public-key', 'realityOpts.publicKey', 'realitySettings.publicKey']);
   const shortId = pickString(source, ['shortId', 'short-id', 'sid', 'securityOptions.shortId', 'securityOptions.short-id', 'reality-opts.short-id', 'realityOpts.shortId', 'realitySettings.shortId']);
-  const spiderX = pickString(source, ['spiderX', 'spider-x', 'spx', 'securityOptions.spiderX', 'securityOptions.spider-x', 'realitySettings.spiderX']);
   const alpn = parseListValue(pickStructuredValue(source, ['alpn', 'securityOptions.alpn', 'tlsSettings.alpn']));
 
   if (base.network) params.set('type', base.network);
@@ -1430,7 +1429,6 @@ function buildStreamFromStructuredOptions(base: {
   if (fingerprint) params.set('fp', fingerprint);
   if (publicKey) params.set('pbk', publicKey);
   if (shortId) params.set('sid', shortId);
-  if (spiderX) params.set('spx', spiderX);
   if (alpn.length) params.set('alpn', alpn.join(','));
 
   const transportHost = firstDefinedString(
@@ -1486,6 +1484,27 @@ function buildRuntimeFromStructuredProxy(proxyValue: unknown, label: string): Xr
   const protocolOptions = pickRecord(proxyValue, ['protocolOptions', 'protocolSettings', 'protocol_options', 'settings']);
   const transportOptions = pickRecord(proxyValue, ['transportOptions', 'transportSettings', 'transport_options']);
   const securityOptions = pickRecord(proxyValue, ['securityOptions', 'securitySettings', 'security_options']);
+  const reality = pickRecord(proxyValue, ['realitySettings', 'streamSettings.realitySettings', 'reality-opts', 'realityOpts']);
+  const spiderX = [proxyValue.spiderX, proxyValue['spider-x'], proxyValue.spx,
+    securityOptions.spiderX, securityOptions['spider-x'], securityOptions.spx,
+    reality.spiderX, reality['spider-x'], reality.spx].find(value => typeof value === 'string');
+  const realityPassword = [securityOptions.password, reality.password].find(value => typeof value === 'string');
+  const finalmask = [getPathValue(proxyValue, 'streamSettings.finalmask'), proxyValue.finalmask,
+    transportOptions.finalmask].find(value => value !== undefined);
+  const finishOutbound = (outbound: Record<string, unknown>) => {
+    const result = compactObject(outbound);
+    const stream = isRecord(result.streamSettings) ? result.streamSettings : {};
+    if (finalmask !== undefined) {
+      // Provider JSON is opaque here: compaction would change empty values and arrays.
+      stream.finalmask = finalmask;
+      result.streamSettings = stream;
+    }
+    if (stream.security === 'reality' && isRecord(stream.realitySettings)) {
+      if (spiderX !== undefined) stream.realitySettings.spiderX = spiderX;
+      if (realityPassword !== undefined) stream.realitySettings.password = realityPassword;
+    }
+    return result;
+  };
   const mergedSource = compactObject({
     ...proxyValue,
     protocolOptions,
@@ -1546,7 +1565,7 @@ function buildRuntimeFromStructuredProxy(proxyValue: unknown, label: string): Xr
       protocol: 'vless',
       remarks: label,
       transport: network as XrayRuntimeTemplate['transport'],
-      outbound: compactObject({
+      outbound: finishOutbound({
         tag: 'proxy',
         protocol: 'vless',
         settings: {
@@ -1583,7 +1602,7 @@ function buildRuntimeFromStructuredProxy(proxyValue: unknown, label: string): Xr
       protocol: 'vmess',
       remarks: label,
       transport: network as XrayRuntimeTemplate['transport'],
-      outbound: compactObject({
+      outbound: finishOutbound({
         tag: 'proxy',
         protocol: 'vmess',
         settings: {
@@ -1620,7 +1639,7 @@ function buildRuntimeFromStructuredProxy(proxyValue: unknown, label: string): Xr
       protocol: 'trojan',
       remarks: label,
       transport: network as XrayRuntimeTemplate['transport'],
-      outbound: compactObject({
+      outbound: finishOutbound({
         tag: 'proxy',
         protocol: 'trojan',
         settings: {
@@ -1649,7 +1668,7 @@ function buildRuntimeFromStructuredProxy(proxyValue: unknown, label: string): Xr
       protocol: 'shadowsocks',
       remarks: label,
       transport: 'raw',
-      outbound: compactObject({
+      outbound: finishOutbound({
         tag: 'proxy',
         protocol: 'shadowsocks',
         settings: {
@@ -1674,7 +1693,7 @@ function buildRuntimeFromStructuredProxy(proxyValue: unknown, label: string): Xr
       protocol: 'hysteria2',
       remarks: label,
       transport: 'udp',
-      outbound: compactObject({
+      outbound: finishOutbound({
         tag: 'proxy',
         protocol: 'hysteria',
         settings: {
