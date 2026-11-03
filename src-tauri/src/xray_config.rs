@@ -347,7 +347,12 @@ fn merge_stats_policy(config: &mut Value) {
             .and_then(Value::as_object_mut)
             .expect("policy object created");
         for flag in flags {
-            map.entry((*flag).to_string()).or_insert(json!(true));
+            if matches!(*flag, "statsInboundUplink" | "statsInboundDownlink") {
+                // The runtime replaces provider inbounds with its own listeners.
+                set_client_owned_xray_field(map, flag, json!(true));
+            } else {
+                map.entry((*flag).to_string()).or_insert(json!(true));
+            }
         }
     }
     if config.get("stats").map_or(true, Value::is_null) {
@@ -571,6 +576,84 @@ fn build_from_full_xray_config_template(
     set_client_owned_xray_field(api, "services", json!(["StatsService"]));
     merge_stats_policy(&mut config);
     Some(config)
+}
+
+// Older Xray translated transportLayer=true to this exact dialer setting.
+// The protocol-layer path is equivalent only for an unmodified RAW socket.
+fn migrate_legacy_outbound_dialers(config: &mut Value) -> Result<(), String> {
+    let Some(outbounds) = config.get_mut("outbounds").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for (index, outbound) in outbounds.iter_mut().enumerate() {
+        let Some(outbound) = outbound.as_object_mut() else {
+            continue;
+        };
+        let error = |reason| format!("XRAY_COMPAT: outbounds[{index}].proxySettings: {reason}");
+        let aliases = |map: &serde_json::Map<String, Value>, field: &str| {
+            map.keys()
+                .any(|key| key != field && xray_json_field_matches(key, field))
+        };
+        if aliases(outbound, "proxySettings") {
+            return Err(error("use canonical field names for a legacy chain"));
+        }
+        let Some(legacy) = outbound.get("proxySettings").filter(|v| !v.is_null()) else {
+            continue;
+        };
+        let legacy = legacy
+            .as_object()
+            .ok_or_else(|| error("expected an object"))?;
+        if legacy
+            .keys()
+            .any(|key| !matches!(key.as_str(), "tag" | "transportLayer"))
+        {
+            return Err(error("unknown legacy chain option"));
+        }
+        let tag = legacy
+            .get("tag")
+            .and_then(Value::as_str)
+            .filter(|tag| !tag.trim().is_empty())
+            .ok_or_else(|| error("missing dialer target"))?
+            .to_owned();
+        let transport_layer = match legacy.get("transportLayer") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| error("expected boolean transportLayer"))?,
+        };
+        if aliases(outbound, "streamSettings") {
+            return Err(error("ambiguous streamSettings"));
+        }
+        let stream = outbound
+            .entry("streamSettings")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| error("invalid streamSettings"))?;
+        if aliases(stream, "sockopt") {
+            return Err(error("ambiguous sockopt"));
+        }
+        if !transport_layer
+            && !stream.iter().all(|(key, value)| match key.as_str() {
+                "network" => matches!(value.as_str(), Some("" | "raw" | "tcp")),
+                "security" => matches!(value.as_str(), Some("" | "none")),
+                _ => false,
+            })
+        {
+            return Err(error(
+                "legacy protocol-layer detour cannot preserve this transport",
+            ));
+        }
+        let socket = stream
+            .entry("sockopt")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| error("invalid sockopt"))?;
+        if socket.contains_key("dialerProxy") || aliases(socket, "dialerProxy") {
+            return Err(error("conflicts with sockopt.dialerProxy"));
+        }
+        socket.insert("dialerProxy".into(), json!(tag));
+        outbound.remove("proxySettings");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -970,7 +1053,7 @@ pub(crate) fn build_xray_config_with_plan(
             "settings": {}
         });
 
-        if let Some(full_runtime_config) = build_from_full_xray_config_template(
+        if let Some(mut full_runtime_config) = build_from_full_xray_config_template(
             template,
             full_config,
             inbounds.clone(),
@@ -984,6 +1067,7 @@ pub(crate) fn build_xray_config_with_plan(
                 send_through_ip,
             },
         ) {
+            migrate_legacy_outbound_dialers(&mut full_runtime_config)?;
             validate_runtime_transport_fields(&full_runtime_config)?;
             return Ok((full_runtime_config, plan, routing_exclusion_plan));
         }
@@ -1531,6 +1615,59 @@ mod fragment_compat_tests {
             }
         }
     }
+    #[test]
+    fn legacy_cascade_migrates_only_equivalent_transports_and_keeps_the_source_graph() {
+        let mut source = fixture();
+        source["outbounds"][1]["proxySettings"] = json!({"tag":"pool-raw", "transportLayer":true});
+        source["outbounds"][1]["streamSettings"]["sockopt"] = json!({"tcpKeepAliveIdle": 60});
+        let input = template(source.clone());
+        let (runtime, _, _) =
+            build_xray_config(&input, "proxy", "ipv4", None, &[], None, None).unwrap();
+        let mut expected = source["outbounds"][1].clone();
+        expected.as_object_mut().unwrap().remove("proxySettings");
+        expected["streamSettings"]["sockopt"]["dialerProxy"] = json!("pool-raw");
+        assert_eq!(runtime["outbounds"][1], expected);
+        assert_eq!(runtime["outbounds"][0], source["outbounds"][0]);
+        assert_eq!(input.full_config.as_ref(), Some(&source));
+
+        source["outbounds"][1]["proxySettings"] = json!({"tag":"pool-raw"});
+        let error = build_xray_config(
+            &template(source.clone()),
+            "proxy",
+            "ipv4",
+            None,
+            &[],
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("legacy protocol-layer detour cannot preserve this transport"));
+        source["outbounds"][1]["streamSettings"] = json!({"network":"raw", "security":"none"});
+        let (runtime, _, _) = build_xray_config(
+            &template(source.clone()),
+            "proxy",
+            "ipv4",
+            None,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            runtime["outbounds"][1]["streamSettings"]["sockopt"]["dialerProxy"],
+            "pool-raw"
+        );
+
+        source["outbounds"][1]["proxySettings"]["transportLayer"] = json!(true);
+        source["outbounds"][1]["streamSettings"]["sockopt"]["dialerProxy"] = json!("pool-ws");
+        assert!(
+            build_xray_config(&template(source), "proxy", "ipv4", None, &[], None, None)
+                .err()
+                .unwrap()
+                .contains("conflicts with sockopt.dialerProxy")
+        );
+    }
     #[cfg(target_os = "windows")]
     fn core_test(runtime: &Value) -> Result<(), String> {
         let core =
@@ -1587,11 +1724,16 @@ mod fragment_compat_tests {
     #[test]
     fn pinned_core_compiles_masks_and_reality_without_starting_tun_or_network() {
         let _fixture = HELPER_TEST_LOCK.lock().unwrap();
-        for chained in [false, true] {
+        for chain in [None, Some("modern"), Some("legacy")] {
             let mut source = fixture();
-            if chained {
-                source["outbounds"][1]["streamSettings"]["sockopt"] =
-                    json!({"dialerProxy":"pool-raw"});
+            if let Some(chain) = chain {
+                if chain == "legacy" {
+                    source["outbounds"][1]["proxySettings"] =
+                        json!({"tag":"pool-raw", "transportLayer":true});
+                } else {
+                    source["outbounds"][1]["streamSettings"]["sockopt"] =
+                        json!({"dialerProxy":"pool-raw"});
+                }
                 let reality = source["outbounds"][0]["streamSettings"]["realitySettings"]
                     .as_object_mut()
                     .unwrap();
@@ -1634,6 +1776,12 @@ mod fragment_compat_tests {
                     }
                 }
                 let compiled = compile_without_starting(&runtime).unwrap();
+                if chain.is_some() {
+                    assert_eq!(
+                        runtime["outbounds"][1]["streamSettings"]["sockopt"]["dialerProxy"],
+                        "pool-raw"
+                    );
+                }
                 let primary = compiled["outbound"]
                     .as_array()
                     .unwrap()
@@ -1672,6 +1820,165 @@ mod fragment_compat_tests {
         let (runtime, _, _) =
             build_xray_config(&template(source), "proxy", "ipv4", None, &[], None, None).unwrap();
         assert!(compile_without_starting(&runtime).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "CI-only synthetic loopback transfer; no host runtime"]
+    fn windows_bundled_xray_cascade_stats() {
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+
+        fn socks_connect(stream: &mut TcpStream, expected_port: u16) {
+            let mut greeting = [0; 2];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting[0], 5);
+            let mut methods = vec![0; usize::from(greeting[1])];
+            stream.read_exact(&mut methods).unwrap();
+            assert!(methods.contains(&0));
+            stream.write_all(&[5, 0]).unwrap();
+            let mut connect = [0; 10];
+            stream.read_exact(&mut connect).unwrap();
+            assert_eq!(connect[..8], [5, 1, 0, 1, 127, 0, 0, 1]);
+            assert_eq!(u16::from_be_bytes([connect[8], connect[9]]), expected_port);
+            stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+        }
+
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+        let bind = || TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = |socket: &TcpListener| socket.local_addr().unwrap().port();
+        let entry = bind();
+        entry.set_nonblocking(true).unwrap();
+        let exit = bind(); // Intentionally unserved: bypassing the entry cannot succeed.
+        let target = bind();
+        let (entry_port, exit_port, target_port) = (port(&entry), port(&exit), port(&target));
+        let source = json!({
+            "outbounds": [
+                {"tag":"exit","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":exit_port}]},
+                 "proxySettings":{"tag":"entry","transportLayer":true}},
+                {"tag":"entry","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":entry_port}]}}
+            ],
+            "routing": {
+                "balancers":[{"tag":"synthetic-auto","selector":["exit"],"strategy":{"type":"random"}}],
+                "rules":[{"type":"field","network":"tcp,udp","balancerTag":"synthetic-auto"}]
+            },
+            "policy":{"system":{"statsInboundUplink":false,"statsInboundDownlink":false}}
+        });
+        validate_full_config_graph(&source).unwrap();
+        let mut input = template(source.clone());
+        input.profile_kind = Some("auto".into());
+        input.primary_outbound_tag = Some("exit".into());
+        let (mut runtime, _, _) =
+            build_xray_config(&input, "proxy", "ipv4", None, &[], None, None).unwrap();
+        let tags = client_traffic_inbound_tags(&runtime).unwrap();
+        assert_ne!(tags, ["http-in", "socks-in"]);
+        let reservations = [bind(), bind(), bind()];
+        let ports = reservations.each_ref().map(port);
+        for (inbound, port) in runtime["inbounds"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(ports)
+        {
+            inbound["port"] = json!(port);
+        }
+        let core =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../resources/core/windows/xray.exe");
+        let integrity = prepare_core_launch(&core, None).unwrap();
+        let mut cmd = Command::new(&integrity.core);
+        cmd.args(["run", "-config", "stdin:"])
+            .current_dir(integrity.core.parent().unwrap())
+            .env_remove("XRAY_LOCATION_CONFDIR")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        hide_child_console(&mut cmd);
+        drop(reservations);
+        let mut child = OwnedXrayProcess::attach(cmd.spawn().unwrap()).unwrap();
+        write_owned_stdin(&mut child, Some(serde_json::to_vec(&runtime).unwrap()))
+            .unwrap()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !crate::listener_owner::child_listeners_ready(&mut child, &ports).unwrap() {
+            assert!(Instant::now() < deadline && child.try_wait().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let port_for = |protocol: &str| {
+            runtime["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["protocol"] == protocol)
+                .unwrap()["port"]
+                .as_u64()
+                .unwrap() as u16
+        };
+        let api = port_for("dokodemo-door");
+        let mut totals = TrafficAccumulator::default();
+        let session = totals.start_session().unwrap();
+        let (received, sent) = query_client_stats(&integrity, api, &tags).unwrap();
+        assert_eq!((received, sent), (0, 0));
+        totals
+            .record(session, "fixture".into(), received, sent)
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut stream = loop {
+                match entry.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "entry was not used");
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("loopback accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socks_connect(&mut stream, exit_port);
+            socks_connect(&mut stream, target_port);
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 2048);
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            assert!(request.starts_with(b"GET /fixture "));
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nchain-success").unwrap();
+        });
+        let client = build_http_client(
+            Some(&format!("http://127.0.0.1:{}", port_for("http"))),
+            Duration::from_secs(8),
+        )
+        .unwrap();
+        let response = client
+            .get(format!("http://127.0.0.1:{target_port}/fixture"))
+            .send()
+            .unwrap();
+        assert_eq!(response.text().unwrap(), "chain-success");
+        server.join().unwrap();
+        let (received, sent) = query_client_stats(&integrity, api, &tags).unwrap();
+        assert!(received >= 13 && sent > 0);
+        assert_eq!(
+            totals
+                .record(session, "fixture".into(), received, sent)
+                .unwrap(),
+            (received, sent)
+        );
+        assert!(
+            query_client_stats(&integrity, api, &["http-in".into(), "socks-in".into()]).is_err()
+        );
+        assert!(terminate_child_with_timeout(&mut child, Duration::from_secs(3)).is_some());
+        // Graph, including the old detour field and provider counter preference, was read-only.
+        assert_eq!(input.full_config.as_ref(), Some(&source));
     }
     #[cfg(target_os = "windows")]
     #[test]

@@ -49,27 +49,21 @@ pub(crate) async fn write_routing_log(
 }
 
 #[tauri::command]
-pub(crate) async fn public_ip_snapshot(mode: Option<String>) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || public_ip_snapshot_blocking(mode))
+pub(crate) async fn public_ip_snapshot(
+    mode: Option<String>,
+    app: AppHandle,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || public_ip_snapshot_blocking(mode, app))
         .await
         .map_err(|error| format!("Проверка внешнего IP была прервана: {error}"))?
 }
 
-pub(crate) fn public_ip_snapshot_blocking(mode: Option<String>) -> Result<String, String> {
+fn public_ip_snapshot_blocking(mode: Option<String>, app: AppHandle) -> Result<String, String> {
     let normalized_mode = mode.unwrap_or_else(|| "direct".to_string()).to_lowercase();
 
     if normalized_mode == "runtime" {
-        if !tcp_port_open("127.0.0.1", HTTP_PORT, 1200) {
-            return Err(format!(
-                "HTTP inbound 127.0.0.1:{HTTP_PORT} не отвечает. Сначала запустите runtime."
-            ));
-        }
-
-        let client = build_http_client(
-            Some(&format!("http://127.0.0.1:{HTTP_PORT}")),
-            Duration::from_secs(8),
-        )?;
-        return fetch_public_ip(&client);
+        let probe = connectivity_probe_blocking(app)?;
+        return probe.public_ip.ok_or(probe.message);
     }
 
     let client = build_http_client(None, Duration::from_secs(4))?;
@@ -621,8 +615,12 @@ pub(crate) fn wait_for_xray_runtime_ready(
             } else {
                 format!("Последние строки xray-runtime.log: {log_excerpt}")
             };
+            let binds = crate::listener_owner::describe_listener_binds(
+                child.id(),
+                &[HTTP_PORT, SOCKS_PORT, XRAY_API_PORT],
+            );
             return Err(format!(
-                "Xray запущен, но локальные порты не стали готовы за {} мс ({ports_state}). {details}",
+                "Xray запущен, но локальные порты не стали готовы за {} мс ({ports_state}). {binds}. {details}",
                 timeout.as_millis()
             ));
         }
@@ -944,6 +942,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
 
     let config_text = serde_json::to_string_pretty(&config)
         .map_err(|error| format!("Не удалось сериализовать config: {error}"))?;
+    let traffic_inbound_tags = client_traffic_inbound_tags(&config)?;
     let config_hash = sha256_hex_bytes(config_text.as_bytes());
     _operation_guard.check()?;
     _operation_guard.stage("validating")?;
@@ -1255,6 +1254,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
                 .filter(|value| !value.trim().is_empty()),
             started_at: unix_now_string(),
             telemetry_epoch: next_telemetry_epoch(),
+            traffic_inbound_tags,
             network_mode: normalized_network_mode.clone(),
             tun_interface_name: if normalized_network_mode == "tun" {
                 Some(TUN_INTERFACE_NAME.to_string())
@@ -1908,12 +1908,16 @@ pub(crate) async fn server_ping(
     .map_err(|error| format!("Проверка пинга была прервана: {error}"))?
 }
 
-fn query_client_stats(integrity: &LaunchIntegrity) -> Result<(u64, u64), String> {
+pub(crate) fn query_client_stats(
+    integrity: &LaunchIntegrity,
+    port: u16,
+    owned_tags: &[String; 2],
+) -> Result<(u64, u64), String> {
     let mut command = Command::new(integrity.core.as_path());
     command.args([
         "api",
         "statsquery",
-        &format!("--server=127.0.0.1:{XRAY_API_PORT}"),
+        &format!("--server=127.0.0.1:{port}"),
         "-pattern",
         "inbound>>>",
     ]);
@@ -1922,7 +1926,7 @@ fn query_client_stats(integrity: &LaunchIntegrity) -> Result<(u64, u64), String>
         Duration::from_millis(1400),
         "xray readonly statsquery",
     )?;
-    parse_client_inbound_stats(&raw)
+    parse_client_inbound_stats(&raw, owned_tags)
 }
 
 #[tauri::command]
@@ -1955,16 +1959,20 @@ pub(crate) fn traffic_snapshot_blocking(
     let state = app.state::<AppState>();
     // Serialize bounded queries without blocking runtime/operation ownership locks.
     let mut totals = state.traffic.try_lock().map_err(|_| "TRAFFIC_BUSY")?;
-    let (runtime_id, mode, integrity) = {
+    let (runtime_id, mode, integrity, inbound_tags) = {
         let mut runtime = state.runtime.lock().map_err(|_| "TRAFFIC_RUNTIME_LOCK")?;
         let item = runtime.as_mut().ok_or("TRAFFIC_NO_RUNTIME")?;
         if !matches!(item.child.try_wait(), Ok(None)) {
             return Err("TRAFFIC_RUNTIME_EXITED".into());
         }
+        if item.network_mode == "proxy" {
+            crate::listener_owner::require_proxy_runtime_ready(&mut item.child, &[XRAY_API_PORT])?;
+        }
         (
             traffic_runtime_id(item),
             item.network_mode.clone(),
             item.child.integrity_lease(),
+            item.traffic_inbound_tags.clone(),
         )
     };
     let measured = if mode == "tun" {
@@ -1972,7 +1980,7 @@ pub(crate) fn traffic_snapshot_blocking(
     } else {
         integrity
             .ok_or("TRAFFIC_NO_INTEGRITY".into())
-            .and_then(|lease| query_client_stats(&lease))
+            .and_then(|lease| query_client_stats(&lease, XRAY_API_PORT, &inbound_tags))
             .map(|(received, sent)| (runtime_id.clone(), received, sent))
     };
     let mut runtime = state.runtime.lock().map_err(|_| "TRAFFIC_RUNTIME_LOCK")?;
@@ -1988,6 +1996,12 @@ pub(crate) fn traffic_snapshot_blocking(
     ) {
         return Err("TRAFFIC_RUNTIME_EXITED".into());
     }
+    if mode == "proxy" {
+        crate::listener_owner::require_proxy_runtime_ready(
+            &mut runtime.as_mut().expect("checked runtime").child,
+            &[XRAY_API_PORT],
+        )?;
+    }
     let source = if mode == "tun" {
         "windows-tun-adapter"
     } else {
@@ -1995,8 +2009,12 @@ pub(crate) fn traffic_snapshot_blocking(
     };
     match measured {
         Ok((key, received, sent)) => {
-            let (received, sent) =
-                totals.record(session_id, format!("{source}:{key}"), received, sent)?;
+            let (received, sent) = totals.record(
+                session_id,
+                format!("{source}:{runtime_id}:{key}"),
+                received,
+                sent,
+            )?;
             Ok(TrafficSnapshot {
                 baseline_changed: totals.baseline_changed,
                 received_bytes: received,

@@ -17,6 +17,7 @@ pub(crate) struct ManagedCore {
     pub(crate) server_fingerprint: Option<String>,
     pub(crate) started_at: String,
     pub(crate) telemetry_epoch: u64,
+    pub(crate) traffic_inbound_tags: [String; 2],
     pub(crate) network_mode: String,
     pub(crate) tun_interface_name: Option<String>,
     pub(crate) tun_server_ips: Vec<String>,

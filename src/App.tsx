@@ -1062,30 +1062,6 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
     }
   }
 
-  async function refreshVpnExternalIp() {
-    try {
-      const ip = await fetchPublicIpSnapshot('runtime');
-      setVpnExternalIp(ip);
-      return ip;
-    } catch {
-      return null;
-    }
-  }
-
-  async function refreshVpnExternalIpWithRetry(attempts = 5, delayMs = 650) {
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-      const ip = await refreshVpnExternalIp();
-      if (ip && ip !== '—') {
-        return ip;
-      }
-      if (attempt < attempts - 1) {
-        await sleep(delayMs);
-      }
-    }
-
-    return null;
-  }
-
   function runPostConnectProbe(server: VpnServer | null) {
     if (!settingsRef.current.probeOnConnect) {
       return;
@@ -1143,14 +1119,21 @@ export default function App({ safeStart = false }: { safeStart?: boolean } = {})
 
   function scheduleVpnIpRefreshForServer(serverId: string, fallbackIp?: string) {
     const ipProbeId = ++vpnIpProbeSeqRef.current;
-    void refreshVpnExternalIpWithRetry().then((resolvedVpnIp) => {
-      if (vpnIpProbeSeqRef.current !== ipProbeId || connectedServerIdRef.current !== serverId) {
-        return;
+    const isCurrent = () => vpnIpProbeSeqRef.current === ipProbeId
+      && connectedServerIdRef.current === serverId
+      && connectionStateRef.current === 'connected';
+    void (async () => {
+      for (let attempt = 0; attempt < 5 && isCurrent(); attempt += 1) {
+        const ip = await fetchPublicIpSnapshot('runtime').catch(() => null);
+        if (!isCurrent()) return;
+        if (ip && ip !== '—') {
+          setVpnExternalIp(ip);
+          return;
+        }
+        if (attempt < 4) await sleep(650);
       }
-      if (!resolvedVpnIp && fallbackIp) {
-        setVpnExternalIp(fallbackIp);
-      }
-    });
+      if (!isTauriRuntime && isCurrent() && fallbackIp) setVpnExternalIp(fallbackIp);
+    })();
   }
 
   function updateTunnelModePreference(value: AppSettings['tunnelMode']) {

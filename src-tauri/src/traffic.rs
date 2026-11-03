@@ -65,16 +65,38 @@ impl TrafficAccumulator {
     }
 }
 
-pub(crate) fn parse_client_inbound_stats(raw: &str) -> Result<(u64, u64), String> {
+pub(crate) fn client_traffic_inbound_tags(config: &Value) -> Result<[String; 2], String> {
+    let inbounds = config["inbounds"]
+        .as_array()
+        .ok_or("TRAFFIC_INBOUNDS_MISSING")?;
+    let tag = |port: u16, protocol: &str| {
+        inbounds
+            .iter()
+            .find(|inbound| {
+                inbound["port"] == port
+                    && inbound["protocol"] == protocol
+                    && inbound["listen"] == "127.0.0.1"
+            })
+            .and_then(|inbound| inbound["tag"].as_str())
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_owned)
+            .ok_or("TRAFFIC_INBOUND_TAG_MISSING")
+    };
+    Ok([tag(HTTP_PORT, "http")?, tag(SOCKS_PORT, "socks")?])
+}
+
+pub(crate) fn parse_client_inbound_stats(
+    raw: &str,
+    owned_tags: &[String; 2],
+) -> Result<(u64, u64), String> {
     if raw.len() > 256 * 1024 {
         return Err("TRAFFIC_RESPONSE_TOO_LARGE".into());
     }
     let value: Value = serde_json::from_str(raw).map_err(|_| "TRAFFIC_INVALID_JSON")?;
     let object = value.as_object().ok_or("TRAFFIC_INVALID_RESPONSE")?;
-    let empty = Vec::new();
     let stats = match object.get("stat") {
         Some(Value::Array(items)) => items,
-        None if object.is_empty() => &empty, // Valid protobuf JSON: no registered counters yet.
+        None if object.is_empty() => return Err("TRAFFIC_COUNTERS_UNAVAILABLE".into()),
         _ => return Err("TRAFFIC_INVALID_STATS".into()),
     };
     let mut seen = std::collections::HashSet::new();
@@ -87,7 +109,7 @@ pub(crate) fn parse_client_inbound_stats(raw: &str) -> Result<(u64, u64), String
         let parts: Vec<_> = name.split(">>>").collect();
         if parts.len() != 4
             || parts[0] != "inbound"
-            || !matches!(parts[1], "http-in" | "socks-in")
+            || !owned_tags.iter().any(|tag| tag == parts[1])
             || parts[2] != "traffic"
         {
             continue;
@@ -112,6 +134,9 @@ pub(crate) fn parse_client_inbound_stats(raw: &str) -> Result<(u64, u64), String
         } else {
             received = received.checked_add(counter).ok_or("TRAFFIC_OVERFLOW")?;
         }
+    }
+    if seen.len() != owned_tags.len() * 2 {
+        return Err("TRAFFIC_COUNTERS_UNAVAILABLE".into());
     }
     Ok((received, sent))
 }
@@ -145,11 +170,29 @@ pub(crate) fn tun_counters(_alias: &str) -> Result<(String, u64, u64), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn parse(raw: &str) -> Result<(u64, u64), String> {
+        parse_client_inbound_stats(raw, &["http-in".into(), "socks-in".into()])
+    }
     #[test]
     fn client_counters_have_correct_orientation_and_no_outbound_double_count() {
-        let raw = r#"{"stat":[{"name":"inbound>>>http-in>>>traffic>>>uplink","value":"12"},{"name":"inbound>>>socks-in>>>traffic>>>uplink","value":8},{"name":"inbound>>>socks-in>>>traffic>>>downlink","value":"170"},{"name":"outbound>>>proxy>>>traffic>>>uplink","value":"99999"},{"name":"inbound>>>api>>>traffic>>>uplink","value":"99999"}]}"#;
-        assert_eq!(parse_client_inbound_stats(raw).unwrap(), (170, 20));
-        assert_eq!(parse_client_inbound_stats("{}").unwrap(), (0, 0));
+        let raw = r#"{"stat":[{"name":"inbound>>>http-in>>>traffic>>>uplink","value":"12"},{"name":"inbound>>>http-in>>>traffic>>>downlink"},{"name":"inbound>>>socks-in>>>traffic>>>uplink","value":8},{"name":"inbound>>>socks-in>>>traffic>>>downlink","value":"170"},{"name":"outbound>>>proxy>>>traffic>>>uplink","value":"99999"},{"name":"inbound>>>api>>>traffic>>>uplink","value":"99999"}]}"#;
+        assert_eq!(parse(raw).unwrap(), (170, 20));
+        assert_eq!(parse("{}").unwrap_err(), "TRAFFIC_COUNTERS_UNAVAILABLE");
+        assert!(parse(r#"{"stat":[]}"#).is_err());
+        let namespaced = raw
+            .replace("inbound>>>http-in", "inbound>>>__vkarmani.1.http-in")
+            .replace("inbound>>>socks-in", "inbound>>>__vkarmani.1.socks-in");
+        assert_eq!(
+            parse_client_inbound_stats(
+                &namespaced,
+                &[
+                    "__vkarmani.1.http-in".into(),
+                    "__vkarmani.1.socks-in".into()
+                ]
+            ),
+            Ok((170, 20))
+        );
+        assert!(parse(&namespaced).is_err());
     }
     #[test]
     fn malformed_stats_never_become_zero() {
@@ -161,11 +204,11 @@ mod tests {
             "{\"stat\":null}",
             "{\"stat\":[{\"name\":\"inbound>>>http-in>>>traffic>>>uplink\",\"value\":-1}]}",
         ] {
-            assert!(parse_client_inbound_stats(raw).is_err());
+            assert!(parse(raw).is_err());
         }
         let item = r#"{"name":"inbound>>>http-in>>>traffic>>>uplink","value":"1"}"#;
-        assert!(parse_client_inbound_stats(&format!("{{\"stat\":[{item},{item}]}}")).is_err());
-        assert!(parse_client_inbound_stats(&" ".repeat(256 * 1024 + 1)).is_err());
+        assert!(parse(&format!("{{\"stat\":[{item},{item}]}}")).is_err());
+        assert!(parse(&" ".repeat(256 * 1024 + 1)).is_err());
     }
     #[test]
     fn session_preserves_totals_through_reset_switch_and_rejects_old_sessions() {
@@ -230,15 +273,12 @@ mod tests {
                 seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
                 raw.push((32 + (seed % 95) as u8) as char);
             }
-            assert!(parse_client_inbound_stats(&raw).is_err());
+            assert!(parse(&raw).is_err());
         }
         assert_eq!(
-            parse_client_inbound_stats(
-                r#"{"stat":[{"name":"inbound>>>http-in>>>traffic>>>uplink"}]}"#
-            )
-            .unwrap(),
-            (0, 0)
+            parse(r#"{"stat":[{"name":"inbound>>>http-in>>>traffic>>>uplink"}]}"#).unwrap_err(),
+            "TRAFFIC_COUNTERS_UNAVAILABLE"
         );
-        assert!(parse_client_inbound_stats(r#"{"stat":[{"name":"inbound>>>http-in>>>traffic>>>uplink","value":"9223372036854775808"}]}"#).is_err());
+        assert!(parse(r#"{"stat":[{"name":"inbound>>>http-in>>>traffic>>>uplink","value":"9223372036854775808"}]}"#).is_err());
     }
 }

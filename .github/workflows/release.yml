@@ -121,6 +121,7 @@ jobs:
           cargo test --locked --manifest-path src-tauri/Cargo.toml -- --test-threads=1
           # Disposable CI runner only: never opens a socket on the owner's PC.
           cargo test --locked --manifest-path src-tauri/Cargo.toml listener_owner::tests::windows_socket_owner_integration -- --ignored --exact --test-threads=1
+          cargo test --locked --manifest-path src-tauri/Cargo.toml xray_config::fragment_compat_tests::windows_bundled_xray_cascade_stats -- --ignored --exact --test-threads=1
           cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Run Windows runtime smoke checks
@@ -160,6 +161,8 @@ jobs:
             - FinalMask передаётся ядру с исходными значениями и порядком TCP/UDP-масок, QUIC-параметров и последовательностей фрагментации.
             - REALITY получает значение `spiderX` конкретного профиля. Если параметр отсутствует или пуст, VKarmani не подставляет свой путь.
             - В комплекте Xray-core v26.10.31: прежняя версия не поддерживала пофрагментные последовательности `lengths/delays`. Wintun, геоданные и интерфейс не изменились.
+
+            В RC2 исправлено чтение счётчиков полного профиля. Добавлена совместимость с однозначно переносимыми каскадами старого формата и подробности о владельцах портов при таймауте запуска Xray.
 
             На Windows автоматически проверены синтетические конфигурации Proxy и TUN. Реальное подключение к проблемным серверам, регрессия обычных серверов, маршрутизация, DNS и фактическое обновление установленной копии ожидают приёмки владельцем. Используйте этот черновик только для проверки. Публичный Stable — v0.13.86.
 
@@ -219,6 +222,7 @@ jobs:
           cargo check --locked --manifest-path src-tauri/Cargo.toml
           cargo test --locked --manifest-path src-tauri/Cargo.toml -- --test-threads=1
           cargo test --locked --manifest-path src-tauri/Cargo.toml listener_owner::tests::windows_socket_owner_integration -- --ignored --exact --test-threads=1
+          cargo test --locked --manifest-path src-tauri/Cargo.toml xray_config::fragment_compat_tests::windows_bundled_xray_cascade_stats -- --ignored --exact --test-threads=1
           cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Resource helper tests and read-only smoke
         shell: pwsh
