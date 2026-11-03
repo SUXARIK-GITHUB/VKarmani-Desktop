@@ -188,19 +188,35 @@ fn install_routes_with_rollback(
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
-    use windows_sys::Win32::{
-        Foundation::{
-            CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
-            ERROR_NOT_FOUND, FILETIME, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
-        },
-        NetworkManagement::{
-            IpHelper::*,
-            Ndis::{MediaConnectStateConnected, MediaConnectStateDisconnected, NET_LUID_LH},
-        },
-        Networking::WinSock::*,
-        System::Threading::{
-            GetCurrentProcess, GetProcessTimes, OpenProcess, WaitForSingleObject,
-            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    use windows_sys::{
+        core::GUID,
+        Win32::{
+            Devices::{
+                DeviceAndDriverInstallation::{
+                    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+                    SetupDiGetDevicePropertyW, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL,
+                    DIGCF_PRESENT, DIREG_DRV, HDEVINFO, SP_DEVINFO_DATA,
+                },
+                Properties::{DEVPROPKEY, DEVPROP_TYPE_STRING},
+            },
+            Foundation::{
+                CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
+                ERROR_NOT_FOUND, ERROR_NO_MORE_ITEMS, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+                WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+            },
+            NetworkManagement::{
+                IpHelper::*,
+                Ndis::{MediaConnectStateConnected, MediaConnectStateDisconnected, NET_LUID_LH},
+            },
+            Networking::WinSock::*,
+            System::{
+                Com::CLSIDFromString,
+                Registry::{RegCloseKey, RegGetValueW, KEY_QUERY_VALUE, RRF_RT_REG_SZ},
+                Threading::{
+                    GetCurrentProcess, GetProcessTimes, OpenProcess, WaitForSingleObject,
+                    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+                },
+            },
         },
     };
 
@@ -398,6 +414,148 @@ mod windows {
         String::from_utf16_lossy(&field[..end])
     }
 
+    fn guid_bytes(raw: GUID) -> [u8; 16] {
+        let mut guid = [0; 16];
+        guid[..4].copy_from_slice(&raw.data1.to_be_bytes());
+        guid[4..6].copy_from_slice(&raw.data2.to_be_bytes());
+        guid[6..8].copy_from_slice(&raw.data3.to_be_bytes());
+        guid[8..].copy_from_slice(&raw.data4);
+        guid
+    }
+
+    struct DeviceList(HDEVINFO);
+
+    impl Drop for DeviceList {
+        fn drop(&mut self) {
+            unsafe { SetupDiDestroyDeviceInfoList(self.0) };
+        }
+    }
+
+    fn named_wintun_device() -> Result<Option<[u8; 16]>, String> {
+        // WintunOpenAdapter uses this device property, which Windows adapter
+        // renames do not update. Reading it via SetupAPI has no Wintun side effects.
+        const NET_CLASS: GUID = GUID::from_u128(0x4d36e972_e325_11ce_bfc1_08002be10318);
+        const WINTUN_NAME: DEVPROPKEY = DEVPROPKEY {
+            fmtid: GUID::from_u128(0x3361c968_2f2e_4660_b47e_699cdc4c32b9),
+            pid: 3,
+        };
+        let fail = |api, code| format!("TUN_INTERFACE_OWNER_UNKNOWN: {api}: Win32 {code}");
+        let mut matched = None;
+        // The pinned Wintun uses SWD on supported Windows, ROOT on Windows 7.
+        for enumerator in [r"SWD\Wintun", r"ROOT\Wintun"] {
+            let enumerator: Vec<u16> = enumerator.encode_utf16().chain(Some(0)).collect();
+            let devices = unsafe {
+                SetupDiGetClassDevsW(&NET_CLASS, enumerator.as_ptr(), null_mut(), DIGCF_PRESENT)
+            };
+            if devices == INVALID_HANDLE_VALUE as HDEVINFO {
+                return Err(fail("SetupDiGetClassDevsW", win32_error()));
+            }
+            let devices = DeviceList(devices);
+            let mut ended = false;
+            for index in 0..8192 {
+                let mut node: SP_DEVINFO_DATA = unsafe { std::mem::zeroed() };
+                node.cbSize = std::mem::size_of_val(&node) as u32;
+                if unsafe { SetupDiEnumDeviceInfo(devices.0, index, &mut node) } == 0 {
+                    let code = win32_error();
+                    if code != ERROR_NO_MORE_ITEMS {
+                        return Err(fail("SetupDiEnumDeviceInfo", code));
+                    }
+                    ended = true;
+                    break;
+                }
+                let mut name = [0u16; 256];
+                let mut kind = 0;
+                if unsafe {
+                    SetupDiGetDevicePropertyW(
+                        devices.0,
+                        &node,
+                        &WINTUN_NAME,
+                        &mut kind,
+                        name.as_mut_ptr().cast(),
+                        std::mem::size_of_val(&name) as u32,
+                        null_mut(),
+                        0,
+                    )
+                } == 0
+                {
+                    let code = win32_error();
+                    if code == ERROR_NOT_FOUND {
+                        continue; // WintunOpenAdapter also skips nodes without its name.
+                    }
+                    return Err(fail("SetupDiGetDevicePropertyW", code));
+                }
+                if kind != DEVPROP_TYPE_STRING
+                    || !wide_field(&name).eq_ignore_ascii_case(TUN_INTERFACE_NAME)
+                {
+                    continue;
+                }
+                if matched.is_some() {
+                    return Err("TUN_INTERFACE_OWNER_UNKNOWN: duplicate Wintun device name".into());
+                }
+                let key = unsafe {
+                    SetupDiOpenDevRegKey(
+                        devices.0,
+                        &node,
+                        DICS_FLAG_GLOBAL,
+                        0,
+                        DIREG_DRV,
+                        KEY_QUERY_VALUE,
+                    )
+                };
+                if key == INVALID_HANDLE_VALUE {
+                    return Err(fail("SetupDiOpenDevRegKey", win32_error()));
+                }
+                let value: Vec<u16> = "NetCfgInstanceId".encode_utf16().chain(Some(0)).collect();
+                let mut guid = [0u16; 40];
+                let mut bytes = std::mem::size_of_val(&guid) as u32;
+                let status = unsafe {
+                    RegGetValueW(
+                        key,
+                        null(),
+                        value.as_ptr(),
+                        RRF_RT_REG_SZ,
+                        null_mut(),
+                        guid.as_mut_ptr().cast(),
+                        &mut bytes,
+                    )
+                };
+                unsafe { RegCloseKey(key) };
+                if status != 0 {
+                    return Err(fail("NetCfgInstanceId", status));
+                }
+                let mut parsed = GUID::from_u128(0);
+                if bytes != 78
+                    || guid[38] != 0
+                    || unsafe { CLSIDFromString(guid.as_ptr(), &mut parsed) } != 0
+                {
+                    return Err(
+                        "TUN_INTERFACE_OWNER_UNKNOWN: invalid Wintun NetCfgInstanceId".into(),
+                    );
+                }
+                matched = Some(guid_bytes(parsed));
+            }
+            if !ended {
+                return Err("TUN_INTERFACE_TABLE_LIMIT: Wintun devices".into());
+            }
+        }
+        Ok(matched)
+    }
+
+    fn verify_wintun_name(
+        current: Option<&AdapterObservation>,
+        named_device: Option<[u8; 16]>,
+    ) -> Result<(), String> {
+        match (current, named_device) {
+            (None, None) => Ok(()),
+            (Some(current), Some(guid)) if current.identity.guid == guid => Ok(()),
+            (Some(current), _) => Err(format!(
+                "TUN_INTERFACE_OWNER_UNKNOWN: Windows alias and Wintun name identify different devices; {}",
+                current.details()
+            )),
+            (None, Some(_)) => Err("TUN_INTERFACE_OWNER_UNKNOWN: Wintun device exists without matching Windows alias".into()),
+        }
+    }
+
     fn observe_adapter() -> Result<Option<AdapterObservation>, String> {
         let mut table = null_mut();
         let status = unsafe { GetIfTable2(&mut table) };
@@ -405,7 +563,7 @@ mod windows {
             return Err(format!("TUN_INTERFACE_TABLE_UNAVAILABLE: Win32 {status}"));
         }
         let count = unsafe { (*table).NumEntries } as usize;
-        let result = if count <= 8192 {
+        let result: Result<_, String> = if count <= 8192 {
             let rows = unsafe {
                 std::slice::from_raw_parts(
                     std::ptr::addr_of!((*table).Table).cast::<MIB_IF_ROW2>(),
@@ -419,30 +577,24 @@ mod windows {
             if matches.next().is_some() {
                 Err("TUN_INTERFACE_OWNER_UNKNOWN: multiple matching aliases".into())
             } else {
-                Ok(first.map(|row| {
-                    let mut guid = [0; 16];
-                    let raw = row.InterfaceGuid;
-                    guid[..4].copy_from_slice(&raw.data1.to_be_bytes());
-                    guid[4..6].copy_from_slice(&raw.data2.to_be_bytes());
-                    guid[6..8].copy_from_slice(&raw.data3.to_be_bytes());
-                    guid[8..].copy_from_slice(&raw.data4);
-                    AdapterObservation {
-                        identity: AdapterIdentity {
-                            guid,
-                            luid: unsafe { row.InterfaceLuid.Value },
-                            kind: row.Type,
-                            description: wide_field(&row.Description),
-                        },
-                        index: row.InterfaceIndex,
-                        media: row.MediaConnectState,
-                    }
+                Ok(first.map(|row| AdapterObservation {
+                    identity: AdapterIdentity {
+                        guid: guid_bytes(row.InterfaceGuid),
+                        luid: unsafe { row.InterfaceLuid.Value },
+                        kind: row.Type,
+                        description: wide_field(&row.Description),
+                    },
+                    index: row.InterfaceIndex,
+                    media: row.MediaConnectState,
                 }))
             }
         } else {
             Err("TUN_INTERFACE_TABLE_LIMIT".into())
         };
         unsafe { FreeMibTable(table.cast()) };
-        result
+        let observed = result?;
+        verify_wintun_name(observed.as_ref(), named_wintun_device()?)?;
+        Ok(observed)
     }
 
     fn load_adapter_receipt(path: &Path) -> Result<Option<AdapterReceipt>, String> {
@@ -768,6 +920,23 @@ mod windows {
         current.identity.guid[0] ^= 1;
         current.identity.description = "other adapter".into();
         assert!(admit_idle_adapter(&current, Some(&receipt), no_process_lookup).is_err());
+    }
+
+    #[test]
+    fn tun_adapter_admission_checks_the_name_used_by_wintun() {
+        let (current, _) = adapter_fixture();
+        verify_wintun_name(None, None).unwrap();
+        verify_wintun_name(Some(&current), Some(current.identity.guid)).unwrap();
+        assert!(verify_wintun_name(None, Some(current.identity.guid)).is_err());
+        assert!(verify_wintun_name(Some(&current), None).is_err());
+        assert!(verify_wintun_name(Some(&current), Some([5; 16])).is_err());
+    }
+
+    #[test]
+    fn tun_adapter_pnp_enumeration_is_read_only() {
+        // Query the same device property as WintunOpenAdapter without loading
+        // wintun.dll or triggering its orphan cleanup. No adapter is required.
+        named_wintun_device().unwrap();
     }
 
     #[test]
