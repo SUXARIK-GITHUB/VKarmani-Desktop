@@ -38,7 +38,11 @@ pub(crate) fn fetch_public_ip(client: &reqwest::blocking::Client) -> Result<Stri
         .json::<IpifyResponse>()
         .map_err(|error| format!("Не удалось разобрать ответ IP-сервиса: {error}"))?;
 
-    Ok(payload.ip)
+    payload
+        .ip
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.to_string())
+        .map_err(|_| "IP-сервис не вернул корректный IP-адрес.".into())
 }
 
 pub(crate) fn reveal_main_window(app: &AppHandle) {

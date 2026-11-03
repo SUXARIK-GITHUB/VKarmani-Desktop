@@ -1,11 +1,14 @@
 param(
   [string]$ProjectDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
-  [string]$XrayVersion = 'v26.4.25',
+  [string]$XrayVersion = 'v26.10.31',
   [string]$ExpectedZipSha256 = '',
   [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
+if ($XrayVersion -eq 'v26.10.31' -and -not $ExpectedZipSha256) {
+  $ExpectedZipSha256 = '2e04a9995a6f2ad1b28c0bb25c708ecb2695e43a1c9c7889c4b6ac2b48cf7a6a'
+}
 
 $coreDir = Join-Path $ProjectDir 'resources\core\windows'
 $manifestPath = Join-Path $coreDir 'core-manifest.json'

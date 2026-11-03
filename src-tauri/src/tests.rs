@@ -85,7 +85,9 @@ mod regression_cases {
     fn rejects_obsolete_text_stats_output() {
         let output =
             "stat: <\n  name: \"outbound>>>proxy>>>traffic>>>downlink\"\n  value: 123456\n>";
-        assert!(parse_client_inbound_stats(output).is_err()); // Old text output is not the bundled core JSON contract.
+        assert!(
+            parse_client_inbound_stats(output, &["http-in".into(), "socks-in".into()]).is_err()
+        ); // Old text output is not the bundled core JSON contract.
     }
 
     fn full_template(config: Value, kind: &str) -> RuntimeTemplate {

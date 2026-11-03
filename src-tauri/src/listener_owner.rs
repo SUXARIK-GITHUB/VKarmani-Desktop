@@ -1,10 +1,18 @@
 // Read-only readiness: reachability alone cannot establish who bound a port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListenerBind {
+    Missing,
+    OwnedLoopback,
+    OwnedWildcard,
+    Foreign(u32),
+}
+
 #[cfg(any(target_os = "windows", test))]
-fn table_has_owned_loopback_listeners(
+fn table_listener_binds(
     bytes: &[u8],
     expected_pid: u32,
     ports: &[u16],
-) -> Result<bool, String> {
+) -> Result<Vec<ListenerBind>, String> {
     const ROW_BYTES: usize = 24; // MIB_TCPROW_OWNER_PID: six DWORD fields
     let invalid = || "XRAY_LISTENER_TABLE_INVALID".to_string();
     let count =
@@ -18,7 +26,7 @@ fn table_has_owned_loopback_listeners(
     }
     let loopback = u32::from_ne_bytes([127, 0, 0, 1]);
     let rows = &bytes[4..end];
-    let mut found = vec![false; ports.len()];
+    let mut found = vec![ListenerBind::Missing; ports.len()];
     for row in rows.chunks_exact(ROW_BYTES) {
         let word = |offset| u32::from_ne_bytes(row[offset..offset + 4].try_into().unwrap());
         let address = word(4);
@@ -28,18 +36,52 @@ fn table_has_owned_loopback_listeners(
         }
         for (index, required) in ports.iter().enumerate() {
             if port == *required {
-                if word(20) != expected_pid {
-                    return Ok(false);
+                let pid = word(20);
+                if pid != expected_pid {
+                    found[index] = ListenerBind::Foreign(pid);
+                } else if !matches!(found[index], ListenerBind::Foreign(_)) {
+                    if address == loopback {
+                        found[index] = ListenerBind::OwnedLoopback;
+                    } else if found[index] == ListenerBind::Missing {
+                        found[index] = ListenerBind::OwnedWildcard;
+                    }
                 }
-                // A wildcard-only bind is not the private loopback bind we asked for.
-                found[index] |= address == loopback;
             }
         }
     }
-    Ok(found.into_iter().all(|ready| ready))
+    Ok(found)
 }
 
 pub(crate) fn owned_loopback_listeners_ready(pid: u32, ports: &[u16]) -> Result<bool, String> {
+    Ok(listener_binds(pid, ports)?
+        .into_iter()
+        .all(|bind| bind == ListenerBind::OwnedLoopback))
+}
+
+pub(crate) fn describe_listener_binds(pid: u32, ports: &[u16]) -> String {
+    match listener_binds(pid, ports) {
+        Ok(binds) => {
+            let ports = ports
+                .iter()
+                .zip(binds)
+                .map(|(port, bind)| {
+                    let status = match bind {
+                        ListenerBind::Missing => "missing".into(),
+                        ListenerBind::OwnedLoopback => "owned-loopback".into(),
+                        ListenerBind::OwnedWildcard => "owned-wildcard".into(),
+                        ListenerBind::Foreign(owner) => format!("foreign-pid-{owner}"),
+                    };
+                    format!("{port}={status}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("IPv4 child PID {pid}: {ports}")
+        }
+        Err(error) => format!("IPv4 child PID {pid}: {error}"),
+    }
+}
+
+fn listener_binds(pid: u32, ports: &[u16]) -> Result<Vec<ListenerBind>, String> {
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::{
@@ -76,7 +118,7 @@ pub(crate) fn owned_loopback_listeners_ready(pid: u32, ports: &[u16]) -> Result<
                 let bytes = unsafe {
                     std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), size as usize)
                 };
-                return table_has_owned_loopback_listeners(bytes, pid, ports);
+                return table_listener_binds(bytes, pid, ports);
             }
             if code != ERROR_INSUFFICIENT_BUFFER {
                 return Err(format!("XRAY_LISTENER_TABLE_FAILED: {code}"));
@@ -136,6 +178,15 @@ fn retained_child_alive(child: &mut std::process::Child) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn table_has_owned_loopback_listeners(
+        bytes: &[u8],
+        pid: u32,
+        ports: &[u16],
+    ) -> Result<bool, String> {
+        Ok(table_listener_binds(bytes, pid, ports)?
+            .into_iter()
+            .all(|bind| bind == ListenerBind::OwnedLoopback))
+    }
     fn table(rows: &[[u32; 6]]) -> Vec<u8> {
         let mut bytes = (rows.len() as u32).to_ne_bytes().to_vec();
         for row in rows {
@@ -230,6 +281,28 @@ mod tests {
         for (pid, ports) in [(0, vec![10808]), (44, vec![]), (44, vec![0])] {
             assert!(table_has_owned_loopback_listeners(&table(&[]), pid, &ports).is_err());
         }
+    }
+
+    #[test]
+    fn diagnostics_distinguish_a_partial_bind_without_marking_it_ready() {
+        let rows = table(&[
+            listener(44, [127, 0, 0, 1], 10808),
+            listener(44, [0; 4], 10809),
+            listener(99, [127, 0, 0, 1], 10810),
+        ]);
+        assert_eq!(
+            table_listener_binds(&rows, 44, &[10808, 10809, 10810, 10811]),
+            Ok(vec![
+                ListenerBind::OwnedLoopback,
+                ListenerBind::OwnedWildcard,
+                ListenerBind::Foreign(99),
+                ListenerBind::Missing
+            ])
+        );
+        assert_eq!(
+            table_has_owned_loopback_listeners(&rows, 44, &[10808, 10809, 10810, 10811]),
+            Ok(false)
+        );
     }
     #[test]
     fn reused_pid_or_exit_after_snapshot_cannot_pass_a_dead_retained_child() {
@@ -371,6 +444,7 @@ mod tests {
                 server_fingerprint: None,
                 started_at: "synthetic-start".into(),
                 telemetry_epoch: 1,
+                traffic_inbound_tags: ["http-in".into(), "socks-in".into()],
                 network_mode: "proxy".into(),
                 tun_interface_name: None,
                 tun_server_ips: Vec::new(),
@@ -392,6 +466,13 @@ mod tests {
         );
         drop(socket);
         assert_eq!(owned_loopback_listeners_ready(pid, &[port]), Ok(false));
+        let ipv6 = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).unwrap();
+        assert_eq!(
+            owned_loopback_listeners_ready(pid, &[ipv6.local_addr().unwrap().port()]),
+            Ok(false),
+            "an IPv6-only loopback cannot satisfy the requested IPv4 bind"
+        );
+        drop(ipv6);
         let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let occupied_port = occupied.local_addr().unwrap().port();
         let (mut rejected, messages) = spawn_fixture(occupied_port);

@@ -53,14 +53,16 @@ try {
             version = 2
             auth = 'vkarmani-hy2-test-password'
           }
-          udpmasks = @(
-            [ordered]@{
-              type = 'salamander'
-              settings = [ordered]@{
-                password = 'vkarmani-hy2-obfs-password'
+          finalmask = [ordered]@{
+            udp = @(
+              [ordered]@{
+                type = 'salamander'
+                settings = [ordered]@{
+                  password = 'vkarmani-hy2-obfs-password'
+                }
               }
-            }
-          )
+            )
+          }
         }
       },
       [ordered]@{

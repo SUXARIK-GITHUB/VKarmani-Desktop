@@ -621,8 +621,12 @@ fn wait_for_restarted_xray_ready(
             } else {
                 format!("Последние строки xray-runtime.log: {log_excerpt}")
             };
+            let binds = crate::listener_owner::describe_listener_binds(
+                child.id(),
+                &[HTTP_PORT, SOCKS_PORT, XRAY_API_PORT],
+            );
             return Err(format!(
-                "Xray был перезапущен, но локальные порты не стали готовы за {} секунд. {details}",
+                "Xray был перезапущен, но локальные порты не стали готовы за {} секунд. {binds}. {details}",
                 timeout.as_secs()
             ));
         }
