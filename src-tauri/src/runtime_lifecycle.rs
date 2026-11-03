@@ -668,7 +668,7 @@ impl Drop for PreparedNetworkConfig {
         }
     }
 }
-fn current_physical_binding() -> Result<DefaultRouteSnapshot, String> {
+pub(crate) fn current_physical_binding() -> Result<DefaultRouteSnapshot, String> {
     #[cfg(target_os = "windows")]
     {
         default_route_snapshot()
@@ -923,11 +923,17 @@ fn try_self_restart_xray_runtime(
         let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
         return Err(Box::new((runtime, error)));
     }
-    if runtime.network_mode == "tun"
-        && current_physical_binding().ok().as_ref() != runtime.physical_binding.as_ref()
-    {
-        let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
-        return Err(Box::new((runtime, "NETWORK_CHANGED_DURING_RESTART".into())));
+    if runtime.network_mode == "tun" {
+        if let Err(error) = confirm_tun_physical_binding(
+            runtime.physical_binding.as_ref(),
+            current_physical_binding(),
+        ) {
+            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+            return Err(Box::new((
+                runtime,
+                format!("NETWORK_CHANGED_DURING_RESTART: {error}"),
+            )));
+        }
     }
     // Routes/binding checks may outlive the first readiness snapshot. A dead
     // replacement must not be published as connected after that setup window.

@@ -1191,6 +1191,9 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         })?;
         std::thread::sleep(Duration::from_millis(250));
         confirm_tun_routes_ready(&app)?;
+        // Xray v26.10.31 can keep its listeners alive while rejecting dials
+        // bound to a physical interface that changed after preflight.
+        confirm_tun_physical_binding(physical_route.as_ref(), current_physical_binding())?;
         let _ = append_runtime_event(
             &app,
             "TUN routes confirmed; per-process TCP/UDP egress not measured.",

@@ -26,6 +26,19 @@ pub(crate) enum OwnedRecoveryOutcome<T> {
     Started,
     Failed(Box<(T, String)>),
 }
+
+pub(crate) fn confirm_tun_physical_binding(
+    expected: Option<&DefaultRouteSnapshot>,
+    observed: Result<DefaultRouteSnapshot, String>,
+) -> Result<(), String> {
+    let expected = expected.ok_or("NETWORK_TUN_BINDING_UNAVAILABLE")?;
+    let observed = observed?;
+    if &observed != expected {
+        return Err("NETWORK_TUN_BINDING_CHANGED".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn run_owned_recovery<T>(
     mut runtime: T,
     stop: impl FnOnce(&mut T) -> bool,
@@ -256,6 +269,28 @@ mod tests {
             source_ip: "192.0.2.12".into(),
             next_hop: "192.0.2.1".into(),
             dns_servers: vec!["192.0.2.53".into()],
+        }
+    }
+    #[test]
+    fn publication_rejects_missing_and_stale_physical_socket_bindings() {
+        let expected = binding();
+        assert!(confirm_tun_physical_binding(Some(&expected), Ok(expected.clone())).is_ok());
+        assert!(confirm_tun_physical_binding(None, Ok(expected.clone())).is_err());
+        assert!(
+            confirm_tun_physical_binding(Some(&expected), Err("NETWORK_ROUTE_CHANGED".into()))
+                .is_err()
+        );
+        let mut renamed = expected.clone();
+        renamed.interface_alias.push_str(" 2");
+        let mut recycled = expected.clone();
+        recycled.interface_luid += 1;
+        let mut dhcp = expected.clone();
+        dhcp.source_ip = "192.0.2.13".into();
+        for changed in [renamed, recycled, dhcp] {
+            assert_eq!(
+                confirm_tun_physical_binding(Some(&expected), Ok(changed)).unwrap_err(),
+                "NETWORK_TUN_BINDING_CHANGED"
+            );
         }
     }
     #[test]
