@@ -136,6 +136,21 @@ fn enable_transaction(
     Ok(journal)
 }
 
+fn enable_ready_transaction(
+    backend: &mut impl ProxyBackend,
+    previous: Option<ProxyJournal>,
+    confirm_runtime: impl FnOnce() -> Result<(), String>,
+) -> Result<ProxyJournal, String> {
+    let journal = enable_transaction(backend, previous)?;
+    if let Err(error) = confirm_runtime() {
+        return match restore_transaction(backend, &journal) {
+            Ok(_) => Err(error),
+            Err(cleanup) => Err(format!("PROXY_CLEANUP_INCOMPLETE: {error}; {cleanup}")),
+        };
+    }
+    Ok(journal)
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn read_wininet_settings() -> Result<ProxySettings, String> {
     use windows_sys::Win32::Networking::WinInet::*;
@@ -342,9 +357,12 @@ impl ProxyBackend for NativeProxyBackend<'_> {
         Ok(())
     }
 }
-pub(crate) fn enable_owned_windows_proxy(app: &AppHandle) -> Result<ProxyStatus, String> {
+pub(crate) fn enable_owned_windows_proxy(
+    app: &AppHandle,
+    confirm_runtime: impl FnOnce() -> Result<(), String>,
+) -> Result<ProxyStatus, String> {
     let mut backend = NativeProxyBackend { app };
-    let journal = enable_transaction(&mut backend, load_journal(app)?)?;
+    let journal = enable_ready_transaction(&mut backend, load_journal(app)?, confirm_runtime)?;
     Ok(journal.target.status())
 }
 pub(crate) fn restore_owned_windows_proxy(app: &AppHandle) -> Result<Option<ProxyStatus>, String> {
@@ -377,6 +395,17 @@ pub(crate) fn windows_proxy_ownership_state(app: &AppHandle) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn losing_runtime_during_activation_restores_original_pac_and_clears_journal() {
+        let mut fake = backend();
+        let original = fake.current.clone();
+        let error =
+            enable_ready_transaction(&mut fake, None, || Err("PROXY_RUNTIME_EXITED".into()))
+                .unwrap_err();
+        assert_eq!(error, "PROXY_RUNTIME_EXITED");
+        assert_eq!(fake.current, original);
+        assert!(fake.journal.is_none());
+    }
     #[test]
     #[cfg(windows)]
     fn proxy_journal_missing_locked_corrupt_and_oversize_stay_distinct() {

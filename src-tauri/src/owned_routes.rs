@@ -33,6 +33,8 @@ struct RouteEntry {
 struct RouteJournal {
     version: u8,
     owner_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_created_at: Option<u64>,
     entries: Vec<RouteEntry>,
 }
 
@@ -179,14 +181,131 @@ fn install_routes_with_rollback(
 mod windows {
     use super::*;
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND},
+        Foundation::{
+            CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
+            ERROR_NOT_FOUND, FILETIME, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        },
         NetworkManagement::{IpHelper::*, Ndis::NET_LUID_LH},
         Networking::WinSock::*,
         System::Threading::{
-            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_SYNCHRONIZE,
+            GetCurrentProcess, GetProcessTimes, OpenProcess, WaitForSingleObject,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
         },
     };
+
+    struct ProcessHandle(HANDLE);
+
+    impl Drop for ProcessHandle {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn win32_error() -> u32 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32
+    }
+
+    fn process_created_at(handle: HANDLE) -> Result<u64, u32> {
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+        if unsafe { GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) } == 0
+        {
+            return Err(win32_error());
+        }
+        Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum OwnerObservation {
+        Exited,
+        Running,
+        IdentityOnly(u64),
+        Unknown(&'static str, u32),
+    }
+
+    fn open_owner(pid: u32, access: u32) -> Result<ProcessHandle, u32> {
+        let handle = unsafe { OpenProcess(access, 0, pid) };
+        if handle.is_null() {
+            return Err(win32_error());
+        }
+        Ok(ProcessHandle(handle))
+    }
+
+    fn owner_observation(pid: u32, created_at: Option<u64>) -> OwnerObservation {
+        let handle = match open_owner(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)
+        {
+            Ok(handle) => handle,
+            Err(ERROR_INVALID_PARAMETER) => return OwnerObservation::Exited,
+            Err(ERROR_ACCESS_DENIED) if created_at.is_some() => {
+                // Query-only can prove PID reuse, never that the same owner exited.
+                return match open_owner(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+                    Ok(handle) => match process_created_at(handle.0) {
+                        Ok(created) => OwnerObservation::IdentityOnly(created),
+                        Err(code) => OwnerObservation::Unknown("GetProcessTimes", code),
+                    },
+                    Err(ERROR_INVALID_PARAMETER) => OwnerObservation::Exited,
+                    Err(code) => OwnerObservation::Unknown("OpenProcess(query)", code),
+                };
+            }
+            Err(code) => return OwnerObservation::Unknown("OpenProcess", code),
+        };
+        match unsafe { WaitForSingleObject(handle.0, 0) } {
+            WAIT_OBJECT_0 => OwnerObservation::Exited,
+            WAIT_TIMEOUT if created_at.is_some() => match process_created_at(handle.0) {
+                Ok(created) if Some(created) != created_at => {
+                    OwnerObservation::IdentityOnly(created)
+                }
+                Ok(_) => OwnerObservation::Running,
+                Err(code) => OwnerObservation::Unknown("GetProcessTimes", code),
+            },
+            WAIT_TIMEOUT => OwnerObservation::Running,
+            WAIT_FAILED => OwnerObservation::Unknown("WaitForSingleObject", win32_error()),
+            code => OwnerObservation::Unknown("WaitForSingleObject result", code),
+        }
+    }
+
+    fn verify_previous_owner(
+        journal: &RouteJournal,
+        observe: impl FnOnce(u32, Option<u64>) -> OwnerObservation,
+    ) -> Result<(), String> {
+        let pid = journal.owner_pid;
+        let current_pid = std::process::id();
+        if pid == 0 || journal.owner_created_at == Some(0) {
+            return Err("ROUTE_OWNER_UNKNOWN: invalid journal owner identity".into());
+        }
+        if pid == current_pid {
+            // A live PID is unique. This version can only have written a
+            // journal with a generation, so a legacy record cannot be a rival.
+            return Ok(());
+        }
+        let details =
+            format!(
+            "ownerPID={pid}, currentPID={current_pid}, ownerCreatedAt={:?}, entries={}, LUID={:?}",
+            journal.owner_created_at,
+            journal.entries.len(),
+            journal.entries.first().map(|entry| entry.route.interface_luid),
+        );
+        match observe(pid, journal.owner_created_at) {
+            OwnerObservation::Exited => Ok(()),
+            OwnerObservation::IdentityOnly(created)
+                if journal.owner_created_at.is_some_and(|owner| owner != created) =>
+            {
+                Ok(())
+            }
+            OwnerObservation::Running => Err(format!(
+                "ROUTE_OWNER_ACTIVE: предыдущий owner process ещё активен. {details}"
+            )),
+            OwnerObservation::IdentityOnly(_) => Err(format!(
+                "ROUTE_OWNER_UNKNOWN: невозможно проверить завершение предыдущего process. Win32 {ERROR_ACCESS_DENIED}; {details}"
+            )),
+            OwnerObservation::Unknown(operation, code) => Err(format!(
+                "ROUTE_OWNER_UNKNOWN: невозможно проверить предыдущий process. {operation}: Win32 {code}; {details}"
+            )),
+        }
+    }
 
     pub(super) fn interface_identity(index: u32) -> Result<(u64, String), String> {
         let mut row: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };
@@ -352,27 +471,7 @@ mod windows {
         {
             return Err("Route journal invalid".into());
         }
-        if journal.owner_pid != std::process::id() {
-            // Conservatively refuse when a previous owner may still exist. No PID termination.
-            let handle = unsafe {
-                OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                    0,
-                    journal.owner_pid,
-                )
-            };
-            if !handle.is_null() {
-                let alive = unsafe { WaitForSingleObject(handle, 0) } != 0;
-                unsafe {
-                    CloseHandle(handle);
-                }
-                if alive {
-                    return Err("ROUTE_OWNER_ACTIVE: предыдущий owner process ещё активен.".into());
-                }
-            } else if std::io::Error::last_os_error().raw_os_error() != Some(87) {
-                return Err("ROUTE_OWNER_UNKNOWN: невозможно проверить предыдущий process.".into());
-            }
-        }
+        verify_previous_owner(&journal, owner_observation)?;
         // Lookup by the stored LUID, never by a stale/recycled index.
         for entry in &journal.entries {
             verify_owned_interface(entry.route.interface_luid)?;
@@ -409,6 +508,11 @@ mod windows {
         let mut journal = RouteJournal {
             version: 1,
             owner_pid: std::process::id(),
+            owner_created_at: Some(
+                process_created_at(unsafe { GetCurrentProcess() }).map_err(|code| {
+                    format!("ROUTE_OWNER_UNKNOWN: GetProcessTimes: Win32 {code}")
+                })?,
+            ),
             entries: Vec::new(),
         };
         install_routes_with_rollback(&mut backend, &mut journal, &routes)
@@ -450,6 +554,7 @@ mod windows {
             .save(&RouteJournal {
                 version: 1,
                 owner_pid: child.id(),
+                owner_created_at: None,
                 entries: vec![],
             })
             .unwrap();
@@ -458,11 +563,61 @@ mod windows {
             .unwrap_err()
             .starts_with("ROUTE_OWNER_ACTIVE:"));
         assert_eq!(fs::read(&backend.path).unwrap(), original);
+        let handle = open_owner(child.id(), PROCESS_QUERY_LIMITED_INFORMATION).unwrap();
+        let actual = process_created_at(handle.0).unwrap();
+        let mut journal = RouteJournal {
+            version: 1,
+            owner_pid: child.id(),
+            owner_created_at: Some(actual),
+            entries: vec![],
+        };
+        backend.save(&journal).unwrap();
+        assert!(load(&backend)
+            .unwrap_err()
+            .starts_with("ROUTE_OWNER_ACTIVE:"));
+        // Exercise real OpenProcess/GetProcessTimes on a live process that
+        // stands in for a recycled PID. Do not open or mutate any routes.
+        journal.owner_created_at = Some(actual - 1);
+        backend.save(&journal).unwrap();
+        assert_eq!(
+            load(&backend).unwrap().unwrap().owner_created_at,
+            Some(actual - 1)
+        );
+        drop(handle);
         assert!(terminate_child_with_timeout(&mut child, Duration::from_secs(2)).is_some());
         assert!(load(&backend).unwrap().unwrap().entries.is_empty());
         drop(child);
         backend.clear().unwrap();
         fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn uncertain_previous_owner_preserves_the_journal_and_distinguishes_win32_errors() {
+        let mut journal = RouteJournal {
+            version: 1,
+            owner_pid: u32::MAX,
+            owner_created_at: Some(42),
+            entries: vec![],
+        };
+        for code in [5, 32, 33] {
+            let error = verify_previous_owner(&journal, |_, _| {
+                OwnerObservation::Unknown("OpenProcess", code)
+            })
+            .unwrap_err();
+            assert!(error.starts_with("ROUTE_OWNER_UNKNOWN:"));
+            assert!(error.contains(&format!("Win32 {code}")));
+        }
+        assert!(
+            verify_previous_owner(&journal, |_, _| OwnerObservation::IdentityOnly(42)).is_err()
+        );
+        assert!(verify_previous_owner(&journal, |_, _| OwnerObservation::IdentityOnly(43)).is_ok());
+        assert!(verify_previous_owner(&journal, |_, _| OwnerObservation::Exited).is_ok());
+        journal.owner_created_at = None;
+        assert!(
+            verify_previous_owner(&journal, |_, _| OwnerObservation::IdentityOnly(43)).is_err()
+        );
+        journal.owner_pid = 0;
+        assert!(verify_previous_owner(&journal, |_, _| panic!("invalid PID was queried")).is_err());
     }
     #[test]
     fn route_journal_reader_refuses_linked_journal_without_trusting_it() {
@@ -476,6 +631,7 @@ mod windows {
         let journal = RouteJournal {
             version: 1,
             owner_pid: std::process::id(),
+            owner_created_at: None,
             entries: vec![],
         };
         let encrypted = encrypt_access_key(&serde_json::to_string(&journal).unwrap()).unwrap();
@@ -509,6 +665,7 @@ mod windows {
         let journal = RouteJournal {
             version: 1,
             owner_pid: std::process::id(),
+            owner_created_at: None,
             entries: vec![],
         };
         let encrypted = encrypt_access_key(&serde_json::to_string(&journal).unwrap()).unwrap();
@@ -567,6 +724,28 @@ pub(crate) fn configure_tun_routes(
         Err("Windows TUN only".into())
     }
 }
+
+pub(crate) fn confirm_tun_routes_ready(app: &AppHandle) -> Result<(), String> {
+    let (status, routes) = owned_route_summary(app);
+    if status == "confirmed" && complete_tun_route_set(&routes) {
+        return Ok(());
+    }
+    Err(format!(
+        "TUN_ROUTES_NOT_READY: ownership={status}, recorded={}",
+        routes.len()
+    ))
+}
+
+fn complete_tun_route_set(routes: &[OwnedRoute]) -> bool {
+    routes.len() == 4
+        && routes.iter().all(|route| {
+            valid_owned_route(route) && route.interface_luid == routes[0].interface_luid
+        })
+        && ["0.0.0.0", "128.0.0.0", "::", "8000::"]
+            .iter()
+            .all(|destination| routes.iter().any(|route| route.destination == *destination))
+}
+
 fn route_journal_status(backend: &mut impl RouteBackend, journal: &RouteJournal) -> &'static str {
     if journal.entries.iter().any(|entry| !entry.applied) {
         return "unconfirmed";
@@ -922,6 +1101,7 @@ mod tests {
         let journal = RouteJournal {
             version: 1,
             owner_pid: std::process::id(),
+            owner_created_at: None,
             entries: vec![RouteEntry {
                 route: owned.clone(),
                 applied: true,
@@ -938,7 +1118,7 @@ mod tests {
         OwnedRoute {
             destination: ip.into(),
             prefix: 1,
-            next_hop: "0.0.0.0".into(),
+            next_hop: if ip.contains(':') { "::" } else { "0.0.0.0" }.into(),
             interface_index: 14,
             interface_luid: 14000,
             metric: 6,
@@ -949,6 +1129,7 @@ mod tests {
         RouteJournal {
             version: 1,
             owner_pid: 1,
+            owner_created_at: None,
             entries: vec![],
         }
     }
@@ -1073,6 +1254,17 @@ mod tests {
             mutate(&mut changed);
             assert!(!same_owned_route(&expected, &changed));
         }
+    }
+
+    #[test]
+    fn ready_requires_all_four_routes_on_one_interface_generation() {
+        let mut routes = ["0.0.0.0", "128.0.0.0", "::", "8000::"].map(route);
+        assert!(complete_tun_route_set(&routes));
+        assert!(!complete_tun_route_set(&routes[..3]));
+        routes[2].interface_luid += 1;
+        assert!(!complete_tun_route_set(&routes));
+        routes[2] = routes[3].clone();
+        assert!(!complete_tun_route_set(&routes));
     }
     #[test]
     fn successful_exact_restore_100_cycles_no_foreign_routes_deleted() {

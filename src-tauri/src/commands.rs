@@ -972,7 +972,9 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         "connect_preflight",
     )?;
     let mut failed_connect = FailedConnectRollback::new(|| {
-        let _ = restore_saved_proxy_state(&app, &state, "connect_failed_after_stop");
+        if let Err(error) = restore_saved_proxy_state(&app, &state, "connect_failed_after_stop") {
+            let _ = append_runtime_event(&app, &format!("PROXY_CLEANUP_INCOMPLETE: {error}"));
+        }
         if let Ok(mut connected) = state.connected.lock() {
             *connected = false;
         }
@@ -980,6 +982,11 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
             *label = None;
         }
     });
+    if normalized_network_mode == "tun" {
+        cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &outbound_ips).map_err(|error| {
+            format!("Не удалось подготовить Windows-маршруты для TUN режима: {error}")
+        })?;
+    }
     if let Err(first_release_error) = wait_for_runtime_ports_release(if reconnect_requested {
         Duration::from_secs(6)
     } else {
@@ -1174,46 +1181,29 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
                 "Xray runtime не стал готовым после запуска, выполняю аварийную очистку: {error}"
             ),
         );
-        clear_starting_runtime(&state, child_pid);
-        let _ = cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &outbound_ips);
-        let _ = restore_saved_proxy_state(&app, &state, "connect_readiness_failed");
-        let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
-        remove_startup_runtime_config(&app, &config_path, "runtime_readiness_failed");
         return Err(error);
     }
 
     if normalized_network_mode == "tun" {
         _operation_guard.stage("configuring-routes")?;
         configure_tun_routes(&app, TUN_INTERFACE_NAME, &outbound_ips).map_err(|error| {
-            clear_starting_runtime(&state, child_pid);
-            let _ = cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &outbound_ips);
-            let _ = restore_saved_proxy_state(&app, &state, "tun_routes_failed");
-            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
-            remove_startup_runtime_config(&app, &config_path, "tun_routes_failed");
             format!("Не удалось подготовить Windows-маршруты для TUN режима: {error}")
         })?;
-        let _ = append_runtime_event(
-            &app,
-            "Owned IPv4/IPv6 split routes applied; unselected traffic DIRECT.",
-        );
         std::thread::sleep(Duration::from_millis(250));
+        confirm_tun_routes_ready(&app)?;
         let _ = append_runtime_event(
             &app,
-            "TUN маршруты применены и стабилизированы для текущего сеанса.",
+            "TUN routes confirmed; per-process TCP/UDP egress not measured.",
         );
     }
 
     if let Some(status) = child.try_wait().map_err(|error| {
         format!("Не удалось проверить Xray перед завершением подключения: {error}")
     })? {
-        clear_starting_runtime(&state, child_pid);
         let code = status.code();
         if let Ok(mut exit_guard) = state.last_exit_code.lock() {
             *exit_guard = code;
         }
-        let _ = cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &outbound_ips);
-        let _ = restore_saved_proxy_state(&app, &state, "connect_final_check_failed");
-        remove_startup_runtime_config(&app, &config_path, "xray_stopped_before_ready_final_check");
         return Err(format!(
             "Xray остановился до завершения подключения. Exit code: {:?}. Подключение не было помечено активным.",
             code
@@ -1674,6 +1664,9 @@ pub(crate) fn set_system_proxy_blocking(
         let runtime = runtime
             .as_mut()
             .ok_or("Сначала запустите runtime, затем включайте системный proxy.")?;
+        if runtime.network_mode != "proxy" {
+            return Err("PROXY_RUNTIME_MODE_MISMATCH".into());
+        }
         crate::listener_owner::require_proxy_runtime_ready(
             &mut runtime.child,
             &[HTTP_PORT, SOCKS_PORT, XRAY_API_PORT],
@@ -1683,7 +1676,15 @@ pub(crate) fn set_system_proxy_blocking(
     }
 
     let status = if enabled {
-        enable_owned_windows_proxy(&app)?
+        enable_owned_windows_proxy(&app, || {
+            _operation_guard.check()?;
+            connectivity_probe_runtime_identity(
+                &state,
+                None,
+                &[HTTP_PORT, SOCKS_PORT, XRAY_API_PORT],
+            )
+            .map(|_| ())
+        })?
     } else {
         match restore_saved_proxy_state(&app, &state, "manual_proxy_toggle")? {
             Some(restored) => restored,
@@ -1750,7 +1751,7 @@ pub(crate) fn connectivity_probe_runtime_identity(
     state: &AppState,
     expected: Option<&str>,
     ports: &[u16],
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let mut runtime = state
         .runtime
         .lock()
@@ -1762,14 +1763,19 @@ pub(crate) fn connectivity_probe_runtime_identity(
     }
     crate::listener_owner::require_proxy_runtime_ready(&mut runtime.child, ports)
         .map_err(|error| format!("CONNECTIVITY_RUNTIME_NOT_READY: {error}"))?;
-    Ok(identity)
+    Ok((identity, runtime.network_mode == "tun"))
 }
 
 pub(crate) fn connectivity_probe_blocking(app: AppHandle) -> Result<ConnectivityProbe, String> {
     let state = app.state::<AppState>();
     let ports = [HTTP_PORT, SOCKS_PORT, XRAY_API_PORT];
-    let identity = connectivity_probe_runtime_identity(&state, None, &ports)?;
+    let (identity, tun) = connectivity_probe_runtime_identity(&state, None, &ports)?;
     let checked_at = unix_now_string();
+    if tun {
+        // Explicit HTTP proxy ingress is a different Xray routing path.
+        // A request here would not exercise the Windows app's TUN policy.
+        return Ok(unverified_tun_probe(checked_at));
+    }
     let http_port_open = tcp_port_open("127.0.0.1", HTTP_PORT, 1200);
     let socks_port_open = tcp_port_open("127.0.0.1", SOCKS_PORT, 1200);
 
@@ -1811,6 +1817,28 @@ pub(crate) fn connectivity_probe_blocking(app: AppHandle) -> Result<Connectivity
         packet_loss_pct: None,
         message: "Маршрут через локальный Xray runtime отвечает.".into(),
     })
+}
+
+fn unverified_tun_probe(checked_at: String) -> ConnectivityProbe {
+    ConnectivityProbe {
+        success: false,
+        checked_at,
+        http_port_open: true,
+        socks_port_open: true,
+        public_ip: None,
+        latency_ms: None,
+        packet_loss_pct: None,
+        message: "TUN_EGRESS_UNVERIFIED: локальные порты Xray готовы, трафик приложений через TUN не проверен.".into(),
+    }
+}
+
+#[test]
+fn owned_listeners_do_not_publish_tun_egress_or_a_public_ip() {
+    let probe = unverified_tun_probe("test".into());
+    assert!(probe.http_port_open && probe.socks_port_open);
+    assert!(!probe.success);
+    assert_eq!(probe.public_ip, None);
+    assert_eq!(probe.latency_ms, None);
 }
 
 pub(crate) fn server_ping_blocking(

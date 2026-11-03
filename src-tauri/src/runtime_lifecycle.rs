@@ -83,16 +83,35 @@ impl Drop for PendingXray {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
             let pid = child.id();
-            let _ = terminate_child_with_timeout(child, Duration::from_secs(3));
+            let stopped = terminate_child_with_timeout(child, Duration::from_secs(3)).is_some();
             child.release_integrity();
             let state = self.app.state::<AppState>();
-            clear_starting_runtime(&state, pid);
-            if self.network_mode == "tun" {
-                let _ =
-                    cleanup_tun_routes_for_app(&self.app, TUN_INTERFACE_NAME, &self.tun_server_ips);
+            if stopped {
+                clear_starting_runtime(&state, pid);
+                if self.network_mode == "tun" {
+                    if let Err(error) = cleanup_tun_routes_for_app(
+                        &self.app,
+                        TUN_INTERFACE_NAME,
+                        &self.tun_server_ips,
+                    ) {
+                        let _ = append_runtime_event(
+                            &self.app,
+                            &format!("ROUTE_CLEANUP_INCOMPLETE: {error}"),
+                        );
+                    }
+                }
+                let _ = fs::remove_file(&self.config_path);
+            } else {
+                let _ = append_runtime_event(
+                    &self.app,
+                    "PROCESS_STOP_UNCONFIRMED: pending Xray exited without confirmed cleanup",
+                );
             }
-            let _ = restore_saved_proxy_state(&self.app, &state, "pending_start_failed");
-            let _ = fs::remove_file(&self.config_path);
+            if let Err(error) = restore_saved_proxy_state(&self.app, &state, "pending_start_failed")
+            {
+                let _ =
+                    append_runtime_event(&self.app, &format!("PROXY_CLEANUP_INCOMPLETE: {error}"));
+            }
         }
     }
 }
@@ -890,6 +909,10 @@ fn try_self_restart_xray_runtime(
             )));
         }
         std::thread::sleep(Duration::from_millis(250));
+        if let Err(error) = confirm_tun_routes_ready(app) {
+            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+            return Err(Box::new((runtime, error)));
+        }
         let _ = append_runtime_event(
             app,
             "TUN маршруты повторно применены после автоматического перезапуска Xray.",
@@ -964,14 +987,16 @@ fn finalize_unexpected_xray_exit(
     reason: &str,
 ) {
     if runtime.network_mode == "tun" {
-        let _ = cleanup_tun_routes_for_app(
+        if let Err(error) = cleanup_tun_routes_for_app(
             app,
             runtime
                 .tun_interface_name
                 .as_deref()
                 .unwrap_or(TUN_INTERFACE_NAME),
             &runtime.tun_server_ips,
-        );
+        ) {
+            let _ = append_runtime_event(app, &format!("ROUTE_CLEANUP_INCOMPLETE: {error}"));
+        }
     }
     runtime.child.release_integrity();
     let _ = fs::remove_file(Path::new(&runtime.config_path));
@@ -994,7 +1019,9 @@ fn finalize_unexpected_xray_exit(
             reason
         ),
     );
-    let _ = restore_saved_proxy_state(app, state, "xray_exit");
+    if let Err(error) = restore_saved_proxy_state(app, state, "xray_exit") {
+        let _ = append_runtime_event(app, &format!("PROXY_CLEANUP_INCOMPLETE: {error}"));
+    }
     let _ = app.emit("vkarmani://native-disconnect", "stopped");
     refresh_tray_menu(app);
 }
