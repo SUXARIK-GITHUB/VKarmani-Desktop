@@ -206,7 +206,10 @@ mod windows {
             },
             NetworkManagement::{
                 IpHelper::*,
-                Ndis::{MediaConnectStateConnected, MediaConnectStateDisconnected, NET_LUID_LH},
+                Ndis::{
+                    IfOperStatusUp, MediaConnectStateConnected, MediaConnectStateDisconnected,
+                    MediaConnectStateUnknown, NET_LUID_LH,
+                },
             },
             Networking::WinSock::*,
             System::{
@@ -391,6 +394,7 @@ mod windows {
         identity: AdapterIdentity,
         index: u32,
         media: i32,
+        oper_status: i32,
     }
 
     impl AdapterObservation {
@@ -398,12 +402,24 @@ mod windows {
             let AdapterIdentity {
                 guid, luid, kind, ..
             } = self.identity;
-            let guid: String = guid.iter().map(|byte| format!("{byte:02x}")).collect();
+            let guid = canonical_guid(guid);
             format!(
-                "alias={TUN_INTERFACE_NAME}, GUID={guid}, LUID={luid}, index={}, ifType={kind}, Wintun={}, media={}",
-                self.index, self.identity.is_wintun(), self.media,
+                "alias={TUN_INTERFACE_NAME}, GUID={guid}, LUID={luid}, index={}, ifType={kind}, Wintun={}, media={}, operStatus={}",
+                self.index, self.identity.is_wintun(), self.media, self.oper_status,
             )
         }
+    }
+
+    fn canonical_guid(guid: [u8; 16]) -> String {
+        let hex: String = guid.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        )
     }
 
     fn wide_field(field: &[u16]) -> String {
@@ -431,7 +447,14 @@ mod windows {
         }
     }
 
-    fn named_wintun_device() -> Result<Option<[u8; 16]>, String> {
+    #[derive(Clone, Copy)]
+    enum WintunName {
+        Missing,
+        Unique([u8; 16]),
+        Duplicate,
+    }
+
+    fn named_wintun_device() -> Result<WintunName, String> {
         // WintunOpenAdapter uses this device property, which Windows adapter
         // renames do not update. Reading it via SetupAPI has no Wintun side effects.
         const NET_CLASS: GUID = GUID::from_u128(0x4d36e972_e325_11ce_bfc1_08002be10318);
@@ -490,7 +513,7 @@ mod windows {
                     continue;
                 }
                 if matched.is_some() {
-                    return Err("TUN_INTERFACE_OWNER_UNKNOWN: duplicate Wintun device name".into());
+                    return Ok(WintunName::Duplicate);
                 }
                 let key = unsafe {
                     SetupDiOpenDevRegKey(
@@ -538,25 +561,86 @@ mod windows {
                 return Err("TUN_INTERFACE_TABLE_LIMIT: Wintun devices".into());
             }
         }
-        Ok(matched)
+        Ok(matched.map_or(WintunName::Missing, WintunName::Unique))
     }
 
-    fn verify_wintun_name(
-        current: Option<&AdapterObservation>,
-        named_device: Option<[u8; 16]>,
-    ) -> Result<(), String> {
+    enum AdapterSnapshot {
+        Absent,
+        Matched(AdapterObservation),
+        Pending(String),
+    }
+
+    fn reconcile_wintun_name(
+        current: Option<AdapterObservation>,
+        named_device: WintunName,
+        starting: bool,
+    ) -> Result<AdapterSnapshot, String> {
+        let named_device = match named_device {
+            WintunName::Missing => None,
+            WintunName::Unique(guid) => Some(guid),
+            WintunName::Duplicate => {
+                return Err(
+                    "TUN_INTERFACE_DUPLICATE_WINTUN_NAME: multiple present devices match".into(),
+                );
+            }
+        };
         match (current, named_device) {
-            (None, None) => Ok(()),
-            (Some(current), Some(guid)) if current.identity.guid == guid => Ok(()),
-            (Some(current), _) => Err(format!(
-                "TUN_INTERFACE_OWNER_UNKNOWN: Windows alias and Wintun name identify different devices; {}",
+            (None, None) => Ok(AdapterSnapshot::Absent),
+            (Some(current), Some(guid)) if current.identity.guid == guid => {
+                Ok(AdapterSnapshot::Matched(current))
+            }
+            (Some(current), Some(guid)) => Err(format!(
+                "TUN_INTERFACE_GUID_CONFLICT: PnP NetCfgInstanceId={}; Windows {}",
+                canonical_guid(guid),
                 current.details()
             )),
-            (None, Some(_)) => Err("TUN_INTERFACE_OWNER_UNKNOWN: Wintun device exists without matching Windows alias".into()),
+            (Some(current), None) => {
+                let details = format!(
+                    "no present Wintun device returned for Windows {}",
+                    current.details()
+                );
+                if current.identity.is_wintun()
+                    && (starting
+                        || (current.media == MediaConnectStateUnknown
+                            && current.oper_status != IfOperStatusUp))
+                {
+                    Ok(AdapterSnapshot::Pending(details))
+                } else {
+                    Err(format!("TUN_INTERFACE_PNP_MISSING: {details}"))
+                }
+            }
+            (None, Some(guid)) => {
+                let details = format!(
+                    "present Wintun NetCfgInstanceId={} without matching Windows alias",
+                    canonical_guid(guid)
+                );
+                if starting {
+                    Ok(AdapterSnapshot::Pending(details))
+                } else {
+                    Err(format!("TUN_INTERFACE_ALIAS_MISSING: {details}"))
+                }
+            }
         }
     }
 
-    fn observe_adapter() -> Result<Option<AdapterObservation>, String> {
+    fn wait_for_adapter_snapshot(
+        mut snapshot: impl FnMut() -> Result<AdapterSnapshot, String>,
+        mut wait_for_change: impl FnMut() -> bool,
+    ) -> Result<Option<AdapterObservation>, String> {
+        loop {
+            match snapshot()? {
+                AdapterSnapshot::Absent => return Ok(None),
+                AdapterSnapshot::Matched(current) => return Ok(Some(current)),
+                AdapterSnapshot::Pending(details) => {
+                    if !wait_for_change() {
+                        return Err(format!("TUN_INTERFACE_SNAPSHOT_PENDING: {details}"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn observe_windows_alias() -> Result<Option<AdapterObservation>, String> {
         let mut table = null_mut();
         let status = unsafe { GetIfTable2(&mut table) };
         if status != 0 || table.is_null() {
@@ -586,15 +670,30 @@ mod windows {
                     },
                     index: row.InterfaceIndex,
                     media: row.MediaConnectState,
+                    oper_status: row.OperStatus,
                 }))
             }
         } else {
             Err("TUN_INTERFACE_TABLE_LIMIT".into())
         };
         unsafe { FreeMibTable(table.cast()) };
-        let observed = result?;
-        verify_wintun_name(observed.as_ref(), named_wintun_device()?)?;
-        Ok(observed)
+        result
+    }
+
+    fn observe_adapter(starting: bool) -> Result<Option<AdapterObservation>, String> {
+        // PnP presence and IP Helper do not share a snapshot. Give a one-sided
+        // transition time to settle. An incomplete pair never authorizes reuse.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_adapter_snapshot(
+            || reconcile_wintun_name(observe_windows_alias()?, named_wintun_device()?, starting),
+            || {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                true
+            },
+        )
     }
 
     fn load_adapter_receipt(path: &Path) -> Result<Option<AdapterReceipt>, String> {
@@ -755,18 +854,30 @@ mod windows {
         Ok(runtime_output_dir(app)?.join("owned-tun-adapter-v1.dpapi"))
     }
 
-    pub(super) fn prepare_adapter(app: &AppHandle) -> Result<Option<AdapterIdentity>, String> {
+    fn observe_reusable_adapter(app: &AppHandle) -> Result<Option<AdapterObservation>, String> {
         let receipt = load_adapter_receipt(&adapter_receipt_path(app)?)?;
-        let Some(current) = observe_adapter()? else {
+        let Some(current) = observe_adapter(false)? else {
             return Ok(None);
         };
         admit_idle_adapter(&current, receipt.as_ref(), owner_observation)?;
+        Ok(Some(current))
+    }
+
+    pub(super) fn preflight_adapter(app: &AppHandle) -> Result<(), String> {
+        observe_reusable_adapter(app).map(|_| ())
+    }
+
+    pub(super) fn prepare_adapter(app: &AppHandle) -> Result<Option<AdapterIdentity>, String> {
+        let Some(current) = observe_reusable_adapter(app)? else {
+            return Ok(None);
+        };
         verify_idle_configuration(&current)?;
-        let after = observe_adapter()?
+        let after = observe_adapter(false)?
             .ok_or("TUN_INTERFACE_OWNER_UNKNOWN: alias disappeared during admission")?;
         if after.identity != current.identity
             || after.index != current.index
             || after.media != current.media
+            || after.oper_status != current.oper_status
         {
             return Err(format!(
                 "TUN_INTERFACE_OWNER_UNKNOWN: adapter changed during admission; {}",
@@ -803,7 +914,7 @@ mod windows {
         link: (u32, u64),
     ) -> Result<AdapterIdentity, String> {
         let current =
-            observe_adapter()?.ok_or("TUN_INTERFACE_GENERATION_UNCONFIRMED: alias missing")?;
+            observe_adapter(true)?.ok_or("TUN_INTERFACE_GENERATION_UNCONFIRMED: alias missing")?;
         verify_started_adapter(&current, expected, link)?;
         Ok(current.identity)
     }
@@ -860,6 +971,7 @@ mod windows {
                 identity: identity(),
                 index: 12,
                 media: MediaConnectStateDisconnected,
+                oper_status: 2,
             },
             AdapterReceipt {
                 version: 1,
@@ -923,13 +1035,105 @@ mod windows {
     }
 
     #[test]
-    fn tun_adapter_admission_checks_the_name_used_by_wintun() {
+    fn tun_adapter_reports_a_real_guid_conflict_separately_from_missing_pnp() {
         let (current, _) = adapter_fixture();
-        verify_wintun_name(None, None).unwrap();
-        verify_wintun_name(Some(&current), Some(current.identity.guid)).unwrap();
-        assert!(verify_wintun_name(None, Some(current.identity.guid)).is_err());
-        assert!(verify_wintun_name(Some(&current), None).is_err());
-        assert!(verify_wintun_name(Some(&current), Some([5; 16])).is_err());
+        assert!(matches!(
+            reconcile_wintun_name(None, WintunName::Missing, false),
+            Ok(AdapterSnapshot::Absent)
+        ));
+        let guid = current.identity.guid;
+        assert!(matches!(
+            reconcile_wintun_name(Some(current), WintunName::Unique(guid), false),
+            Ok(AdapterSnapshot::Matched(_))
+        ));
+
+        let (current, _) = adapter_fixture();
+        let Err(conflict) =
+            reconcile_wintun_name(Some(current), WintunName::Unique([5; 16]), false)
+        else {
+            panic!("different GUIDs must fail");
+        };
+        assert!(conflict.contains("TUN_INTERFACE_GUID_CONFLICT"));
+        assert!(conflict.contains("05050505-0505-0505-0505-050505050505"));
+        assert!(conflict.contains("2a2a2a2a-2a2a-2a2a-2a2a-2a2a2a2a2a2a"));
+        assert!(reconcile_wintun_name(None, WintunName::Unique(guid), false).is_err());
+        let (current, _) = adapter_fixture();
+        let Err(duplicate) = reconcile_wintun_name(Some(current), WintunName::Duplicate, false)
+        else {
+            panic!("duplicate internal names must fail even when there is only one Windows alias");
+        };
+        assert!(duplicate.starts_with("TUN_INTERFACE_DUPLICATE_WINTUN_NAME"));
+        let (current, _) = adapter_fixture();
+        assert!(reconcile_wintun_name(Some(current), WintunName::Missing, false).is_err());
+    }
+
+    #[test]
+    fn tun_adapter_waits_for_a_disappearing_interface_without_adopting_it() {
+        let (mut stale, _) = adapter_fixture();
+        stale.media = MediaConnectStateUnknown;
+        let mut samples = [Some(stale), None].into_iter();
+        let mut waits = 0;
+        let result = wait_for_adapter_snapshot(
+            || reconcile_wintun_name(samples.next().unwrap(), WintunName::Missing, false),
+            || {
+                waits += 1;
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(waits, 1);
+        assert!(result.is_none());
+
+        let Err(pending) = wait_for_adapter_snapshot(
+            || {
+                let (mut stale, _) = adapter_fixture();
+                stale.media = MediaConnectStateUnknown;
+                reconcile_wintun_name(Some(stale), WintunName::Missing, false)
+            },
+            || false,
+        ) else {
+            panic!("a persistent incomplete pair must fail closed");
+        };
+        assert!(pending.starts_with("TUN_INTERFACE_SNAPSHOT_PENDING"));
+    }
+
+    #[test]
+    fn tun_adapter_start_waits_for_pnp_and_then_confirms_same_link() {
+        let (mut current, receipt) = adapter_fixture();
+        current.media = MediaConnectStateConnected;
+        let link = (current.index, current.identity.luid);
+        let mut samples = [
+            WintunName::Missing,
+            WintunName::Unique(current.identity.guid),
+        ]
+        .into_iter();
+        let result = wait_for_adapter_snapshot(
+            || {
+                let (mut current, _) = adapter_fixture();
+                current.media = MediaConnectStateConnected;
+                reconcile_wintun_name(Some(current), samples.next().unwrap(), true)
+            },
+            || true,
+        )
+        .unwrap()
+        .unwrap();
+        verify_started_adapter(&result, Some(&receipt.identity), link).unwrap();
+    }
+
+    #[test]
+    fn tun_adapter_guid_matches_windows_canonical_format() {
+        let mut parsed = GUID::from_u128(0);
+        let text = "{9A83A959-4093-3468-B11A-96A80880587E}";
+        let input: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        assert_eq!(unsafe { CLSIDFromString(input.as_ptr(), &mut parsed) }, 0);
+        assert_eq!(
+            guid_bytes(parsed),
+            guid_bytes(GUID::from_u128(0x9a83a959_4093_3468_b11a_96a80880587e))
+        );
+        assert_eq!(
+            canonical_guid(guid_bytes(parsed)),
+            "9a83a959-4093-3468-b11a-96a80880587e"
+        );
     }
 
     #[test]
@@ -1565,6 +1769,18 @@ pub(crate) fn configure_tun_routes(
 pub(crate) use windows::AdapterIdentity;
 #[cfg(not(target_os = "windows"))]
 pub(crate) struct AdapterIdentity;
+
+pub(crate) fn preflight_owned_tun_adapter(app: &AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::preflight_adapter(app)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Err("Windows TUN only".into())
+    }
+}
 
 pub(crate) fn prepare_owned_tun_adapter(
     app: &AppHandle,

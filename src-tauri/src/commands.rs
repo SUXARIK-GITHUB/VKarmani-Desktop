@@ -1016,6 +1016,17 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     if tun_interface_plan.is_some() {
         compile_xray_tun_config_with_core(&core_path, &config_path, &config_hash)
             .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
+        let switching_owned_tun = state
+            .runtime
+            .lock()
+            .map_err(|_| "NETWORK_RUNTIME_UNAVAILABLE")?
+            .as_ref()
+            .is_some_and(|runtime| runtime.network_mode == "tun");
+        if !switching_owned_tun {
+            // Refuse unresolved identities before stopping a working Proxy.
+            // Existing own TUN must release its session before final admission.
+            preflight_owned_tun_adapter(&app)?;
+        }
     }
     _operation_guard.check()?;
     _operation_guard.stage("stopping")?;
@@ -1204,6 +1215,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     } else {
         None
     };
+    _operation_guard.check()?;
     let child = match spawn_xray_runtime_child(&core_path, &config_path, &log_path, &config_hash) {
         Ok(child) => child,
         Err(error) => {

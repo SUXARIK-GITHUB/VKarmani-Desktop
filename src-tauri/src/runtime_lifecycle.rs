@@ -891,6 +891,9 @@ fn try_self_restart_xray_runtime(
     } else {
         None
     };
+    if let Err(error) = check_current_operation(state) {
+        return Err(Box::new((runtime, error)));
+    }
     let mut child =
         match spawn_xray_runtime_child(&core_path, &config_path, &log_path, &runtime.config_hash) {
             Ok(child) => child,

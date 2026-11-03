@@ -41,6 +41,9 @@ it('checks both TUN configurations before stopping and only the owned child cons
   const spawn = connect.indexOf('spawn_xray_runtime_child(');
   expect(compile).toBeGreaterThan(validation);
   expect(compile).toBeLessThan(stop);
+  const adapterPreflight = connect.indexOf('preflight_owned_tun_adapter(&app)');
+  expect(adapterPreflight).toBeGreaterThan(compile);
+  expect(adapterPreflight).toBeLessThan(stop);
   expect(available).toBeGreaterThan(stop);
   expect(spawn).toBeGreaterThan(available);
   expect(connect.indexOf('confirm_tun_routes_ready(&app, interface, &adapter)')).toBeLessThan(
