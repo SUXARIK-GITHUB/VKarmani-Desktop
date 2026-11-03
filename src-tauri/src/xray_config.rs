@@ -1920,14 +1920,27 @@ mod fragment_compat_tests {
                         .iter()
                         .find(|v| v["protocol"] == "tun")
                         .unwrap()["settings"];
-                    for option in ["autoSystemRoutingTable", "autoSystemWfpBlockLeak", "dns"] {
-                        assert!(
-                            settings.get(option).is_none(),
-                            "unexpected Xray-owned option {option}"
-                        );
-                    }
+                    assert_eq!(settings["autoSystemRoutingTable"], json!([]));
+                    assert!(settings.get("autoSystemWfpBlockLeak").is_none());
                 }
                 let compiled = compile_without_starting(&runtime).unwrap();
+                if mode == "tun" {
+                    let tun = compiled["inbound"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|inbound| &inbound["proxySettings"])
+                        .find(|settings| settings["_TypedMessage_"] == "xray.proxy.tun.Config")
+                        .unwrap();
+                    assert_eq!(tun["gateway"], json!([TUN_GATEWAY_IPV4, TUN_GATEWAY_IPV6]));
+                    assert_eq!(tun["MTU"], TUN_MTU);
+                    if policy == "selected" {
+                        assert!(tun.get("DNS").is_none());
+                    } else {
+                        assert_eq!(tun["DNS"], json!(TUN_DNS));
+                    }
+                    assert!(tun.get("autoSystemRoutingTable").is_none());
+                }
                 if chain.is_some() {
                     assert_eq!(
                         runtime["outbounds"][1]["streamSettings"]["sockopt"]["dialerProxy"],
