@@ -37,12 +37,25 @@ it('checks both TUN configurations before stopping and only the owned child cons
   expect(validation).toBeGreaterThan(0);
   expect(validation).toBeLessThan(stop);
   const compile = connect.indexOf('compile_xray_tun_config_with_core(&core_path, &config_path');
-  const available = connect.indexOf('ensure_tun_alias_available()');
+  const available = connect.indexOf('prepare_owned_tun_adapter(&app)');
   const spawn = connect.indexOf('spawn_xray_runtime_child(');
   expect(compile).toBeGreaterThan(validation);
   expect(compile).toBeLessThan(stop);
   expect(available).toBeGreaterThan(stop);
   expect(spawn).toBeGreaterThan(available);
+  expect(connect.indexOf('confirm_tun_routes_ready(&app, interface, &adapter)')).toBeLessThan(
+    connect.indexOf('record_owned_tun_adapter(&app, adapter, &mut child)'),
+  );
+  const restart = readFileSync(new URL('../src-tauri/src/runtime_lifecycle.rs', import.meta.url), 'utf8');
+  const readmit = restart.indexOf('prepare_owned_tun_adapter(app)');
+  const replacement = restart.indexOf('spawn_xray_runtime_child(', readmit);
+  const confirm = restart.indexOf('confirm_tun_routes_ready(app, interface, &adapter)', replacement);
+  const record = restart.indexOf('record_owned_tun_adapter(app, adapter, &mut child)', confirm);
+  expect(readmit).toBeGreaterThan(0);
+  expect(replacement).toBeGreaterThan(readmit);
+  expect(confirm).toBeGreaterThan(replacement);
+  expect(record).toBeGreaterThan(confirm);
+  expect(restart.indexOf('runtime.child = child;', record)).toBeGreaterThan(record);
   expect(connect).toMatch(/if tun_interface_plan\.is_none\(\) \{\s*validate_xray_config_with_core\(&core_path, &config_path/);
   expect(connect.indexOf('config_preflight_projection(&config)')).toBeLessThan(validation);
   expect(connect.indexOf('PreparedRuntimeConfig::write(')).toBeLessThan(validation);

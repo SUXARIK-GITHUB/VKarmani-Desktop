@@ -193,7 +193,10 @@ mod windows {
             CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
             ERROR_NOT_FOUND, FILETIME, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
-        NetworkManagement::{IpHelper::*, Ndis::NET_LUID_LH},
+        NetworkManagement::{
+            IpHelper::*,
+            Ndis::{MediaConnectStateConnected, MediaConnectStateDisconnected, NET_LUID_LH},
+        },
         Networking::WinSock::*,
         System::Threading::{
             GetCurrentProcess, GetProcessTimes, OpenProcess, WaitForSingleObject,
@@ -342,41 +345,493 @@ mod windows {
             String::from_utf16_lossy(&row.Alias[..end]),
         ))
     }
-    pub(super) fn ensure_alias_available() -> Result<(), String> {
+    #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+    pub(crate) struct AdapterIdentity {
+        guid: [u8; 16],
+        #[serde(with = "luid_text")]
+        luid: u64,
+        kind: u32,
+        description: String,
+    }
+
+    impl AdapterIdentity {
+        fn is_wintun(&self) -> bool {
+            self.guid != [0; 16]
+                && self.luid != 0
+                && self.kind == IF_TYPE_PROP_VIRTUAL
+                && self.description.to_ascii_lowercase().contains("wintun")
+        }
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct AdapterReceipt {
+        version: u8,
+        identity: AdapterIdentity,
+        pid: u32,
+        created_at: u64,
+    }
+
+    struct AdapterObservation {
+        identity: AdapterIdentity,
+        index: u32,
+        media: i32,
+    }
+
+    impl AdapterObservation {
+        fn details(&self) -> String {
+            let AdapterIdentity {
+                guid, luid, kind, ..
+            } = self.identity;
+            let guid: String = guid.iter().map(|byte| format!("{byte:02x}")).collect();
+            format!(
+                "alias={TUN_INTERFACE_NAME}, GUID={guid}, LUID={luid}, index={}, ifType={kind}, Wintun={}, media={}",
+                self.index, self.identity.is_wintun(), self.media,
+            )
+        }
+    }
+
+    fn wide_field(field: &[u16]) -> String {
+        let end = field
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(field.len());
+        String::from_utf16_lossy(&field[..end])
+    }
+
+    fn observe_adapter() -> Result<Option<AdapterObservation>, String> {
         let mut table = null_mut();
         let status = unsafe { GetIfTable2(&mut table) };
         if status != 0 || table.is_null() {
             return Err(format!("TUN_INTERFACE_TABLE_UNAVAILABLE: Win32 {status}"));
         }
         let count = unsafe { (*table).NumEntries } as usize;
-        let present = if count <= 8192 {
+        let result = if count <= 8192 {
             let rows = unsafe {
                 std::slice::from_raw_parts(
                     std::ptr::addr_of!((*table).Table).cast::<MIB_IF_ROW2>(),
                     count,
                 )
             };
-            rows.iter().any(|row| {
-                let end = row
-                    .Alias
-                    .iter()
-                    .position(|&unit| unit == 0)
-                    .unwrap_or(row.Alias.len());
-                String::from_utf16_lossy(&row.Alias[..end]).eq_ignore_ascii_case(TUN_INTERFACE_NAME)
-            })
+            let mut matches = rows
+                .iter()
+                .filter(|row| wide_field(&row.Alias).eq_ignore_ascii_case(TUN_INTERFACE_NAME));
+            let first = matches.next();
+            if matches.next().is_some() {
+                Err("TUN_INTERFACE_OWNER_UNKNOWN: multiple matching aliases".into())
+            } else {
+                Ok(first.map(|row| {
+                    let mut guid = [0; 16];
+                    let raw = row.InterfaceGuid;
+                    guid[..4].copy_from_slice(&raw.data1.to_be_bytes());
+                    guid[4..6].copy_from_slice(&raw.data2.to_be_bytes());
+                    guid[6..8].copy_from_slice(&raw.data3.to_be_bytes());
+                    guid[8..].copy_from_slice(&raw.data4);
+                    AdapterObservation {
+                        identity: AdapterIdentity {
+                            guid,
+                            luid: unsafe { row.InterfaceLuid.Value },
+                            kind: row.Type,
+                            description: wide_field(&row.Description),
+                        },
+                        index: row.InterfaceIndex,
+                        media: row.MediaConnectState,
+                    }
+                }))
+            }
         } else {
-            unsafe { FreeMibTable(table.cast()) };
-            return Err("TUN_INTERFACE_TABLE_LIMIT".into());
+            Err("TUN_INTERFACE_TABLE_LIMIT".into())
         };
         unsafe { FreeMibTable(table.cast()) };
-        if present {
+        result
+    }
+
+    fn load_adapter_receipt(path: &Path) -> Result<Option<AdapterReceipt>, String> {
+        let invalid = || {
+            "TUN_INTERFACE_OWNER_UNKNOWN: protected adapter receipt invalid; original preserved"
+                .to_string()
+        };
+        let Some(cipher) = crate::compat_storage::read_state_file(path, 4096).map_err(|error| {
+            format!("TUN_INTERFACE_OWNER_UNKNOWN: protected adapter receipt unreadable: {error}")
+        })?
+        else {
+            return Ok(None);
+        };
+        let text = decrypt_access_key(&cipher).map_err(|_| invalid())?;
+        let receipt: AdapterReceipt = serde_json::from_str(&text).map_err(|_| invalid())?;
+        if receipt.version != 1
+            || receipt.pid == 0
+            || receipt.created_at == 0
+            || !receipt.identity.is_wintun()
+        {
+            return Err(invalid());
+        }
+        Ok(Some(receipt))
+    }
+
+    fn save_adapter_receipt(path: &Path, receipt: &AdapterReceipt) -> Result<(), String> {
+        let text = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
+        atomic_write_text(path, &encrypt_access_key(&text)?, "TUN adapter receipt")
+    }
+
+    fn admit_idle_adapter(
+        current: &AdapterObservation,
+        receipt: Option<&AdapterReceipt>,
+        observe_owner: impl FnOnce(u32, Option<u64>) -> OwnerObservation,
+    ) -> Result<(), String> {
+        if current.media == MediaConnectStateConnected {
+            return Err(format!(
+                "TUN_INTERFACE_ACTIVE: active link; {}",
+                current.details()
+            ));
+        }
+        let Some(receipt) = receipt.filter(|receipt| receipt.identity == current.identity) else {
+            return Err(format!(
+                "TUN_INTERFACE_OWNER_UNKNOWN: no matching protected receipt; {}",
+                current.details()
+            ));
+        };
+        if current.media != MediaConnectStateDisconnected
+            || current.index == 0
+            || !current.identity.is_wintun()
+        {
+            return Err(format!(
+                "TUN_INTERFACE_OWNER_UNKNOWN: link state or identity unconfirmed; {}",
+                current.details()
+            ));
+        }
+        let owner = format!(
+            "ownerPID={}, ownerCreatedAt={}",
+            receipt.pid, receipt.created_at
+        );
+        match observe_owner(receipt.pid, Some(receipt.created_at)) {
+            OwnerObservation::Exited => Ok(()),
+            OwnerObservation::IdentityOnly(created) if created != receipt.created_at => Ok(()),
+            OwnerObservation::Running => Err(format!(
+                "TUN_INTERFACE_ACTIVE: recorded Xray is alive; {owner}, {}",
+                current.details()
+            )),
+            other => Err(format!(
+                "TUN_INTERFACE_OWNER_UNKNOWN: Xray exit unconfirmed ({other:?}); {owner}, {}",
+                current.details()
+            )),
+        }
+    }
+
+    fn expected_idle_address(row: &MIB_UNICASTIPADDRESS_ROW) -> bool {
+        let ip = match unsafe { row.Address.si_family } {
+            AF_INET => IpAddr::from(unsafe { row.Address.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes() }),
+            AF_INET6 => {
+                let ip = std::net::Ipv6Addr::from(unsafe { row.Address.Ipv6.sin6_addr.u.Byte });
+                if ip.segments()[0] & 0xffc0 == 0xfe80
+                    && row.PrefixOrigin == IpPrefixOriginWellKnown
+                {
+                    return true;
+                }
+                IpAddr::from(ip)
+            }
+            _ => return false,
+        };
+        [TUN_GATEWAY_IPV4, TUN_GATEWAY_IPV6].iter().any(|gateway| {
+            let (host, prefix) = gateway.split_once('/').expect("fixed TUN prefix");
+            host.parse::<IpAddr>() == Ok(ip) && prefix.parse::<u8>() == Ok(row.OnLinkPrefixLength)
+        })
+    }
+
+    // Xray may replace interface addresses and DNS at start and flush routes at
+    // close. Even an owned interface may have externally configured state.
+    fn verify_idle_configuration(current: &AdapterObservation) -> Result<(), String> {
+        let luid = current.identity.luid;
+        let mut addresses = null_mut();
+        let status = unsafe { GetUnicastIpAddressTable(AF_UNSPEC, &mut addresses) };
+        if status != 0 || addresses.is_null() {
+            return Err(format!(
+                "TUN_INTERFACE_ADDRESS_UNCONFIRMED: Win32 {status}; {}",
+                current.details()
+            ));
+        }
+        let count = unsafe { (*addresses).NumEntries } as usize;
+        let addresses_ok = count <= 65536
+            && unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!((*addresses).Table).cast::<MIB_UNICASTIPADDRESS_ROW>(),
+                    count,
+                )
+            }
+            .iter()
+            .filter(|row| unsafe { row.InterfaceLuid.Value == luid })
+            .all(|row| row.InterfaceIndex == current.index && expected_idle_address(row));
+        unsafe { FreeMibTable(addresses.cast()) };
+
+        let mut routes = null_mut();
+        let status = unsafe { GetIpForwardTable2(AF_UNSPEC, &mut routes) };
+        if status != 0 || routes.is_null() {
+            return Err(format!(
+                "TUN_INTERFACE_ROUTES_UNCONFIRMED: Win32 {status}; {}",
+                current.details()
+            ));
+        }
+        let count = unsafe { (*routes).NumEntries } as usize;
+        let routes_ok = count <= 65536
+            && unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!((*routes).Table).cast::<MIB_IPFORWARD_ROW2>(),
+                    count,
+                )
+            }
+            .iter()
+            .filter(|row| unsafe { row.InterfaceLuid.Value == luid })
+            .all(|row| row.InterfaceIndex == current.index && row.Protocol == MIB_IPPROTO_LOCAL);
+        unsafe { FreeMibTable(routes.cast()) };
+
+        let dns = read_interface_dns(current.index, luid).map_err(|error| {
+            format!(
+                "TUN_INTERFACE_DNS_UNCONFIRMED: {error}; {}",
+                current.details()
+            )
+        })?;
+        let dns_ok = dns.is_empty() || dns == TUN_DNS;
+        if !addresses_ok || !routes_ok || !dns_ok {
+            return Err(format!(
+                "TUN_INTERFACE_CONFIGURATION_UNKNOWN: expected addresses={addresses_ok}, local routes only={routes_ok}, expected DNS={dns_ok}; {}",
+                current.details(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn adapter_receipt_path(app: &AppHandle) -> Result<PathBuf, String> {
+        Ok(runtime_output_dir(app)?.join("owned-tun-adapter-v1.dpapi"))
+    }
+
+    pub(super) fn prepare_adapter(app: &AppHandle) -> Result<Option<AdapterIdentity>, String> {
+        let receipt = load_adapter_receipt(&adapter_receipt_path(app)?)?;
+        let Some(current) = observe_adapter()? else {
+            return Ok(None);
+        };
+        admit_idle_adapter(&current, receipt.as_ref(), owner_observation)?;
+        verify_idle_configuration(&current)?;
+        let after = observe_adapter()?
+            .ok_or("TUN_INTERFACE_OWNER_UNKNOWN: alias disappeared during admission")?;
+        if after.identity != current.identity
+            || after.index != current.index
+            || after.media != current.media
+        {
+            return Err(format!(
+                "TUN_INTERFACE_OWNER_UNKNOWN: adapter changed during admission; {}",
+                after.details()
+            ));
+        }
+        let _ = append_runtime_event(
+            app,
+            &format!("TUN_INTERFACE_REUSE_ADMITTED: {}", current.details()),
+        );
+        Ok(Some(current.identity))
+    }
+
+    fn verify_started_adapter(
+        current: &AdapterObservation,
+        expected: Option<&AdapterIdentity>,
+        link: (u32, u64),
+    ) -> Result<(), String> {
+        if (current.index, current.identity.luid) != link
+            || current.media != MediaConnectStateConnected
+            || !current.identity.is_wintun()
+            || expected.is_some_and(|expected| *expected != current.identity)
+        {
+            return Err(format!(
+                "TUN_INTERFACE_GENERATION_UNCONFIRMED: {}",
+                current.details()
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn confirm_started_adapter(
+        expected: Option<&AdapterIdentity>,
+        link: (u32, u64),
+    ) -> Result<AdapterIdentity, String> {
+        let current =
+            observe_adapter()?.ok_or("TUN_INTERFACE_GENERATION_UNCONFIRMED: alias missing")?;
+        verify_started_adapter(&current, expected, link)?;
+        Ok(current.identity)
+    }
+
+    pub(super) fn record_adapter(
+        app: &AppHandle,
+        identity: AdapterIdentity,
+        child: &mut Child,
+    ) -> Result<(), String> {
+        use std::os::windows::io::AsRawHandle;
+        let created_at = process_created_at(child.as_raw_handle()).map_err(|code| {
+            format!("TUN_INTERFACE_OWNER_UNKNOWN: GetProcessTimes: Win32 {code}")
+        })?;
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
             return Err(
-                "TUN_INTERFACE_ALREADY_PRESENT: existing adapter ownership cannot be established"
-                    .into(),
+                "TUN_INTERFACE_OWNER_EXITED: Xray exited before recording the adapter".into(),
+            );
+        }
+        save_adapter_receipt(
+            &adapter_receipt_path(app)?,
+            &AdapterReceipt {
+                version: 1,
+                identity,
+                pid: child.id(),
+                created_at,
+            },
+        )?;
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err(
+                "TUN_INTERFACE_OWNER_EXITED: Xray exited before publishing the runtime".into(),
             );
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    fn adapter_fixture() -> (AdapterObservation, AdapterReceipt) {
+        let identity = || AdapterIdentity {
+            guid: [42; 16],
+            luid: 88,
+            kind: IF_TYPE_PROP_VIRTUAL,
+            description: "Wintun Userspace Tunnel".into(),
+        };
+        (
+            AdapterObservation {
+                identity: identity(),
+                index: 12,
+                media: MediaConnectStateDisconnected,
+            },
+            AdapterReceipt {
+                version: 1,
+                identity: identity(),
+                pid: 44,
+                created_at: 200,
+            },
+        )
+    }
+
+    #[test]
+    fn tun_adapter_reuse_requires_matching_receipt_idle_link_and_ended_generation() {
+        let (mut current, receipt) = adapter_fixture();
+        let no_process_lookup = |_, _| panic!("no owner lookup expected");
+        assert!(admit_idle_adapter(&current, None, no_process_lookup)
+            .unwrap_err()
+            .starts_with("TUN_INTERFACE_OWNER_UNKNOWN"));
+        current.index = 13; // The index is not persistent, unlike the journal's identity check.
+        for owner in [
+            OwnerObservation::Exited,
+            OwnerObservation::IdentityOnly(201),
+        ] {
+            admit_idle_adapter(&current, Some(&receipt), |pid, created| {
+                assert_eq!((pid, created), (44, Some(200)));
+                owner
+            })
+            .unwrap();
+        }
+        for (owner, code) in [
+            (OwnerObservation::Running, "TUN_INTERFACE_ACTIVE"),
+            (
+                OwnerObservation::IdentityOnly(200),
+                "TUN_INTERFACE_OWNER_UNKNOWN",
+            ),
+            (
+                OwnerObservation::Unknown("OpenProcess", 5),
+                "TUN_INTERFACE_OWNER_UNKNOWN",
+            ),
+        ] {
+            assert!(admit_idle_adapter(&current, Some(&receipt), |_, _| owner)
+                .unwrap_err()
+                .starts_with(code));
+        }
+        current.media = MediaConnectStateConnected;
+        assert!(
+            admit_idle_adapter(&current, Some(&receipt), no_process_lookup)
+                .unwrap_err()
+                .starts_with("TUN_INTERFACE_ACTIVE")
+        );
+        current.media = 0; // Unknown is not proof of inactivity.
+        assert!(admit_idle_adapter(&current, Some(&receipt), no_process_lookup).is_err());
+        current.media = MediaConnectStateDisconnected;
+        current.identity.luid += 1;
+        assert!(admit_idle_adapter(&current, Some(&receipt), no_process_lookup).is_err());
+        current.identity.luid -= 1;
+        current.identity.guid[0] ^= 1;
+        assert!(admit_idle_adapter(&current, Some(&receipt), no_process_lookup).is_err());
+        current.identity.guid[0] ^= 1;
+        current.identity.description = "other adapter".into();
+        assert!(admit_idle_adapter(&current, Some(&receipt), no_process_lookup).is_err());
+    }
+
+    #[test]
+    fn tun_adapter_runtime_must_use_the_observed_generation() {
+        let (mut current, receipt) = adapter_fixture();
+        let link = (current.index, current.identity.luid);
+        assert!(verify_started_adapter(&current, Some(&receipt.identity), link).is_err());
+        current.media = MediaConnectStateConnected;
+        verify_started_adapter(&current, None, link).unwrap();
+        verify_started_adapter(&current, Some(&receipt.identity), link).unwrap();
+        assert!(verify_started_adapter(&current, Some(&receipt.identity), (0, link.1)).is_err());
+        current.identity.guid[1] ^= 1;
+        assert!(verify_started_adapter(&current, Some(&receipt.identity), link).is_err());
+        current.identity.kind = 6;
+        assert!(verify_started_adapter(&current, None, link).is_err());
+    }
+
+    #[test]
+    fn tun_adapter_receipt_round_trips_with_dpapi_and_preserves_invalid_state() {
+        let (_, mut receipt) = adapter_fixture();
+        let root = std::env::temp_dir().join(format!(
+            "vkarmani-adapter-receipt-{}",
+            crate::compat_storage::durable::random_state_id().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("owned-tun-adapter-v1.dpapi");
+        assert!(load_adapter_receipt(&path).unwrap().is_none());
+        for created_at in [200, 201] {
+            receipt.created_at = created_at;
+            save_adapter_receipt(&path, &receipt).unwrap();
+            let loaded = load_adapter_receipt(&path).unwrap().unwrap();
+            assert_eq!(loaded.identity, receipt.identity);
+            assert_eq!(loaded.pid, receipt.pid);
+            assert_eq!(loaded.created_at, created_at);
+        }
+        receipt.pid = 0;
+        save_adapter_receipt(&path, &receipt).unwrap();
+        let invalid = fs::read(&path).unwrap();
+        assert!(load_adapter_receipt(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), invalid);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn tun_adapter_reuse_protects_manually_configured_addresses() {
+        let mut row = unsafe { std::mem::zeroed::<MIB_UNICASTIPADDRESS_ROW>() };
+        row.Address = address("172.19.0.1").unwrap();
+        row.OnLinkPrefixLength = 32;
+        assert!(expected_idle_address(&row));
+        row.OnLinkPrefixLength = 24;
+        assert!(!expected_idle_address(&row));
+        row.Address = address("192.0.2.1").unwrap();
+        assert!(!expected_idle_address(&row));
+        row.Address = address("fdfe:dcba:9876::1").unwrap();
+        row.OnLinkPrefixLength = 128;
+        assert!(expected_idle_address(&row));
+        row.Address = address("fe80::1").unwrap();
+        row.PrefixOrigin = IpPrefixOriginManual;
+        assert!(!expected_idle_address(&row));
+        row.PrefixOrigin = IpPrefixOriginWellKnown;
+        assert!(expected_idle_address(&row));
+    }
+
     fn verify_owned_interface(luid: u64) -> Result<(), String> {
         let mut row: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };
         row.InterfaceLuid = NET_LUID_LH { Value: luid };
@@ -673,7 +1128,8 @@ mod windows {
         app: &AppHandle,
         interface_name: &str,
         interface: TunInterfacePlan,
-    ) -> Result<(), String> {
+        expected_adapter: Option<&AdapterIdentity>,
+    ) -> Result<AdapterIdentity, String> {
         cleanup(app)?;
         let deadline = Instant::now() + Duration::from_secs(6);
         let (index, luid) = loop {
@@ -683,6 +1139,7 @@ mod windows {
                 Err(_) => std::thread::sleep(Duration::from_millis(50)),
             }
         };
+        let adapter = confirm_started_adapter(expected_adapter, (index, luid))?;
         let routes = tun_destinations(interface)
             .iter()
             .map(|&ip| OwnedRoute {
@@ -706,7 +1163,8 @@ mod windows {
             ),
             entries: Vec::new(),
         };
-        install_routes_with_rollback(&mut backend, &mut journal, &routes)
+        install_routes_with_rollback(&mut backend, &mut journal, &routes)?;
+        Ok(adapter)
     }
     #[test]
     fn read_only_native_route_query() {
@@ -921,25 +1379,50 @@ pub(crate) fn configure_tun_routes(
     app: &AppHandle,
     interface_name: &str,
     interface: TunInterfacePlan,
-) -> Result<(), String> {
+    expected_adapter: Option<&AdapterIdentity>,
+) -> Result<AdapterIdentity, String> {
     #[cfg(target_os = "windows")]
     {
-        windows::configure(app, interface_name, interface)
+        windows::configure(app, interface_name, interface, expected_adapter)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, interface_name, interface);
+        let _ = (app, interface_name, interface, expected_adapter);
         Err("Windows TUN only".into())
     }
 }
 
-pub(crate) fn ensure_tun_alias_available() -> Result<(), String> {
+#[cfg(target_os = "windows")]
+pub(crate) use windows::AdapterIdentity;
+#[cfg(not(target_os = "windows"))]
+pub(crate) struct AdapterIdentity;
+
+pub(crate) fn prepare_owned_tun_adapter(
+    app: &AppHandle,
+) -> Result<Option<AdapterIdentity>, String> {
     #[cfg(target_os = "windows")]
     {
-        windows::ensure_alias_available()
+        windows::prepare_adapter(app)
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = app;
+        Err("Windows TUN only".into())
+    }
+}
+
+pub(crate) fn record_owned_tun_adapter(
+    app: &AppHandle,
+    adapter: AdapterIdentity,
+    child: &mut OwnedXrayProcess,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::record_adapter(app, adapter, child)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, adapter, child);
         Err("Windows TUN only".into())
     }
 }
@@ -947,6 +1430,7 @@ pub(crate) fn ensure_tun_alias_available() -> Result<(), String> {
 pub(crate) fn confirm_tun_routes_ready(
     app: &AppHandle,
     interface: TunInterfacePlan,
+    adapter: &AdapterIdentity,
 ) -> Result<(), String> {
     let (status, routes) = owned_route_summary(app);
     #[cfg(target_os = "windows")]
@@ -955,6 +1439,7 @@ pub(crate) fn confirm_tun_routes_ready(
         if routes[0].interface_luid != luid {
             return Err("TUN_ROUTES_NOT_READY: adapter generation changed".into());
         }
+        windows::confirm_started_adapter(Some(adapter), (index, luid))?;
         windows::confirm_effective_routes(index, luid, interface)?;
         let _ = append_runtime_event(app, &format!(
             "TUN_LINK_CONFIRMED: index={index}, LUID={luid}, Preferred, MTU={TUN_MTU}, ownedRoutes={}, adapterDnsConfigured={}",
@@ -962,6 +1447,8 @@ pub(crate) fn confirm_tun_routes_ready(
         ));
         return Ok(());
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (interface, adapter);
     Err(format!(
         "TUN_ROUTES_NOT_READY: ownership={status}, recorded={}",
         routes.len()

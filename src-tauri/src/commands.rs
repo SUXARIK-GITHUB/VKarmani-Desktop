@@ -1199,9 +1199,11 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     };
 
     _operation_guard.stage("starting")?;
-    if tun_interface_plan.is_some() {
-        ensure_tun_alias_available()?;
-    }
+    let expected_adapter = if tun_interface_plan.is_some() {
+        prepare_owned_tun_adapter(&app)?
+    } else {
+        None
+    };
     let child = match spawn_xray_runtime_child(&core_path, &config_path, &log_path, &config_hash) {
         Ok(child) => child,
         Err(error) => {
@@ -1242,13 +1244,19 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         return Err(error);
     }
 
-    if let Some(interface) = tun_interface_plan {
+    let tun_adapter = if let Some(interface) = tun_interface_plan {
         _operation_guard.stage("configuring-routes")?;
-        configure_tun_routes(&app, TUN_INTERFACE_NAME, interface).map_err(|error| {
+        let adapter = configure_tun_routes(
+            &app,
+            TUN_INTERFACE_NAME,
+            interface,
+            expected_adapter.as_ref(),
+        )
+        .map_err(|error| {
             format!("Не удалось подготовить Windows-маршруты для TUN режима: {error}")
         })?;
         std::thread::sleep(Duration::from_millis(250));
-        confirm_tun_routes_ready(&app, interface)?;
+        confirm_tun_routes_ready(&app, interface, &adapter)?;
         // Xray v26.10.31 can keep its listeners alive while rejecting dials
         // bound to a physical interface that changed after preflight.
         confirm_tun_physical_binding(physical_route.as_ref(), current_physical_binding())?;
@@ -1256,7 +1264,10 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
             &app,
             "TUN routes confirmed; per-process TCP/UDP egress not measured.",
         );
-    }
+        Some(adapter)
+    } else {
+        None
+    };
 
     if let Some(status) = child.try_wait().map_err(|error| {
         format!("Не удалось проверить Xray перед завершением подключения: {error}")
@@ -1278,6 +1289,9 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         );
     }
     _operation_guard.stage("publishing")?;
+    if let Some(adapter) = tun_adapter {
+        record_owned_tun_adapter(&app, adapter, &mut child)?;
+    }
 
     if let Ok(mut guard) = state.active_server_label.lock() {
         *guard = Some(server_label.clone());

@@ -883,11 +883,14 @@ fn try_self_restart_xray_runtime(
         }
     }
 
-    if runtime.network_mode == "tun" {
-        if let Err(error) = ensure_tun_alias_available() {
-            return Err(Box::new((runtime, error)));
+    let expected_adapter = if runtime.network_mode == "tun" {
+        match prepare_owned_tun_adapter(app) {
+            Ok(adapter) => adapter,
+            Err(error) => return Err(Box::new((runtime, error))),
         }
-    }
+    } else {
+        None
+    };
     let mut child =
         match spawn_xray_runtime_child(&core_path, &config_path, &log_path, &runtime.config_hash) {
             Ok(child) => child,
@@ -905,7 +908,7 @@ fn try_self_restart_xray_runtime(
         return Err(Box::new((runtime, error)));
     }
 
-    if runtime.network_mode == "tun" {
+    let tun_adapter = if runtime.network_mode == "tun" {
         let Some(interface) = runtime.tun_interface_plan else {
             let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
             return Err(Box::new((runtime, "TUN_INTERFACE_PLAN_MISSING".into())));
@@ -914,15 +917,19 @@ fn try_self_restart_xray_runtime(
             .tun_interface_name
             .clone()
             .unwrap_or_else(|| TUN_INTERFACE_NAME.to_string());
-        if let Err(error) = configure_tun_routes(app, &tun_name, interface) {
-            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
-            return Err(Box::new((
-                runtime,
-                format!("Xray перезапущен, но TUN маршруты не восстановились: {error}"),
-            )));
-        }
+        let adapter =
+            match configure_tun_routes(app, &tun_name, interface, expected_adapter.as_ref()) {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+                    return Err(Box::new((
+                        runtime,
+                        format!("Xray перезапущен, но TUN маршруты не восстановились: {error}"),
+                    )));
+                }
+            };
         std::thread::sleep(Duration::from_millis(250));
-        if let Err(error) = confirm_tun_routes_ready(app, interface) {
+        if let Err(error) = confirm_tun_routes_ready(app, interface, &adapter) {
             let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
             return Err(Box::new((runtime, error)));
         }
@@ -930,7 +937,10 @@ fn try_self_restart_xray_runtime(
             app,
             "TUN маршруты повторно применены после автоматического перезапуска Xray.",
         );
-    }
+        Some(adapter)
+    } else {
+        None
+    };
 
     if let Err(error) = check_current_operation(state) {
         let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
@@ -963,6 +973,12 @@ fn try_self_restart_xray_runtime(
     if let Err(error) = check_current_operation(state) {
         let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
         return Err(Box::new((runtime, error)));
+    }
+    if let Some(adapter) = tun_adapter {
+        if let Err(error) = record_owned_tun_adapter(app, adapter, &mut child) {
+            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+            return Err(Box::new((runtime, error)));
+        }
     }
     runtime.child = child;
     runtime.started_at = unix_now_string();
