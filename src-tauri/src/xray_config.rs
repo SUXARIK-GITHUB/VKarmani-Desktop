@@ -497,21 +497,44 @@ fn build_from_full_xray_config_template(
         own("profile-http"),
         own("profile-tun"),
     ];
-    for (source, target) in [
-        ("socks-in", "socks"),
-        ("http-in", "http"),
-        ("tun-in", "tun"),
-    ] {
-        outbounds.push(json!({"tag":own(&format!("dispatch-{target}")),"protocol":"loopback","settings":{"inboundTag":own(&format!("profile-{target}"))}}));
-        if source != "tun-in" {
-            adapter_rules.push(json!({"type":"field","inboundTag":[own(source)],"outboundTag":own(&format!("dispatch-{target}")),"ruleTag":own(&format!("enter-{target}"))}));
-        }
-    }
     let provider_rules = config
         .pointer("/routing/rules")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let needs_protocol = provider_rules.iter().any(|rule| {
+        rule.as_object().is_some_and(|rule| {
+            rule.iter().any(|(key, value)| {
+                xray_json_field_matches(key, "protocol")
+                    && value
+                        .as_array()
+                        .is_some_and(|protocols| !protocols.is_empty())
+            })
+        })
+    });
+    for (source, target) in [
+        ("socks-in", "socks"),
+        ("http-in", "http"),
+        ("tun-in", "tun"),
+    ] {
+        let mut settings = json!({"inboundTag": own(&format!("profile-{target}"))});
+        // Xray loopback starts a fresh session.Content, including Protocol.
+        // Repeat route-only sniffing when a provider rule needs that protocol.
+        if needs_protocol {
+            let tag = own(source);
+            if let Some(sniffing) = inbounds
+                .iter()
+                .find(|inbound| inbound["tag"] == tag)
+                .and_then(|inbound| inbound.get("sniffing"))
+            {
+                settings["sniffing"] = sniffing.clone();
+            }
+        }
+        outbounds.push(json!({"tag":own(&format!("dispatch-{target}")),"protocol":"loopback","settings":settings}));
+        if source != "tun-in" {
+            adapter_rules.push(json!({"type":"field","inboundTag":[own(source)],"outboundTag":own(&format!("dispatch-{target}")),"ruleTag":own(&format!("enter-{target}"))}));
+        }
+    }
     for mut rule in provider_rules {
         let scope = if let Some(tags) = rule.get("inboundTag").and_then(Value::as_array) {
             let mut mapped = Vec::new();
@@ -1464,6 +1487,55 @@ mod fragment_compat_tests {
         ))
         .unwrap()
     }
+
+    #[test]
+    fn provider_protocol_rules_preserve_sniffing_at_the_second_routing_pass() {
+        let mut source = fixture();
+        for mode in ["proxy", "tun"] {
+            for needs_protocol in [false, true] {
+                source["routing"]["rules"] = if needs_protocol {
+                    json!([{"type":"field","Protocol":["http"],"outboundTag":"pool-raw"}])
+                } else {
+                    json!([{"type":"field","network":"tcp","outboundTag":"pool-raw"}])
+                };
+                let (runtime, _, _) = build_xray_config(
+                    &template(source.clone()),
+                    mode,
+                    "ipv4",
+                    None,
+                    &[],
+                    None,
+                    None,
+                )
+                .unwrap();
+                let inbounds = runtime["inbounds"].as_array().unwrap();
+                let outbounds = runtime["outbounds"].as_array().unwrap();
+                for ingress in ["socks", "http", "tun"] {
+                    let suffix = format!("vkarmani.dispatch-{ingress}");
+                    let outbound = outbounds
+                        .iter()
+                        .find(|item| {
+                            item["protocol"] == "loopback"
+                                && item["tag"]
+                                    .as_str()
+                                    .is_some_and(|tag| tag.ends_with(&suffix))
+                        })
+                        .expect("client dispatch outbound");
+                    let inbound = inbounds.iter().find(|inbound| {
+                        inbound["tag"]
+                            .as_str()
+                            .is_some_and(|tag| tag.ends_with(&format!("{ingress}-in")))
+                    });
+                    if let Some(inbound) = inbound.filter(|_| needs_protocol) {
+                        assert_eq!(outbound["settings"]["sniffing"], inbound["sniffing"]);
+                        assert_eq!(outbound["settings"]["sniffing"]["routeOnly"], true);
+                    } else {
+                        assert!(outbound["settings"].get("sniffing").is_none());
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn ordered_masks_and_reality_remain_unchanged_in_proxy_and_tun() {
         let original = fixture();
@@ -1853,13 +1925,14 @@ mod fragment_compat_tests {
         let (entry_port, exit_port, target_port) = (port(&entry), port(&exit), port(&target));
         let source = json!({
             "outbounds": [
+                {"tag":"provider-deny","protocol":"blackhole"},
                 {"tag":"exit","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":exit_port}]},
                  "proxySettings":{"tag":"entry","transportLayer":true}},
                 {"tag":"entry","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":entry_port}]}}
             ],
             "routing": {
                 "balancers":[{"tag":"synthetic-auto","selector":["exit"],"strategy":{"type":"random"}}],
-                "rules":[{"type":"field","network":"tcp,udp","balancerTag":"synthetic-auto"}]
+                "rules":[{"type":"field","protocol":["http"],"balancerTag":"synthetic-auto"}]
             },
             "policy":{"system":{"statsInboundUplink":false,"statsInboundDownlink":false}}
         });

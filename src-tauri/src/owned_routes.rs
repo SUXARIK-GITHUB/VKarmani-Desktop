@@ -277,9 +277,19 @@ mod windows {
             return Err("ROUTE_OWNER_UNKNOWN: invalid journal owner identity".into());
         }
         if pid == current_pid {
-            // A live PID is unique. This version can only have written a
-            // journal with a generation, so a legacy record cannot be a rival.
-            return Ok(());
+            let recorded = journal.owner_created_at.ok_or(
+                "ROUTE_OWNER_UNKNOWN: current PID matches a legacy journal without creation identity",
+            )?;
+            let current = process_created_at(unsafe { GetCurrentProcess() })
+                .map_err(|code| format!("ROUTE_OWNER_UNKNOWN: GetProcessTimes: Win32 {code}"))?;
+            // The retained current identity proves either this owner or a
+            // later process that reused its PID. Route validation still follows.
+            if recorded <= current {
+                return Ok(());
+            }
+            return Err(
+                "ROUTE_OWNER_UNKNOWN: journal owner is newer than the current process".into(),
+            );
         }
         let details =
             format!(
@@ -619,6 +629,27 @@ mod windows {
         journal.owner_pid = 0;
         assert!(verify_previous_owner(&journal, |_, _| panic!("invalid PID was queried")).is_err());
     }
+
+    #[test]
+    fn a_current_pid_with_no_generation_does_not_prove_legacy_route_ownership() {
+        let actual = process_created_at(unsafe { GetCurrentProcess() }).unwrap();
+        let mut journal = RouteJournal {
+            version: 1,
+            owner_pid: std::process::id(),
+            owner_created_at: None,
+            entries: vec![],
+        };
+        let unexpected = |_, _| panic!("current process uses its retained identity");
+        assert!(verify_previous_owner(&journal, unexpected)
+            .unwrap_err()
+            .starts_with("ROUTE_OWNER_UNKNOWN:"));
+        journal.owner_created_at = Some(actual);
+        assert!(verify_previous_owner(&journal, unexpected).is_ok());
+        journal.owner_created_at = Some(actual - 1);
+        assert!(verify_previous_owner(&journal, unexpected).is_ok());
+        journal.owner_created_at = Some(actual + 1);
+        assert!(verify_previous_owner(&journal, unexpected).is_err());
+    }
     #[test]
     fn route_journal_reader_refuses_linked_journal_without_trusting_it() {
         let root = std::env::temp_dir().join(format!(
@@ -665,7 +696,7 @@ mod windows {
         let journal = RouteJournal {
             version: 1,
             owner_pid: std::process::id(),
-            owner_created_at: None,
+            owner_created_at: Some(process_created_at(unsafe { GetCurrentProcess() }).unwrap()),
             entries: vec![],
         };
         let encrypted = encrypt_access_key(&serde_json::to_string(&journal).unwrap()).unwrap();
