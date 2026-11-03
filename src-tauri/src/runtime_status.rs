@@ -91,7 +91,7 @@ pub(crate) fn build_runtime_status(
 
     let message = if connected && current_network_mode.as_deref() == Some("tun") {
         format!(
-            "Xray TUN режим активен{}. VKarmani направляет выбранные процессы через VPN, остальной трафик выходит напрямую.",
+            "Xray TUN runtime активен{}. Владение маршрутами: {route_ownership}. Передача TCP/UDP приложений не проверена.",
             current_tun_name
                 .as_deref()
                 .map(|name| format!(" через интерфейс {name}"))

@@ -83,16 +83,35 @@ impl Drop for PendingXray {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
             let pid = child.id();
-            let _ = terminate_child_with_timeout(child, Duration::from_secs(3));
+            let stopped = terminate_child_with_timeout(child, Duration::from_secs(3)).is_some();
             child.release_integrity();
             let state = self.app.state::<AppState>();
-            clear_starting_runtime(&state, pid);
-            if self.network_mode == "tun" {
-                let _ =
-                    cleanup_tun_routes_for_app(&self.app, TUN_INTERFACE_NAME, &self.tun_server_ips);
+            if stopped {
+                clear_starting_runtime(&state, pid);
+                if self.network_mode == "tun" {
+                    if let Err(error) = cleanup_tun_routes_for_app(
+                        &self.app,
+                        TUN_INTERFACE_NAME,
+                        &self.tun_server_ips,
+                    ) {
+                        let _ = append_runtime_event(
+                            &self.app,
+                            &format!("ROUTE_CLEANUP_INCOMPLETE: {error}"),
+                        );
+                    }
+                }
+                let _ = fs::remove_file(&self.config_path);
+            } else {
+                let _ = append_runtime_event(
+                    &self.app,
+                    "PROCESS_STOP_UNCONFIRMED: pending Xray exited without confirmed cleanup",
+                );
             }
-            let _ = restore_saved_proxy_state(&self.app, &state, "pending_start_failed");
-            let _ = fs::remove_file(&self.config_path);
+            if let Err(error) = restore_saved_proxy_state(&self.app, &state, "pending_start_failed")
+            {
+                let _ =
+                    append_runtime_event(&self.app, &format!("PROXY_CLEANUP_INCOMPLETE: {error}"));
+            }
         }
     }
 }
@@ -649,7 +668,7 @@ impl Drop for PreparedNetworkConfig {
         }
     }
 }
-fn current_physical_binding() -> Result<DefaultRouteSnapshot, String> {
+pub(crate) fn current_physical_binding() -> Result<DefaultRouteSnapshot, String> {
     #[cfg(target_os = "windows")]
     {
         default_route_snapshot()
@@ -694,7 +713,7 @@ fn prepare_network_config(
     };
     // Xray constructs/starts its TUN adapter inside core.New even for -test.
     // Check provider transports without constructing another live TUN. The
-    // unchanged full config is validated only after confirmed owned-child stop.
+    // Full config is compiled without creating an adapter.
     let projection = config_preflight_projection(&config)?;
     let projection_bytes =
         serde_json::to_vec_pretty(&projection).map_err(|_| "NETWORK_CONFIG_SERIALIZE")?;
@@ -776,7 +795,11 @@ fn try_self_restart_xray_runtime(
             Ok(value) => value,
             Err(error) => return Err(Box::new((runtime, error))),
         };
-        if runtime.physical_binding.as_ref() != Some(&fresh) {
+        if !runtime
+            .physical_binding
+            .as_ref()
+            .is_some_and(|active| same_tun_physical_binding(active, &fresh))
+        {
             prepared_network = match prepare_network_config(&runtime, fresh) {
                 Ok(value) => Some(value),
                 Err(error) => return Err(Box::new((runtime, error))),
@@ -854,12 +877,23 @@ fn try_self_restart_xray_runtime(
             )));
         }
         if let Err(error) =
-            validate_xray_config_with_core(&core_path, &config_path, &runtime.config_hash)
+            compile_xray_tun_config_with_core(&core_path, &config_path, &runtime.config_hash)
         {
             return Err(Box::new((runtime, error)));
         }
     }
 
+    let expected_adapter = if runtime.network_mode == "tun" {
+        match prepare_owned_tun_adapter(app) {
+            Ok(adapter) => adapter,
+            Err(error) => return Err(Box::new((runtime, error))),
+        }
+    } else {
+        None
+    };
+    if let Err(error) = check_current_operation(state) {
+        return Err(Box::new((runtime, error)));
+    }
     let mut child =
         match spawn_xray_runtime_child(&core_path, &config_path, &log_path, &runtime.config_hash) {
             Ok(child) => child,
@@ -877,34 +911,55 @@ fn try_self_restart_xray_runtime(
         return Err(Box::new((runtime, error)));
     }
 
-    if runtime.network_mode == "tun" {
+    let tun_adapter = if runtime.network_mode == "tun" {
+        let Some(interface) = runtime.tun_interface_plan else {
+            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+            return Err(Box::new((runtime, "TUN_INTERFACE_PLAN_MISSING".into())));
+        };
         let tun_name = runtime
             .tun_interface_name
             .clone()
             .unwrap_or_else(|| TUN_INTERFACE_NAME.to_string());
-        if let Err(error) = configure_tun_routes(app, &tun_name, &runtime.tun_server_ips) {
-            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
-            return Err(Box::new((
-                runtime,
-                format!("Xray перезапущен, но TUN маршруты не восстановились: {error}"),
-            )));
-        }
+        let adapter =
+            match configure_tun_routes(app, &tun_name, interface, expected_adapter.as_ref()) {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+                    return Err(Box::new((
+                        runtime,
+                        format!("Xray перезапущен, но TUN маршруты не восстановились: {error}"),
+                    )));
+                }
+            };
         std::thread::sleep(Duration::from_millis(250));
+        if let Err(error) = confirm_tun_routes_ready(app, interface, &adapter) {
+            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+            return Err(Box::new((runtime, error)));
+        }
         let _ = append_runtime_event(
             app,
             "TUN маршруты повторно применены после автоматического перезапуска Xray.",
         );
-    }
+        Some(adapter)
+    } else {
+        None
+    };
 
     if let Err(error) = check_current_operation(state) {
         let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
         return Err(Box::new((runtime, error)));
     }
-    if runtime.network_mode == "tun"
-        && current_physical_binding().ok().as_ref() != runtime.physical_binding.as_ref()
-    {
-        let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
-        return Err(Box::new((runtime, "NETWORK_CHANGED_DURING_RESTART".into())));
+    if runtime.network_mode == "tun" {
+        if let Err(error) = confirm_tun_physical_binding(
+            runtime.physical_binding.as_ref(),
+            current_physical_binding(),
+        ) {
+            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+            return Err(Box::new((
+                runtime,
+                format!("NETWORK_CHANGED_DURING_RESTART: {error}"),
+            )));
+        }
     }
     // Routes/binding checks may outlive the first readiness snapshot. A dead
     // replacement must not be published as connected after that setup window.
@@ -921,6 +976,12 @@ fn try_self_restart_xray_runtime(
     if let Err(error) = check_current_operation(state) {
         let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
         return Err(Box::new((runtime, error)));
+    }
+    if let Some(adapter) = tun_adapter {
+        if let Err(error) = record_owned_tun_adapter(app, adapter, &mut child) {
+            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
+            return Err(Box::new((runtime, error)));
+        }
     }
     runtime.child = child;
     runtime.started_at = unix_now_string();
@@ -964,14 +1025,16 @@ fn finalize_unexpected_xray_exit(
     reason: &str,
 ) {
     if runtime.network_mode == "tun" {
-        let _ = cleanup_tun_routes_for_app(
+        if let Err(error) = cleanup_tun_routes_for_app(
             app,
             runtime
                 .tun_interface_name
                 .as_deref()
                 .unwrap_or(TUN_INTERFACE_NAME),
             &runtime.tun_server_ips,
-        );
+        ) {
+            let _ = append_runtime_event(app, &format!("ROUTE_CLEANUP_INCOMPLETE: {error}"));
+        }
     }
     runtime.child.release_integrity();
     let _ = fs::remove_file(Path::new(&runtime.config_path));
@@ -994,7 +1057,9 @@ fn finalize_unexpected_xray_exit(
             reason
         ),
     );
-    let _ = restore_saved_proxy_state(app, state, "xray_exit");
+    if let Err(error) = restore_saved_proxy_state(app, state, "xray_exit") {
+        let _ = append_runtime_event(app, &format!("PROXY_CLEANUP_INCOMPLETE: {error}"));
+    }
     let _ = app.emit("vkarmani://native-disconnect", "stopped");
     refresh_tray_menu(app);
 }
@@ -1144,7 +1209,9 @@ fn sync_physical_network(app: &AppHandle, state: &tauri::State<AppState>) {
             return;
         }
     };
-    if operation.check().is_err() || current_physical_binding().ok().as_ref() != Some(&fresh) {
+    if operation.check().is_err()
+        || confirm_tun_physical_binding(Some(&fresh), current_physical_binding()).is_err()
+    {
         return;
     }
     let runtime_to_stop = {

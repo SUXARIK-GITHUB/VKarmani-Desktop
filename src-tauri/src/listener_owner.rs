@@ -447,6 +447,7 @@ mod tests {
                 traffic_inbound_tags: ["http-in".into(), "socks-in".into()],
                 network_mode: "proxy".into(),
                 tun_interface_name: None,
+                tun_interface_plan: None,
                 tun_server_ips: Vec::new(),
                 self_restart_count: 0,
                 last_self_restart_at: None,
@@ -490,8 +491,9 @@ mod tests {
             assert_eq!(fields[1].parse::<u32>().unwrap(), child.id());
             let port = fields[2].parse::<u16>().unwrap();
             let state = probe_state(child);
-            let identity =
+            let (identity, is_tun) =
                 crate::connectivity_probe_runtime_identity(&state, None, &[port]).unwrap();
+            assert!(!is_tun);
             assert!(crate::connectivity_probe_runtime_identity(
                 &state,
                 Some(&identity),
@@ -512,11 +514,12 @@ mod tests {
                     .unwrap_err(),
                 "CONNECTIVITY_RUNTIME_SUPERSEDED"
             );
-            let fresh = crate::connectivity_probe_runtime_identity(&state, None, &[port]).unwrap();
+            let (fresh, _) =
+                crate::connectivity_probe_runtime_identity(&state, None, &[port]).unwrap();
             assert_ne!(identity, fresh);
             assert_eq!(
                 crate::connectivity_probe_runtime_identity(&state, Some(&fresh), &[port]).unwrap(),
-                fresh
+                (fresh, false)
             );
             let mut child = state.runtime.lock().unwrap().take().unwrap().child;
             assert_eq!(child_listeners_ready(&mut child, &[port]), Ok(true));

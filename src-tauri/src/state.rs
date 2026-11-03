@@ -20,6 +20,7 @@ pub(crate) struct ManagedCore {
     pub(crate) traffic_inbound_tags: [String; 2],
     pub(crate) network_mode: String,
     pub(crate) tun_interface_name: Option<String>,
+    pub(crate) tun_interface_plan: Option<TunInterfacePlan>,
     pub(crate) tun_server_ips: Vec<String>,
     pub(crate) self_restart_count: u8,
     pub(crate) last_self_restart_at: Option<String>,

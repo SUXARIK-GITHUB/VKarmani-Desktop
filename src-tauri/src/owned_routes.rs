@@ -1,5 +1,13 @@
 use super::*;
 
+fn tun_destinations(interface: TunInterfacePlan) -> &'static [&'static str] {
+    if interface.ipv6_guard {
+        &["0.0.0.0", "128.0.0.0", "::", "8000::"]
+    } else {
+        &["0.0.0.0", "128.0.0.0"]
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OwnedRoute {
@@ -33,6 +41,8 @@ struct RouteEntry {
 struct RouteJournal {
     version: u8,
     owner_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_created_at: Option<u64>,
     entries: Vec<RouteEntry>,
 }
 
@@ -178,15 +188,169 @@ fn install_routes_with_rollback(
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND},
-        NetworkManagement::{IpHelper::*, Ndis::NET_LUID_LH},
-        Networking::WinSock::*,
-        System::Threading::{
-            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_SYNCHRONIZE,
+    use windows_sys::{
+        core::GUID,
+        Win32::{
+            Devices::{
+                DeviceAndDriverInstallation::{
+                    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+                    SetupDiGetDevicePropertyW, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL,
+                    DIGCF_PRESENT, DIREG_DRV, HDEVINFO, SP_DEVINFO_DATA,
+                },
+                Properties::{
+                    DEVPKEY_Device_IsPresent, DEVPROPKEY, DEVPROP_TYPE_BOOLEAN, DEVPROP_TYPE_STRING,
+                },
+            },
+            Foundation::{
+                CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
+                ERROR_NOT_FOUND, ERROR_NO_MORE_ITEMS, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+                WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+            },
+            NetworkManagement::{
+                IpHelper::*,
+                Ndis::{
+                    IfOperStatusDown, IfOperStatusNotPresent, IfOperStatusUp,
+                    MediaConnectStateConnected, MediaConnectStateDisconnected,
+                    MediaConnectStateUnknown, NET_LUID_LH,
+                },
+            },
+            Networking::WinSock::*,
+            System::{
+                Com::CLSIDFromString,
+                Registry::{
+                    RegCloseKey, RegGetValueW, KEY_QUERY_VALUE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+                },
+                Threading::{
+                    GetCurrentProcess, GetProcessTimes, OpenProcess, WaitForSingleObject,
+                    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+                },
+            },
         },
     };
+
+    struct ProcessHandle(HANDLE);
+
+    impl Drop for ProcessHandle {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn win32_error() -> u32 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32
+    }
+
+    fn process_created_at(handle: HANDLE) -> Result<u64, u32> {
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+        if unsafe { GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) } == 0
+        {
+            return Err(win32_error());
+        }
+        Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum OwnerObservation {
+        Exited,
+        Running,
+        IdentityOnly(u64),
+        Unknown(&'static str, u32),
+    }
+
+    fn open_owner(pid: u32, access: u32) -> Result<ProcessHandle, u32> {
+        let handle = unsafe { OpenProcess(access, 0, pid) };
+        if handle.is_null() {
+            return Err(win32_error());
+        }
+        Ok(ProcessHandle(handle))
+    }
+
+    fn owner_observation(pid: u32, created_at: Option<u64>) -> OwnerObservation {
+        let handle = match open_owner(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)
+        {
+            Ok(handle) => handle,
+            Err(ERROR_INVALID_PARAMETER) => return OwnerObservation::Exited,
+            Err(ERROR_ACCESS_DENIED) if created_at.is_some() => {
+                // Query-only can prove PID reuse, never that the same owner exited.
+                return match open_owner(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+                    Ok(handle) => match process_created_at(handle.0) {
+                        Ok(created) => OwnerObservation::IdentityOnly(created),
+                        Err(code) => OwnerObservation::Unknown("GetProcessTimes", code),
+                    },
+                    Err(ERROR_INVALID_PARAMETER) => OwnerObservation::Exited,
+                    Err(code) => OwnerObservation::Unknown("OpenProcess(query)", code),
+                };
+            }
+            Err(code) => return OwnerObservation::Unknown("OpenProcess", code),
+        };
+        match unsafe { WaitForSingleObject(handle.0, 0) } {
+            WAIT_OBJECT_0 => OwnerObservation::Exited,
+            WAIT_TIMEOUT if created_at.is_some() => match process_created_at(handle.0) {
+                Ok(created) if Some(created) != created_at => {
+                    OwnerObservation::IdentityOnly(created)
+                }
+                Ok(_) => OwnerObservation::Running,
+                Err(code) => OwnerObservation::Unknown("GetProcessTimes", code),
+            },
+            WAIT_TIMEOUT => OwnerObservation::Running,
+            WAIT_FAILED => OwnerObservation::Unknown("WaitForSingleObject", win32_error()),
+            code => OwnerObservation::Unknown("WaitForSingleObject result", code),
+        }
+    }
+
+    fn verify_previous_owner(
+        journal: &RouteJournal,
+        observe: impl FnOnce(u32, Option<u64>) -> OwnerObservation,
+    ) -> Result<(), String> {
+        let pid = journal.owner_pid;
+        let current_pid = std::process::id();
+        if pid == 0 || journal.owner_created_at == Some(0) {
+            return Err("ROUTE_OWNER_UNKNOWN: invalid journal owner identity".into());
+        }
+        if pid == current_pid {
+            let recorded = journal.owner_created_at.ok_or(
+                "ROUTE_OWNER_UNKNOWN: current PID matches a legacy journal without creation identity",
+            )?;
+            let current = process_created_at(unsafe { GetCurrentProcess() })
+                .map_err(|code| format!("ROUTE_OWNER_UNKNOWN: GetProcessTimes: Win32 {code}"))?;
+            // The retained current identity proves either this owner or a
+            // later process that reused its PID. Route validation still follows.
+            if recorded <= current {
+                return Ok(());
+            }
+            return Err(
+                "ROUTE_OWNER_UNKNOWN: journal owner is newer than the current process".into(),
+            );
+        }
+        let details =
+            format!(
+            "ownerPID={pid}, currentPID={current_pid}, ownerCreatedAt={:?}, entries={}, LUID={:?}",
+            journal.owner_created_at,
+            journal.entries.len(),
+            journal.entries.first().map(|entry| entry.route.interface_luid),
+        );
+        match observe(pid, journal.owner_created_at) {
+            OwnerObservation::Exited => Ok(()),
+            OwnerObservation::IdentityOnly(created)
+                if journal.owner_created_at.is_some_and(|owner| owner != created) =>
+            {
+                Ok(())
+            }
+            OwnerObservation::Running => Err(format!(
+                "ROUTE_OWNER_ACTIVE: предыдущий owner process ещё активен. {details}"
+            )),
+            OwnerObservation::IdentityOnly(_) => Err(format!(
+                "ROUTE_OWNER_UNKNOWN: невозможно проверить завершение предыдущего process. Win32 {ERROR_ACCESS_DENIED}; {details}"
+            )),
+            OwnerObservation::Unknown(operation, code) => Err(format!(
+                "ROUTE_OWNER_UNKNOWN: невозможно проверить предыдущий process. {operation}: Win32 {code}; {details}"
+            )),
+        }
+    }
 
     pub(super) fn interface_identity(index: u32) -> Result<(u64, String), String> {
         let mut row: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };
@@ -205,6 +369,993 @@ mod windows {
             String::from_utf16_lossy(&row.Alias[..end]),
         ))
     }
+    #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+    pub(crate) struct AdapterIdentity {
+        guid: [u8; 16],
+        #[serde(with = "luid_text")]
+        luid: u64,
+        kind: u32,
+        description: String,
+    }
+
+    impl AdapterIdentity {
+        fn is_wintun(&self) -> bool {
+            self.guid != [0; 16]
+                && self.luid != 0
+                && self.kind == IF_TYPE_PROP_VIRTUAL
+                && self.description.to_ascii_lowercase().contains("wintun")
+        }
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct AdapterReceipt {
+        version: u8,
+        identity: AdapterIdentity,
+        pid: u32,
+        created_at: u64,
+    }
+
+    struct AdapterObservation {
+        identity: AdapterIdentity,
+        index: u32,
+        media: i32,
+        oper_status: i32,
+    }
+
+    impl AdapterObservation {
+        fn details(&self) -> String {
+            let AdapterIdentity {
+                guid, luid, kind, ..
+            } = self.identity;
+            let guid = canonical_guid(guid);
+            format!(
+                "alias={TUN_INTERFACE_NAME}, GUID={guid}, LUID={luid}, index={}, ifType={kind}, Wintun={}, media={}, operStatus={}",
+                self.index, self.identity.is_wintun(), self.media, self.oper_status,
+            )
+        }
+    }
+
+    fn canonical_guid(guid: [u8; 16]) -> String {
+        let hex: String = guid.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        )
+    }
+
+    fn wide_field(field: &[u16]) -> String {
+        let end = field
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(field.len());
+        String::from_utf16_lossy(&field[..end])
+    }
+
+    fn guid_bytes(raw: GUID) -> [u8; 16] {
+        let mut guid = [0; 16];
+        guid[..4].copy_from_slice(&raw.data1.to_be_bytes());
+        guid[4..6].copy_from_slice(&raw.data2.to_be_bytes());
+        guid[6..8].copy_from_slice(&raw.data3.to_be_bytes());
+        guid[8..].copy_from_slice(&raw.data4);
+        guid
+    }
+
+    struct DeviceList(HDEVINFO);
+
+    impl Drop for DeviceList {
+        fn drop(&mut self) {
+            unsafe { SetupDiDestroyDeviceInfoList(self.0) };
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum WintunName {
+        Missing,
+        Unique([u8; 16]),
+        Retired { guid: [u8; 16], luid: u64 },
+        Duplicate,
+    }
+
+    fn named_wintun_device(only_present: bool) -> Result<WintunName, String> {
+        // WintunOpenAdapter uses this device property, which Windows adapter
+        // renames do not update. Reading it via SetupAPI has no Wintun side effects.
+        const NET_CLASS: GUID = GUID::from_u128(0x4d36e972_e325_11ce_bfc1_08002be10318);
+        const WINTUN_NAME: DEVPROPKEY = DEVPROPKEY {
+            fmtid: GUID::from_u128(0x3361c968_2f2e_4660_b47e_699cdc4c32b9),
+            pid: 3,
+        };
+        let fail = |api, code| format!("TUN_INTERFACE_OWNER_UNKNOWN: {api}: Win32 {code}");
+        let mut matched = None;
+        // The pinned Wintun uses SWD on supported Windows, ROOT on Windows 7.
+        for enumerator in [r"SWD\Wintun", r"ROOT\Wintun"] {
+            let enumerator: Vec<u16> = enumerator.encode_utf16().chain(Some(0)).collect();
+            let devices = unsafe {
+                SetupDiGetClassDevsW(
+                    &NET_CLASS,
+                    enumerator.as_ptr(),
+                    null_mut(),
+                    if only_present { DIGCF_PRESENT } else { 0 },
+                )
+            };
+            if devices == INVALID_HANDLE_VALUE as HDEVINFO {
+                return Err(fail("SetupDiGetClassDevsW", win32_error()));
+            }
+            let devices = DeviceList(devices);
+            let mut ended = false;
+            for index in 0..8192 {
+                let mut node: SP_DEVINFO_DATA = unsafe { std::mem::zeroed() };
+                node.cbSize = std::mem::size_of_val(&node) as u32;
+                if unsafe { SetupDiEnumDeviceInfo(devices.0, index, &mut node) } == 0 {
+                    let code = win32_error();
+                    if code != ERROR_NO_MORE_ITEMS {
+                        return Err(fail("SetupDiEnumDeviceInfo", code));
+                    }
+                    ended = true;
+                    break;
+                }
+                let mut name = [0u16; 256];
+                let mut kind = 0;
+                if unsafe {
+                    SetupDiGetDevicePropertyW(
+                        devices.0,
+                        &node,
+                        &WINTUN_NAME,
+                        &mut kind,
+                        name.as_mut_ptr().cast(),
+                        std::mem::size_of_val(&name) as u32,
+                        null_mut(),
+                        0,
+                    )
+                } == 0
+                {
+                    let code = win32_error();
+                    if code == ERROR_NOT_FOUND {
+                        continue; // WintunOpenAdapter also skips nodes without its name.
+                    }
+                    return Err(fail("SetupDiGetDevicePropertyW", code));
+                }
+                if kind != DEVPROP_TYPE_STRING
+                    || !wide_field(&name).eq_ignore_ascii_case(TUN_INTERFACE_NAME)
+                {
+                    continue;
+                }
+                if matched.is_some() {
+                    return Ok(WintunName::Duplicate);
+                }
+                let key = unsafe {
+                    SetupDiOpenDevRegKey(
+                        devices.0,
+                        &node,
+                        DICS_FLAG_GLOBAL,
+                        0,
+                        DIREG_DRV,
+                        KEY_QUERY_VALUE,
+                    )
+                };
+                if key == INVALID_HANDLE_VALUE {
+                    return Err(fail("SetupDiOpenDevRegKey", win32_error()));
+                }
+                let value: Vec<u16> = "NetCfgInstanceId".encode_utf16().chain(Some(0)).collect();
+                let mut guid = [0u16; 40];
+                let mut bytes = std::mem::size_of_val(&guid) as u32;
+                let status = unsafe {
+                    RegGetValueW(
+                        key,
+                        null(),
+                        value.as_ptr(),
+                        RRF_RT_REG_SZ,
+                        null_mut(),
+                        guid.as_mut_ptr().cast(),
+                        &mut bytes,
+                    )
+                };
+                let retired_luid = if only_present {
+                    None
+                } else {
+                    read_retired_wintun_luid(devices.0, &node, key)
+                };
+                unsafe { RegCloseKey(key) };
+                if status != 0 {
+                    return Err(fail("NetCfgInstanceId", status));
+                }
+                let mut parsed = GUID::from_u128(0);
+                if bytes != 78
+                    || guid[38] != 0
+                    || unsafe { CLSIDFromString(guid.as_ptr(), &mut parsed) } != 0
+                {
+                    return Err(
+                        "TUN_INTERFACE_OWNER_UNKNOWN: invalid Wintun NetCfgInstanceId".into(),
+                    );
+                }
+                let guid = guid_bytes(parsed);
+                matched = Some(match retired_luid {
+                    Some(luid) => WintunName::Retired { guid, luid },
+                    None => WintunName::Unique(guid),
+                });
+            }
+            if !ended {
+                return Err("TUN_INTERFACE_TABLE_LIMIT: Wintun devices".into());
+            }
+        }
+        Ok(matched.unwrap_or(WintunName::Missing))
+    }
+
+    fn read_retired_wintun_luid(
+        devices: HDEVINFO,
+        node: &SP_DEVINFO_DATA,
+        key: windows_sys::Win32::System::Registry::HKEY,
+    ) -> Option<u64> {
+        let (mut present, mut kind) = (0xff, 0);
+        let read = unsafe {
+            SetupDiGetDevicePropertyW(
+                devices,
+                node,
+                &DEVPKEY_Device_IsPresent,
+                &mut kind,
+                &mut present,
+                1,
+                null_mut(),
+                0,
+            )
+        };
+        if read == 0 || kind != DEVPROP_TYPE_BOOLEAN || present != 0 {
+            return None;
+        }
+        let read_dword = |name: &str| {
+            let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let mut value = 0u32;
+            let mut size = 4;
+            let status = unsafe {
+                RegGetValueW(
+                    key,
+                    null(),
+                    name.as_ptr(),
+                    RRF_RT_REG_DWORD,
+                    null_mut(),
+                    (&mut value as *mut u32).cast(),
+                    &mut size,
+                )
+            };
+            (status == 0 && size == 4).then_some(value)
+        };
+        let index = read_dword("NetLuidIndex")?;
+        let kind = read_dword("*IfType")?;
+        if index == 0 || index >= 1 << 24 || kind != IF_TYPE_PROP_VIRTUAL {
+            return None;
+        }
+        // NET_LUID: 24 reserved bits, 24 NetLuidIndex bits, 16 IfType bits.
+        Some((u64::from(kind) << 48) | (u64::from(index) << 24))
+    }
+
+    fn is_retired_wintun(current: &AdapterObservation, historical: WintunName) -> bool {
+        // Xray v26.10.31 passes MD5("vkarmani-tun") as the requested Windows
+        // GUID. The GUID corroborates absence here. It never grants ownership.
+        let requested = guid_bytes(GUID::from_u128(0x9a83a959_4093_3468_b11a_96a80880587e));
+        current.identity.is_wintun()
+            && current.identity.guid == requested
+            && current.media == MediaConnectStateUnknown
+            && [IfOperStatusDown, IfOperStatusNotPresent].contains(&current.oper_status)
+            && matches!(historical, WintunName::Retired { guid, luid }
+                if guid == current.identity.guid && luid == current.identity.luid)
+    }
+
+    enum AdapterSnapshot {
+        Absent,
+        Matched(AdapterObservation),
+        Pending(String),
+    }
+
+    fn reconcile_wintun_name(
+        current: Option<AdapterObservation>,
+        named_device: WintunName,
+        starting: bool,
+    ) -> Result<AdapterSnapshot, String> {
+        let named_device = match named_device {
+            WintunName::Missing => None,
+            WintunName::Unique(guid) => Some(guid),
+            WintunName::Retired { .. } => {
+                return Err(
+                    "TUN_INTERFACE_SNAPSHOT_INCONSISTENT: present query returned a retired node"
+                        .into(),
+                )
+            }
+            WintunName::Duplicate => {
+                return Err(
+                    "TUN_INTERFACE_DUPLICATE_WINTUN_NAME: multiple present devices match".into(),
+                );
+            }
+        };
+        match (current, named_device) {
+            (None, None) => Ok(AdapterSnapshot::Absent),
+            (Some(current), Some(guid)) if current.identity.guid == guid => {
+                Ok(AdapterSnapshot::Matched(current))
+            }
+            (Some(current), Some(guid)) => Err(format!(
+                "TUN_INTERFACE_GUID_CONFLICT: PnP NetCfgInstanceId={}; Windows {}",
+                canonical_guid(guid),
+                current.details()
+            )),
+            (Some(current), None) => {
+                let details = format!(
+                    "no present Wintun device returned for Windows {}",
+                    current.details()
+                );
+                if current.identity.is_wintun()
+                    && (starting
+                        || (current.media == MediaConnectStateUnknown
+                            && current.oper_status != IfOperStatusUp))
+                {
+                    Ok(AdapterSnapshot::Pending(details))
+                } else {
+                    Err(format!("TUN_INTERFACE_PNP_MISSING: {details}"))
+                }
+            }
+            (None, Some(guid)) => {
+                let details = format!(
+                    "present Wintun NetCfgInstanceId={} without matching Windows alias",
+                    canonical_guid(guid)
+                );
+                if starting {
+                    Ok(AdapterSnapshot::Pending(details))
+                } else {
+                    Err(format!("TUN_INTERFACE_ALIAS_MISSING: {details}"))
+                }
+            }
+        }
+    }
+
+    fn wait_for_adapter_snapshot(
+        mut snapshot: impl FnMut() -> Result<AdapterSnapshot, String>,
+        mut wait_for_change: impl FnMut() -> bool,
+    ) -> Result<Option<AdapterObservation>, String> {
+        loop {
+            match snapshot()? {
+                AdapterSnapshot::Absent => return Ok(None),
+                AdapterSnapshot::Matched(current) => return Ok(Some(current)),
+                AdapterSnapshot::Pending(details) => {
+                    if !wait_for_change() {
+                        return Err(format!("TUN_INTERFACE_SNAPSHOT_PENDING: {details}"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn observe_windows_alias() -> Result<Option<AdapterObservation>, String> {
+        let mut table = null_mut();
+        let status = unsafe { GetIfTable2(&mut table) };
+        if status != 0 || table.is_null() {
+            return Err(format!("TUN_INTERFACE_TABLE_UNAVAILABLE: Win32 {status}"));
+        }
+        let count = unsafe { (*table).NumEntries } as usize;
+        let result: Result<_, String> = if count <= 8192 {
+            let rows = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!((*table).Table).cast::<MIB_IF_ROW2>(),
+                    count,
+                )
+            };
+            let mut matches = rows
+                .iter()
+                .filter(|row| wide_field(&row.Alias).eq_ignore_ascii_case(TUN_INTERFACE_NAME));
+            let first = matches.next();
+            if matches.next().is_some() {
+                Err("TUN_INTERFACE_OWNER_UNKNOWN: multiple matching aliases".into())
+            } else {
+                Ok(first.map(|row| AdapterObservation {
+                    identity: AdapterIdentity {
+                        guid: guid_bytes(row.InterfaceGuid),
+                        luid: unsafe { row.InterfaceLuid.Value },
+                        kind: row.Type,
+                        description: wide_field(&row.Description),
+                    },
+                    index: row.InterfaceIndex,
+                    media: row.MediaConnectState,
+                    oper_status: row.OperStatus,
+                }))
+            }
+        } else {
+            Err("TUN_INTERFACE_TABLE_LIMIT".into())
+        };
+        unsafe { FreeMibTable(table.cast()) };
+        result
+    }
+
+    fn observe_adapter(starting: bool) -> Result<Option<AdapterObservation>, String> {
+        // PnP presence and IP Helper do not share a snapshot. Give a one-sided
+        // transition time to settle. An incomplete pair never authorizes reuse.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_adapter_snapshot(
+            || {
+                let current = observe_windows_alias()?;
+                let present = named_wintun_device(true)?;
+                if let Some(row) = current.as_ref().filter(|row| {
+                    !starting
+                        && matches!(present, WintunName::Missing)
+                        && row.media == MediaConnectStateUnknown
+                        && row.identity.is_wintun()
+                }) {
+                    if is_retired_wintun(row, named_wintun_device(false)?) {
+                        verify_idle_configuration(row, true)?;
+                        let same = observe_windows_alias()?.is_some_and(|after| {
+                            after.index == row.index
+                                && after.identity == row.identity
+                                && after.media == row.media
+                                && after.oper_status == row.oper_status
+                        });
+                        if same && matches!(named_wintun_device(true)?, WintunName::Missing) {
+                            // This is a retained Windows row, with no openable
+                            // device. Permit ordinary creation, never reuse.
+                            return Ok(AdapterSnapshot::Absent);
+                        }
+                    }
+                }
+                reconcile_wintun_name(current, present, starting)
+            },
+            || {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                true
+            },
+        )
+    }
+
+    fn load_adapter_receipt(path: &Path) -> Result<Option<AdapterReceipt>, String> {
+        let invalid = || {
+            "TUN_INTERFACE_OWNER_UNKNOWN: protected adapter receipt invalid; original preserved"
+                .to_string()
+        };
+        let Some(cipher) = crate::compat_storage::read_state_file(path, 4096).map_err(|error| {
+            format!("TUN_INTERFACE_OWNER_UNKNOWN: protected adapter receipt unreadable: {error}")
+        })?
+        else {
+            return Ok(None);
+        };
+        let text = decrypt_access_key(&cipher).map_err(|_| invalid())?;
+        let receipt: AdapterReceipt = serde_json::from_str(&text).map_err(|_| invalid())?;
+        if receipt.version != 1
+            || receipt.pid == 0
+            || receipt.created_at == 0
+            || !receipt.identity.is_wintun()
+        {
+            return Err(invalid());
+        }
+        Ok(Some(receipt))
+    }
+
+    fn save_adapter_receipt(path: &Path, receipt: &AdapterReceipt) -> Result<(), String> {
+        let text = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
+        atomic_write_text(path, &encrypt_access_key(&text)?, "TUN adapter receipt")
+    }
+
+    fn admit_idle_adapter(
+        current: &AdapterObservation,
+        receipt: Option<&AdapterReceipt>,
+        observe_owner: impl FnOnce(u32, Option<u64>) -> OwnerObservation,
+    ) -> Result<(), String> {
+        if current.media == MediaConnectStateConnected {
+            return Err(format!(
+                "TUN_INTERFACE_ACTIVE: active link; {}",
+                current.details()
+            ));
+        }
+        let Some(receipt) = receipt.filter(|receipt| receipt.identity == current.identity) else {
+            return Err(format!(
+                "TUN_INTERFACE_OWNER_UNKNOWN: no matching protected receipt; {}",
+                current.details()
+            ));
+        };
+        if current.media != MediaConnectStateDisconnected
+            || current.index == 0
+            || !current.identity.is_wintun()
+        {
+            return Err(format!(
+                "TUN_INTERFACE_OWNER_UNKNOWN: link state or identity unconfirmed; {}",
+                current.details()
+            ));
+        }
+        let owner = format!(
+            "ownerPID={}, ownerCreatedAt={}",
+            receipt.pid, receipt.created_at
+        );
+        match observe_owner(receipt.pid, Some(receipt.created_at)) {
+            OwnerObservation::Exited => Ok(()),
+            OwnerObservation::IdentityOnly(created) if created != receipt.created_at => Ok(()),
+            OwnerObservation::Running => Err(format!(
+                "TUN_INTERFACE_ACTIVE: recorded Xray is alive; {owner}, {}",
+                current.details()
+            )),
+            other => Err(format!(
+                "TUN_INTERFACE_OWNER_UNKNOWN: Xray exit unconfirmed ({other:?}); {owner}, {}",
+                current.details()
+            )),
+        }
+    }
+
+    fn expected_idle_address(row: &MIB_UNICASTIPADDRESS_ROW) -> bool {
+        let ip = match unsafe { row.Address.si_family } {
+            AF_INET => IpAddr::from(unsafe { row.Address.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes() }),
+            AF_INET6 => {
+                let ip = std::net::Ipv6Addr::from(unsafe { row.Address.Ipv6.sin6_addr.u.Byte });
+                if ip.segments()[0] & 0xffc0 == 0xfe80
+                    && row.PrefixOrigin == IpPrefixOriginWellKnown
+                {
+                    return true;
+                }
+                IpAddr::from(ip)
+            }
+            _ => return false,
+        };
+        [TUN_GATEWAY_IPV4, TUN_GATEWAY_IPV6].iter().any(|gateway| {
+            let (host, prefix) = gateway.split_once('/').expect("fixed TUN prefix");
+            host.parse::<IpAddr>() == Ok(ip) && prefix.parse::<u8>() == Ok(row.OnLinkPrefixLength)
+        })
+    }
+
+    // Xray may replace interface addresses and DNS at start and flush routes at
+    // close. Even an owned interface may have externally configured state.
+    fn verify_idle_configuration(
+        current: &AdapterObservation,
+        retired: bool,
+    ) -> Result<(), String> {
+        let luid = current.identity.luid;
+        let mut addresses = null_mut();
+        let status = unsafe { GetUnicastIpAddressTable(AF_UNSPEC, &mut addresses) };
+        if status != 0 || addresses.is_null() {
+            return Err(format!(
+                "TUN_INTERFACE_ADDRESS_UNCONFIRMED: Win32 {status}; {}",
+                current.details()
+            ));
+        }
+        let count = unsafe { (*addresses).NumEntries } as usize;
+        let addresses_ok = count <= 65536
+            && unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!((*addresses).Table).cast::<MIB_UNICASTIPADDRESS_ROW>(),
+                    count,
+                )
+            }
+            .iter()
+            .filter(|row| unsafe { row.InterfaceLuid.Value == luid })
+            .all(|row| {
+                !retired && row.InterfaceIndex == current.index && expected_idle_address(row)
+            });
+        unsafe { FreeMibTable(addresses.cast()) };
+
+        let mut routes = null_mut();
+        let status = unsafe { GetIpForwardTable2(AF_UNSPEC, &mut routes) };
+        if status != 0 || routes.is_null() {
+            return Err(format!(
+                "TUN_INTERFACE_ROUTES_UNCONFIRMED: Win32 {status}; {}",
+                current.details()
+            ));
+        }
+        let count = unsafe { (*routes).NumEntries } as usize;
+        let routes_ok = count <= 65536
+            && unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!((*routes).Table).cast::<MIB_IPFORWARD_ROW2>(),
+                    count,
+                )
+            }
+            .iter()
+            .filter(|row| unsafe { row.InterfaceLuid.Value == luid })
+            .all(|row| {
+                !retired && row.InterfaceIndex == current.index && row.Protocol == MIB_IPPROTO_LOCAL
+            });
+        unsafe { FreeMibTable(routes.cast()) };
+
+        let dns_ok = if retired {
+            // A retained NDIS row must have neither IP interface. Do not
+            // substitute absent DNS data from GetAdaptersAddresses for this.
+            interface_row(luid, AF_INET).0 == ERROR_NOT_FOUND
+                && interface_row(luid, AF_INET6).0 == ERROR_NOT_FOUND
+        } else {
+            let dns = read_interface_dns(current.index, luid).map_err(|error| {
+                format!(
+                    "TUN_INTERFACE_DNS_UNCONFIRMED: {error}; {}",
+                    current.details()
+                )
+            })?;
+            dns.is_empty() || dns == TUN_DNS
+        };
+        if !addresses_ok || !routes_ok || !dns_ok {
+            return Err(format!(
+                "TUN_INTERFACE_CONFIGURATION_UNKNOWN: expected addresses={addresses_ok}, local routes only={routes_ok}, expected DNS={dns_ok}; {}",
+                current.details(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn adapter_receipt_path(app: &AppHandle) -> Result<PathBuf, String> {
+        Ok(runtime_output_dir(app)?.join("owned-tun-adapter-v1.dpapi"))
+    }
+
+    fn observe_reusable_adapter(app: &AppHandle) -> Result<Option<AdapterObservation>, String> {
+        let receipt = load_adapter_receipt(&adapter_receipt_path(app)?)?;
+        let Some(current) = observe_adapter(false)? else {
+            return Ok(None);
+        };
+        admit_idle_adapter(&current, receipt.as_ref(), owner_observation)?;
+        Ok(Some(current))
+    }
+
+    pub(super) fn preflight_adapter(app: &AppHandle) -> Result<(), String> {
+        observe_reusable_adapter(app).map(|_| ())
+    }
+
+    pub(super) fn prepare_adapter(app: &AppHandle) -> Result<Option<AdapterIdentity>, String> {
+        let Some(current) = observe_reusable_adapter(app)? else {
+            return Ok(None);
+        };
+        verify_idle_configuration(&current, false)?;
+        let after = observe_adapter(false)?
+            .ok_or("TUN_INTERFACE_OWNER_UNKNOWN: alias disappeared during admission")?;
+        if after.identity != current.identity
+            || after.index != current.index
+            || after.media != current.media
+            || after.oper_status != current.oper_status
+        {
+            return Err(format!(
+                "TUN_INTERFACE_OWNER_UNKNOWN: adapter changed during admission; {}",
+                after.details()
+            ));
+        }
+        let _ = append_runtime_event(
+            app,
+            &format!("TUN_INTERFACE_REUSE_ADMITTED: {}", current.details()),
+        );
+        Ok(Some(current.identity))
+    }
+
+    fn verify_started_adapter(
+        current: &AdapterObservation,
+        expected: Option<&AdapterIdentity>,
+        link: (u32, u64),
+    ) -> Result<(), String> {
+        if (current.index, current.identity.luid) != link
+            || current.media != MediaConnectStateConnected
+            || !current.identity.is_wintun()
+            || expected.is_some_and(|expected| *expected != current.identity)
+        {
+            return Err(format!(
+                "TUN_INTERFACE_GENERATION_UNCONFIRMED: {}",
+                current.details()
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn confirm_started_adapter(
+        expected: Option<&AdapterIdentity>,
+        link: (u32, u64),
+    ) -> Result<AdapterIdentity, String> {
+        let current =
+            observe_adapter(true)?.ok_or("TUN_INTERFACE_GENERATION_UNCONFIRMED: alias missing")?;
+        verify_started_adapter(&current, expected, link)?;
+        Ok(current.identity)
+    }
+
+    pub(super) fn record_adapter(
+        app: &AppHandle,
+        identity: AdapterIdentity,
+        child: &mut Child,
+    ) -> Result<(), String> {
+        use std::os::windows::io::AsRawHandle;
+        let created_at = process_created_at(child.as_raw_handle()).map_err(|code| {
+            format!("TUN_INTERFACE_OWNER_UNKNOWN: GetProcessTimes: Win32 {code}")
+        })?;
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err(
+                "TUN_INTERFACE_OWNER_EXITED: Xray exited before recording the adapter".into(),
+            );
+        }
+        save_adapter_receipt(
+            &adapter_receipt_path(app)?,
+            &AdapterReceipt {
+                version: 1,
+                identity,
+                pid: child.id(),
+                created_at,
+            },
+        )?;
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err(
+                "TUN_INTERFACE_OWNER_EXITED: Xray exited before publishing the runtime".into(),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn adapter_fixture() -> (AdapterObservation, AdapterReceipt) {
+        let identity = || AdapterIdentity {
+            guid: [42; 16],
+            luid: 88,
+            kind: IF_TYPE_PROP_VIRTUAL,
+            description: "Wintun Userspace Tunnel".into(),
+        };
+        (
+            AdapterObservation {
+                identity: identity(),
+                index: 12,
+                media: MediaConnectStateDisconnected,
+                oper_status: 2,
+            },
+            AdapterReceipt {
+                version: 1,
+                identity: identity(),
+                pid: 44,
+                created_at: 200,
+            },
+        )
+    }
+
+    #[test]
+    fn tun_adapter_reuse_requires_matching_receipt_idle_link_and_ended_generation() {
+        let (mut current, receipt) = adapter_fixture();
+        let no_process_lookup = |_, _| panic!("no owner lookup expected");
+        assert!(admit_idle_adapter(&current, None, no_process_lookup)
+            .unwrap_err()
+            .starts_with("TUN_INTERFACE_OWNER_UNKNOWN"));
+        current.index = 13; // The index is not persistent, unlike the journal's identity check.
+        for owner in [
+            OwnerObservation::Exited,
+            OwnerObservation::IdentityOnly(201),
+        ] {
+            admit_idle_adapter(&current, Some(&receipt), |pid, created| {
+                assert_eq!((pid, created), (44, Some(200)));
+                owner
+            })
+            .unwrap();
+        }
+        for (owner, code) in [
+            (OwnerObservation::Running, "TUN_INTERFACE_ACTIVE"),
+            (
+                OwnerObservation::IdentityOnly(200),
+                "TUN_INTERFACE_OWNER_UNKNOWN",
+            ),
+            (
+                OwnerObservation::Unknown("OpenProcess", 5),
+                "TUN_INTERFACE_OWNER_UNKNOWN",
+            ),
+        ] {
+            assert!(admit_idle_adapter(&current, Some(&receipt), |_, _| owner)
+                .unwrap_err()
+                .starts_with(code));
+        }
+        current.media = MediaConnectStateConnected;
+        assert!(
+            admit_idle_adapter(&current, Some(&receipt), no_process_lookup)
+                .unwrap_err()
+                .starts_with("TUN_INTERFACE_ACTIVE")
+        );
+        current.media = 0; // Unknown is not proof of inactivity.
+        assert!(admit_idle_adapter(&current, Some(&receipt), no_process_lookup).is_err());
+        current.media = MediaConnectStateDisconnected;
+        current.identity.luid += 1;
+        assert!(admit_idle_adapter(&current, Some(&receipt), no_process_lookup).is_err());
+        current.identity.luid -= 1;
+        current.identity.guid[0] ^= 1;
+        assert!(admit_idle_adapter(&current, Some(&receipt), no_process_lookup).is_err());
+        current.identity.guid[0] ^= 1;
+        current.identity.description = "other adapter".into();
+        assert!(admit_idle_adapter(&current, Some(&receipt), no_process_lookup).is_err());
+    }
+
+    #[test]
+    fn tun_adapter_reports_a_real_guid_conflict_separately_from_missing_pnp() {
+        let (current, _) = adapter_fixture();
+        assert!(matches!(
+            reconcile_wintun_name(None, WintunName::Missing, false),
+            Ok(AdapterSnapshot::Absent)
+        ));
+        let guid = current.identity.guid;
+        assert!(matches!(
+            reconcile_wintun_name(Some(current), WintunName::Unique(guid), false),
+            Ok(AdapterSnapshot::Matched(_))
+        ));
+
+        let (current, _) = adapter_fixture();
+        let Err(conflict) =
+            reconcile_wintun_name(Some(current), WintunName::Unique([5; 16]), false)
+        else {
+            panic!("different GUIDs must fail");
+        };
+        assert!(conflict.contains("TUN_INTERFACE_GUID_CONFLICT"));
+        assert!(conflict.contains("05050505-0505-0505-0505-050505050505"));
+        assert!(conflict.contains("2a2a2a2a-2a2a-2a2a-2a2a-2a2a2a2a2a2a"));
+        assert!(reconcile_wintun_name(None, WintunName::Unique(guid), false).is_err());
+        let (current, _) = adapter_fixture();
+        let Err(duplicate) = reconcile_wintun_name(Some(current), WintunName::Duplicate, false)
+        else {
+            panic!("duplicate internal names must fail even when there is only one Windows alias");
+        };
+        assert!(duplicate.starts_with("TUN_INTERFACE_DUPLICATE_WINTUN_NAME"));
+        let (current, _) = adapter_fixture();
+        assert!(reconcile_wintun_name(Some(current), WintunName::Missing, false).is_err());
+    }
+
+    #[test]
+    fn tun_adapter_waits_for_a_disappearing_interface_without_adopting_it() {
+        let (mut stale, _) = adapter_fixture();
+        stale.media = MediaConnectStateUnknown;
+        let mut samples = [Some(stale), None].into_iter();
+        let mut waits = 0;
+        let result = wait_for_adapter_snapshot(
+            || reconcile_wintun_name(samples.next().unwrap(), WintunName::Missing, false),
+            || {
+                waits += 1;
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(waits, 1);
+        assert!(result.is_none());
+
+        let Err(pending) = wait_for_adapter_snapshot(
+            || {
+                let (mut stale, _) = adapter_fixture();
+                stale.media = MediaConnectStateUnknown;
+                reconcile_wintun_name(Some(stale), WintunName::Missing, false)
+            },
+            || false,
+        ) else {
+            panic!("a persistent incomplete pair must fail closed");
+        };
+        assert!(pending.starts_with("TUN_INTERFACE_SNAPSHOT_PENDING"));
+    }
+
+    #[test]
+    fn tun_adapter_start_waits_for_pnp_and_then_confirms_same_link() {
+        let (mut current, receipt) = adapter_fixture();
+        current.media = MediaConnectStateConnected;
+        let link = (current.index, current.identity.luid);
+        let mut samples = [
+            WintunName::Missing,
+            WintunName::Unique(current.identity.guid),
+        ]
+        .into_iter();
+        let result = wait_for_adapter_snapshot(
+            || {
+                let (mut current, _) = adapter_fixture();
+                current.media = MediaConnectStateConnected;
+                reconcile_wintun_name(Some(current), samples.next().unwrap(), true)
+            },
+            || true,
+        )
+        .unwrap()
+        .unwrap();
+        verify_started_adapter(&result, Some(&receipt.identity), link).unwrap();
+    }
+
+    #[test]
+    fn tun_adapter_guid_matches_windows_canonical_format() {
+        let mut parsed = GUID::from_u128(0);
+        let text = "{9A83A959-4093-3468-B11A-96A80880587E}";
+        let input: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        assert_eq!(unsafe { CLSIDFromString(input.as_ptr(), &mut parsed) }, 0);
+        assert_eq!(
+            guid_bytes(parsed),
+            guid_bytes(GUID::from_u128(0x9a83a959_4093_3468_b11a_96a80880587e))
+        );
+        assert_eq!(
+            canonical_guid(guid_bytes(parsed)),
+            "9a83a959-4093-3468-b11a-96a80880587e"
+        );
+    }
+
+    #[test]
+    fn tun_adapter_retired_row_requires_nonpresent_matching_pnp_generation() {
+        let (mut row, _) = adapter_fixture();
+        row.identity.guid = guid_bytes(GUID::from_u128(0x9a83a959_4093_3468_b11a_96a80880587e));
+        row.identity.luid = 14918723538255872;
+        row.media = MediaConnectStateUnknown;
+        row.oper_status = IfOperStatusDown;
+        let historical = WintunName::Retired {
+            guid: row.identity.guid,
+            luid: row.identity.luid,
+        };
+        assert!(is_retired_wintun(&row, historical));
+        assert!(!is_retired_wintun(
+            &row,
+            WintunName::Unique(row.identity.guid)
+        ));
+        assert!(!is_retired_wintun(&row, WintunName::Duplicate));
+        row.identity.luid += 1 << 24;
+        assert!(!is_retired_wintun(&row, historical));
+        row.identity.luid -= 1 << 24;
+        row.media = MediaConnectStateConnected;
+        assert!(!is_retired_wintun(&row, historical));
+        row.media = MediaConnectStateUnknown;
+        row.oper_status = IfOperStatusUp;
+        assert!(!is_retired_wintun(&row, historical));
+    }
+
+    #[test]
+    fn tun_adapter_pnp_enumeration_is_read_only() {
+        // Query the same device property as WintunOpenAdapter without loading
+        // wintun.dll or triggering its orphan cleanup. No adapter is required.
+        named_wintun_device(true).unwrap();
+    }
+
+    #[test]
+    fn tun_adapter_runtime_must_use_the_observed_generation() {
+        let (mut current, receipt) = adapter_fixture();
+        let link = (current.index, current.identity.luid);
+        assert!(verify_started_adapter(&current, Some(&receipt.identity), link).is_err());
+        current.media = MediaConnectStateConnected;
+        verify_started_adapter(&current, None, link).unwrap();
+        verify_started_adapter(&current, Some(&receipt.identity), link).unwrap();
+        assert!(verify_started_adapter(&current, Some(&receipt.identity), (0, link.1)).is_err());
+        current.identity.guid[1] ^= 1;
+        assert!(verify_started_adapter(&current, Some(&receipt.identity), link).is_err());
+        current.identity.kind = 6;
+        assert!(verify_started_adapter(&current, None, link).is_err());
+    }
+
+    #[test]
+    fn tun_adapter_receipt_round_trips_with_dpapi_and_preserves_invalid_state() {
+        let (_, mut receipt) = adapter_fixture();
+        let root = std::env::temp_dir().join(format!(
+            "vkarmani-adapter-receipt-{}",
+            crate::compat_storage::durable::random_state_id().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("owned-tun-adapter-v1.dpapi");
+        assert!(load_adapter_receipt(&path).unwrap().is_none());
+        for created_at in [200, 201] {
+            receipt.created_at = created_at;
+            save_adapter_receipt(&path, &receipt).unwrap();
+            let loaded = load_adapter_receipt(&path).unwrap().unwrap();
+            assert_eq!(loaded.identity, receipt.identity);
+            assert_eq!(loaded.pid, receipt.pid);
+            assert_eq!(loaded.created_at, created_at);
+        }
+        receipt.pid = 0;
+        save_adapter_receipt(&path, &receipt).unwrap();
+        let invalid = fs::read(&path).unwrap();
+        assert!(load_adapter_receipt(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), invalid);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn tun_adapter_reuse_protects_manually_configured_addresses() {
+        let mut row = unsafe { std::mem::zeroed::<MIB_UNICASTIPADDRESS_ROW>() };
+        row.Address = address("172.19.0.1").unwrap();
+        row.OnLinkPrefixLength = 32;
+        assert!(expected_idle_address(&row));
+        row.OnLinkPrefixLength = 24;
+        assert!(!expected_idle_address(&row));
+        row.Address = address("192.0.2.1").unwrap();
+        assert!(!expected_idle_address(&row));
+        row.Address = address("fdfe:dcba:9876::1").unwrap();
+        row.OnLinkPrefixLength = 128;
+        assert!(expected_idle_address(&row));
+        row.Address = address("fe80::1").unwrap();
+        row.PrefixOrigin = IpPrefixOriginManual;
+        assert!(!expected_idle_address(&row));
+        row.PrefixOrigin = IpPrefixOriginWellKnown;
+        assert!(expected_idle_address(&row));
+    }
+
     fn verify_owned_interface(luid: u64) -> Result<(), String> {
         let mut row: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };
         row.InterfaceLuid = NET_LUID_LH { Value: luid };
@@ -265,6 +1416,137 @@ mod windows {
             }
         }
         Ok(value)
+    }
+
+    fn interface_row(luid: u64, family: u16) -> (u32, MIB_IPINTERFACE_ROW) {
+        let mut row = unsafe { std::mem::zeroed::<MIB_IPINTERFACE_ROW>() };
+        unsafe { InitializeIpInterfaceEntry(&mut row) };
+        row.Family = family;
+        row.InterfaceLuid = NET_LUID_LH { Value: luid };
+        (unsafe { GetIpInterfaceEntry(&mut row) }, row)
+    }
+
+    fn ready_address(
+        row: &MIB_UNICASTIPADDRESS_ROW,
+        status: u32,
+        index: u32,
+        luid: u64,
+        prefix: u8,
+    ) -> bool {
+        status == 0
+            && row.InterfaceIndex == index
+            && unsafe { row.InterfaceLuid.Value == luid }
+            && row.OnLinkPrefixLength == prefix
+            && row.DadState == IpDadStatePreferred
+            && row.SkipAsSource == 0
+    }
+
+    #[test]
+    fn tun_address_must_be_preferred_and_belong_to_the_current_luid() {
+        let mut row = unsafe { std::mem::zeroed::<MIB_UNICASTIPADDRESS_ROW>() };
+        row.InterfaceIndex = 42;
+        row.InterfaceLuid = NET_LUID_LH { Value: 99 };
+        row.OnLinkPrefixLength = 32;
+        row.DadState = IpDadStatePreferred;
+        assert!(ready_address(&row, 0, 42, 99, 32));
+        assert!(!ready_address(&row, ERROR_NOT_FOUND, 42, 99, 32));
+        assert!(!ready_address(&row, 0, 42, 100, 32));
+        assert!(!ready_address(&row, 0, 43, 99, 32));
+        assert!(!ready_address(&row, 0, 42, 99, 128));
+        for state in [
+            IpDadStateTentative,
+            IpDadStateDuplicate,
+            IpDadStateDeprecated,
+        ] {
+            row.DadState = state;
+            assert!(!ready_address(&row, 0, 42, 99, 32));
+        }
+        row.DadState = IpDadStatePreferred;
+        row.SkipAsSource = 1;
+        assert!(!ready_address(&row, 0, 42, 99, 32));
+    }
+
+    pub(super) fn ready(alias: &str, interface: TunInterfacePlan) -> Result<(u32, u64), String> {
+        let index = find_index(alias)?;
+        let (luid, actual) = interface_identity(index)?;
+        validate_owned_interface(luid, luid, &actual)?;
+        let mut link = unsafe { std::mem::zeroed::<MIB_IF_ROW2>() };
+        link.InterfaceLuid = NET_LUID_LH { Value: luid };
+        let status = unsafe { GetIfEntry2(&mut link) };
+        if status != 0 || link.InterfaceIndex != index || link.OperStatus != 1 {
+            return Err(format!(
+                "TUN_INTERFACE_NOT_READY: index={index}, LUID={luid}, Win32 {status}"
+            ));
+        }
+        for (gateway, prefix) in interface.gateways().iter().zip([32, 128]) {
+            let ip = gateway.split_once('/').expect("fixed TUN prefix").0;
+            let mut row = unsafe { std::mem::zeroed::<MIB_UNICASTIPADDRESS_ROW>() };
+            unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+            row.InterfaceLuid = NET_LUID_LH { Value: luid };
+            row.Address = address(ip)?;
+            let family = unsafe { row.Address.si_family };
+            let status = unsafe { GetUnicastIpAddressEntry(&mut row) };
+            if !ready_address(&row, status, index, luid, prefix) {
+                return Err(format!("TUN_ADDRESS_NOT_READY: index={index}, LUID={luid}, family={family}, dad={}, Win32 {status}", row.DadState));
+            }
+            let (status, ip_interface) = interface_row(luid, family);
+            if status != 0 || ip_interface.InterfaceIndex != index || ip_interface.NlMtu != TUN_MTU
+            {
+                return Err(format!("TUN_MTU_UNCONFIRMED: index={index}, LUID={luid}, family={family}, MTU={}, Win32 {status}", ip_interface.NlMtu));
+            }
+        }
+        if !interface.ipv6_guard && interface_row(luid, AF_INET6).0 != ERROR_NOT_FOUND {
+            return Err(
+                "TUN_IPV6_GUARD_REQUIRED: live adapter did not confirm disabled IPv6".into(),
+            );
+        }
+        if interface.adapter_dns && read_interface_dns(index, luid)? != interface.dns() {
+            return Err(format!("TUN_DNS_UNCONFIRMED: index={index}, LUID={luid}"));
+        }
+        Ok((index, luid))
+    }
+
+    pub(super) fn confirm_effective_routes(
+        index: u32,
+        luid: u64,
+        interface: TunInterfacePlan,
+    ) -> Result<(), String> {
+        // Read-only lookups in each journal-owned half. No socket or traffic.
+        let samples = ["24.0.0.1", "198.51.100.1", "2001:db8::1", "a000::1"];
+        for sample in &samples[..tun_destinations(interface).len()] {
+            let mut row = unsafe { std::mem::zeroed::<MIB_IPFORWARD_ROW2>() };
+            let mut source = unsafe { std::mem::zeroed::<SOCKADDR_INET>() };
+            let destination = address(sample)?;
+            let mut selected_index = 0;
+            let selection = unsafe {
+                GetBestInterfaceEx(
+                    (&destination as *const SOCKADDR_INET).cast(),
+                    &mut selected_index,
+                )
+            };
+            let status = unsafe {
+                GetBestRoute2(
+                    null(),
+                    index,
+                    null(),
+                    &destination,
+                    0,
+                    &mut row,
+                    &mut source,
+                )
+            };
+            if status != 0
+                || selection != 0
+                || selected_index != index
+                || row.InterfaceIndex != index
+                || unsafe { row.InterfaceLuid.Value != luid }
+                || row.DestinationPrefix.PrefixLength != 1
+                || row.Metric != 6
+            {
+                return Err(format!("TUN_EFFECTIVE_ROUTE_UNCONFIRMED: index={index}, LUID={luid}, Win32 {status}/{selection}, selectedIndex={selected_index}, routeMetric={}", row.Metric));
+            }
+        }
+        Ok(())
     }
     fn row(route: &OwnedRoute) -> Result<MIB_IPFORWARD_ROW2, String> {
         let mut value: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
@@ -352,27 +1634,7 @@ mod windows {
         {
             return Err("Route journal invalid".into());
         }
-        if journal.owner_pid != std::process::id() {
-            // Conservatively refuse when a previous owner may still exist. No PID termination.
-            let handle = unsafe {
-                OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                    0,
-                    journal.owner_pid,
-                )
-            };
-            if !handle.is_null() {
-                let alive = unsafe { WaitForSingleObject(handle, 0) } != 0;
-                unsafe {
-                    CloseHandle(handle);
-                }
-                if alive {
-                    return Err("ROUTE_OWNER_ACTIVE: предыдущий owner process ещё активен.".into());
-                }
-            } else if std::io::Error::last_os_error().raw_os_error() != Some(87) {
-                return Err("ROUTE_OWNER_UNKNOWN: невозможно проверить предыдущий process.".into());
-            }
-        }
+        verify_previous_owner(&journal, owner_observation)?;
         // Lookup by the stored LUID, never by a stale/recycled index.
         for entry in &journal.entries {
             verify_owned_interface(entry.route.interface_luid)?;
@@ -386,16 +1648,25 @@ mod windows {
         }
         Ok(())
     }
-    pub(super) fn configure(app: &AppHandle, interface_name: &str) -> Result<(), String> {
+    pub(super) fn configure(
+        app: &AppHandle,
+        interface_name: &str,
+        interface: TunInterfacePlan,
+        expected_adapter: Option<&AdapterIdentity>,
+    ) -> Result<AdapterIdentity, String> {
         cleanup(app)?;
-        let index = wait_for_tun_interface(interface_name)?;
-        let (luid, alias) = interface_identity(index)?;
-        if alias != TUN_INTERFACE_NAME {
-            return Err("Неподтверждённый TUN interface".into());
-        }
-        let routes = ["0.0.0.0", "128.0.0.0", "::", "8000::"]
-            .into_iter()
-            .map(|ip| OwnedRoute {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let (index, luid) = loop {
+            match ready(interface_name, interface) {
+                Ok(value) => break value,
+                Err(error) if Instant::now() >= deadline => return Err(error),
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        let adapter = confirm_started_adapter(expected_adapter, (index, luid))?;
+        let routes = tun_destinations(interface)
+            .iter()
+            .map(|&ip| OwnedRoute {
                 destination: ip.into(),
                 prefix: 1,
                 next_hop: if ip.contains(':') { "::" } else { "0.0.0.0" }.into(),
@@ -409,9 +1680,15 @@ mod windows {
         let mut journal = RouteJournal {
             version: 1,
             owner_pid: std::process::id(),
+            owner_created_at: Some(
+                process_created_at(unsafe { GetCurrentProcess() }).map_err(|code| {
+                    format!("ROUTE_OWNER_UNKNOWN: GetProcessTimes: Win32 {code}")
+                })?,
+            ),
             entries: Vec::new(),
         };
-        install_routes_with_rollback(&mut backend, &mut journal, &routes)
+        install_routes_with_rollback(&mut backend, &mut journal, &routes)?;
+        Ok(adapter)
     }
     #[test]
     fn read_only_native_route_query() {
@@ -450,6 +1727,7 @@ mod windows {
             .save(&RouteJournal {
                 version: 1,
                 owner_pid: child.id(),
+                owner_created_at: None,
                 entries: vec![],
             })
             .unwrap();
@@ -458,11 +1736,82 @@ mod windows {
             .unwrap_err()
             .starts_with("ROUTE_OWNER_ACTIVE:"));
         assert_eq!(fs::read(&backend.path).unwrap(), original);
+        let handle = open_owner(child.id(), PROCESS_QUERY_LIMITED_INFORMATION).unwrap();
+        let actual = process_created_at(handle.0).unwrap();
+        let mut journal = RouteJournal {
+            version: 1,
+            owner_pid: child.id(),
+            owner_created_at: Some(actual),
+            entries: vec![],
+        };
+        backend.save(&journal).unwrap();
+        assert!(load(&backend)
+            .unwrap_err()
+            .starts_with("ROUTE_OWNER_ACTIVE:"));
+        // Exercise real OpenProcess/GetProcessTimes on a live process that
+        // stands in for a recycled PID. Do not open or mutate any routes.
+        journal.owner_created_at = Some(actual - 1);
+        backend.save(&journal).unwrap();
+        assert_eq!(
+            load(&backend).unwrap().unwrap().owner_created_at,
+            Some(actual - 1)
+        );
+        drop(handle);
         assert!(terminate_child_with_timeout(&mut child, Duration::from_secs(2)).is_some());
         assert!(load(&backend).unwrap().unwrap().entries.is_empty());
         drop(child);
         backend.clear().unwrap();
         fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn uncertain_previous_owner_preserves_the_journal_and_distinguishes_win32_errors() {
+        let mut journal = RouteJournal {
+            version: 1,
+            owner_pid: u32::MAX,
+            owner_created_at: Some(42),
+            entries: vec![],
+        };
+        for code in [5, 32, 33] {
+            let error = verify_previous_owner(&journal, |_, _| {
+                OwnerObservation::Unknown("OpenProcess", code)
+            })
+            .unwrap_err();
+            assert!(error.starts_with("ROUTE_OWNER_UNKNOWN:"));
+            assert!(error.contains(&format!("Win32 {code}")));
+        }
+        assert!(
+            verify_previous_owner(&journal, |_, _| OwnerObservation::IdentityOnly(42)).is_err()
+        );
+        assert!(verify_previous_owner(&journal, |_, _| OwnerObservation::IdentityOnly(43)).is_ok());
+        assert!(verify_previous_owner(&journal, |_, _| OwnerObservation::Exited).is_ok());
+        journal.owner_created_at = None;
+        assert!(
+            verify_previous_owner(&journal, |_, _| OwnerObservation::IdentityOnly(43)).is_err()
+        );
+        journal.owner_pid = 0;
+        assert!(verify_previous_owner(&journal, |_, _| panic!("invalid PID was queried")).is_err());
+    }
+
+    #[test]
+    fn a_current_pid_with_no_generation_does_not_prove_legacy_route_ownership() {
+        let actual = process_created_at(unsafe { GetCurrentProcess() }).unwrap();
+        let mut journal = RouteJournal {
+            version: 1,
+            owner_pid: std::process::id(),
+            owner_created_at: None,
+            entries: vec![],
+        };
+        let unexpected = |_, _| panic!("current process uses its retained identity");
+        assert!(verify_previous_owner(&journal, unexpected)
+            .unwrap_err()
+            .starts_with("ROUTE_OWNER_UNKNOWN:"));
+        journal.owner_created_at = Some(actual);
+        assert!(verify_previous_owner(&journal, unexpected).is_ok());
+        journal.owner_created_at = Some(actual - 1);
+        assert!(verify_previous_owner(&journal, unexpected).is_ok());
+        journal.owner_created_at = Some(actual + 1);
+        assert!(verify_previous_owner(&journal, unexpected).is_err());
     }
     #[test]
     fn route_journal_reader_refuses_linked_journal_without_trusting_it() {
@@ -476,6 +1825,7 @@ mod windows {
         let journal = RouteJournal {
             version: 1,
             owner_pid: std::process::id(),
+            owner_created_at: None,
             entries: vec![],
         };
         let encrypted = encrypt_access_key(&serde_json::to_string(&journal).unwrap()).unwrap();
@@ -509,6 +1859,7 @@ mod windows {
         let journal = RouteJournal {
             version: 1,
             owner_pid: std::process::id(),
+            owner_created_at: Some(process_created_at(unsafe { GetCurrentProcess() }).unwrap()),
             entries: vec![],
         };
         let encrypted = encrypt_access_key(&serde_json::to_string(&journal).unwrap()).unwrap();
@@ -548,25 +1899,109 @@ pub(crate) fn cleanup_tun_routes_for_app(
         Ok(())
     }
 }
-#[cfg(target_os = "windows")]
-pub(crate) fn owned_interface_index(alias: &str) -> Result<u32, String> {
-    windows::find_index(alias)
-}
 pub(crate) fn configure_tun_routes(
     app: &AppHandle,
     interface_name: &str,
-    _server_ips: &[String],
-) -> Result<(), String> {
+    interface: TunInterfacePlan,
+    expected_adapter: Option<&AdapterIdentity>,
+) -> Result<AdapterIdentity, String> {
     #[cfg(target_os = "windows")]
     {
-        windows::configure(app, interface_name)
+        windows::configure(app, interface_name, interface, expected_adapter)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, interface_name);
+        let _ = (app, interface_name, interface, expected_adapter);
         Err("Windows TUN only".into())
     }
 }
+
+#[cfg(target_os = "windows")]
+pub(crate) use windows::AdapterIdentity;
+#[cfg(not(target_os = "windows"))]
+pub(crate) struct AdapterIdentity;
+
+pub(crate) fn preflight_owned_tun_adapter(app: &AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::preflight_adapter(app)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Err("Windows TUN only".into())
+    }
+}
+
+pub(crate) fn prepare_owned_tun_adapter(
+    app: &AppHandle,
+) -> Result<Option<AdapterIdentity>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::prepare_adapter(app)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Err("Windows TUN only".into())
+    }
+}
+
+pub(crate) fn record_owned_tun_adapter(
+    app: &AppHandle,
+    adapter: AdapterIdentity,
+    child: &mut OwnedXrayProcess,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::record_adapter(app, adapter, child)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, adapter, child);
+        Err("Windows TUN only".into())
+    }
+}
+
+pub(crate) fn confirm_tun_routes_ready(
+    app: &AppHandle,
+    interface: TunInterfacePlan,
+    adapter: &AdapterIdentity,
+) -> Result<(), String> {
+    let (status, routes) = owned_route_summary(app);
+    #[cfg(target_os = "windows")]
+    if status == "confirmed" && complete_tun_route_set(&routes, interface) {
+        let (index, luid) = windows::ready(TUN_INTERFACE_NAME, interface)?;
+        if routes[0].interface_luid != luid {
+            return Err("TUN_ROUTES_NOT_READY: adapter generation changed".into());
+        }
+        windows::confirm_started_adapter(Some(adapter), (index, luid))?;
+        windows::confirm_effective_routes(index, luid, interface)?;
+        let _ = append_runtime_event(app, &format!(
+            "TUN_LINK_CONFIRMED: index={index}, LUID={luid}, Preferred, MTU={TUN_MTU}, ownedRoutes={}, adapterDnsConfigured={}",
+            routes.len(), interface.adapter_dns,
+        ));
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (interface, adapter);
+    Err(format!(
+        "TUN_ROUTES_NOT_READY: ownership={status}, recorded={}",
+        routes.len()
+    ))
+}
+
+fn complete_tun_route_set(routes: &[OwnedRoute], interface: TunInterfacePlan) -> bool {
+    let destinations = tun_destinations(interface);
+    routes.len() == destinations.len()
+        && routes.iter().all(|route| {
+            valid_owned_route(route) && route.interface_luid == routes[0].interface_luid
+        })
+        && destinations
+            .iter()
+            .all(|destination| routes.iter().any(|route| route.destination == *destination))
+}
+
 fn route_journal_status(backend: &mut impl RouteBackend, journal: &RouteJournal) -> &'static str {
     if journal.entries.iter().any(|entry| !entry.applied) {
         return "unconfirmed";
@@ -922,6 +2357,7 @@ mod tests {
         let journal = RouteJournal {
             version: 1,
             owner_pid: std::process::id(),
+            owner_created_at: None,
             entries: vec![RouteEntry {
                 route: owned.clone(),
                 applied: true,
@@ -938,7 +2374,7 @@ mod tests {
         OwnedRoute {
             destination: ip.into(),
             prefix: 1,
-            next_hop: "0.0.0.0".into(),
+            next_hop: if ip.contains(':') { "::" } else { "0.0.0.0" }.into(),
             interface_index: 14,
             interface_luid: 14000,
             metric: 6,
@@ -949,6 +2385,7 @@ mod tests {
         RouteJournal {
             version: 1,
             owner_pid: 1,
+            owner_created_at: None,
             entries: vec![],
         }
     }
@@ -1073,6 +2510,26 @@ mod tests {
             mutate(&mut changed);
             assert!(!same_owned_route(&expected, &changed));
         }
+    }
+
+    #[test]
+    fn ready_requires_all_four_routes_on_one_interface_generation() {
+        let mut routes = ["0.0.0.0", "128.0.0.0", "::", "8000::"].map(route);
+        let mut interface = TunInterfacePlan {
+            ipv6_guard: true,
+            adapter_dns: true,
+        };
+        assert!(complete_tun_route_set(&routes, interface));
+        assert!(!complete_tun_route_set(&routes[..3], interface));
+        routes[2].interface_luid += 1;
+        assert!(!complete_tun_route_set(&routes, interface));
+        routes[2] = routes[3].clone();
+        assert!(!complete_tun_route_set(&routes, interface));
+        interface.ipv6_guard = false;
+        assert!(complete_tun_route_set(&routes[..2], interface));
+        assert!(!complete_tun_route_set(&routes, interface));
+        routes[0].metric = 7;
+        assert!(!complete_tun_route_set(&routes[..2], interface));
     }
     #[test]
     fn successful_exact_restore_100_cycles_no_foreign_routes_deleted() {

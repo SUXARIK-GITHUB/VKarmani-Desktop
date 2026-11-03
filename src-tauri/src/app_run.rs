@@ -182,7 +182,12 @@ pub fn run() {
             let _ = interface_logs_dir(app.handle());
             let _ = routing_logs_dir(app.handle());
             let _ = ensure_log_tree(app.handle());
-            let _ = cleanup_tun_routes_for_app(app.handle(), TUN_INTERFACE_NAME, &[]);
+            if let Err(error) = cleanup_tun_routes_for_app(app.handle(), TUN_INTERFACE_NAME, &[]) {
+                let _ = append_runtime_event(
+                    app.handle(),
+                    &format!("ROUTE_CLEANUP_INCOMPLETE (startup): {error}"),
+                );
+            }
             let _ = cleanup_runtime_config_files(app.handle());
             let state = app.state::<AppState>();
             let _ = recover_orphaned_system_proxy(app.handle(), &state, "startup_recovery");

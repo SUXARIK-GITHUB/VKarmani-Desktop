@@ -16,6 +16,12 @@ impl ProxySettings {
             pac: String::new(),
         }
     }
+    fn legacy_target() -> Self {
+        Self {
+            bypass: "<local>".into(),
+            ..Self::owned_target()
+        }
+    }
     fn can_rollback_partial(&self, original: &Self, target: &Self) -> bool {
         (self.flags == original.flags || self.flags == target.flags)
             && (self.server == original.server || self.server == target.server)
@@ -90,7 +96,8 @@ fn enable_transaction(
         if journal.version != 2 {
             return Err("Неподдерживаемый proxy journal".into());
         }
-        if current == journal.target && journal.applied {
+        if current == journal.target && current == ProxySettings::owned_target() && journal.applied
+        {
             return Ok(journal);
         }
         restore_transaction(backend, &journal)?;
@@ -98,7 +105,7 @@ fn enable_transaction(
     let original = backend.read()?;
     let target = ProxySettings::owned_target();
     // A loopback endpoint alone is not proof that this instance owns it.
-    if original == target {
+    if original == target || original == ProxySettings::legacy_target() {
         return Err(
             "PROXY_UNKNOWN_OWNER: loopback proxy уже установлен без journal владельца.".into(),
         );
@@ -132,6 +139,21 @@ fn enable_transaction(
                 "PROXY_ROLLBACK_FAILED: backup сохранён, восстановление не подтверждено.".into()
             }
         });
+    }
+    Ok(journal)
+}
+
+fn enable_ready_transaction(
+    backend: &mut impl ProxyBackend,
+    previous: Option<ProxyJournal>,
+    confirm_runtime: impl FnOnce() -> Result<(), String>,
+) -> Result<ProxyJournal, String> {
+    let journal = enable_transaction(backend, previous)?;
+    if let Err(error) = confirm_runtime() {
+        return match restore_transaction(backend, &journal) {
+            Ok(_) => Err(error),
+            Err(cleanup) => Err(format!("PROXY_CLEANUP_INCOMPLETE: {error}; {cleanup}")),
+        };
     }
     Ok(journal)
 }
@@ -294,7 +316,8 @@ fn load_journal_at(path: &Path) -> Result<Option<ProxyJournal>, String> {
         return Err("Неподдерживаемый proxy journal".into());
     }
     ensure_previous_owner_inactive(journal.owner_pid)?;
-    if journal.target != ProxySettings::owned_target()
+    if (journal.target != ProxySettings::owned_target()
+        && journal.target != ProxySettings::legacy_target())
         || [&journal.original, &journal.target].iter().any(|settings| {
             settings.flags > 15
                 || [&settings.server, &settings.bypass, &settings.pac]
@@ -342,9 +365,12 @@ impl ProxyBackend for NativeProxyBackend<'_> {
         Ok(())
     }
 }
-pub(crate) fn enable_owned_windows_proxy(app: &AppHandle) -> Result<ProxyStatus, String> {
+pub(crate) fn enable_owned_windows_proxy(
+    app: &AppHandle,
+    confirm_runtime: impl FnOnce() -> Result<(), String>,
+) -> Result<ProxyStatus, String> {
     let mut backend = NativeProxyBackend { app };
-    let journal = enable_transaction(&mut backend, load_journal(app)?)?;
+    let journal = enable_ready_transaction(&mut backend, load_journal(app)?, confirm_runtime)?;
     Ok(journal.target.status())
 }
 pub(crate) fn restore_owned_windows_proxy(app: &AppHandle) -> Result<Option<ProxyStatus>, String> {
@@ -377,6 +403,66 @@ pub(crate) fn windows_proxy_ownership_state(app: &AppHandle) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lan_bypass_uses_only_local_names_and_the_exact_private_wildcards() {
+        let target = ProxySettings::owned_target();
+        let patterns: Vec<_> = target.bypass.split(';').collect();
+        for prefix in [
+            "<local>",
+            "localhost",
+            "127.*",
+            "10.*",
+            "192.168.*",
+            "169.254.*",
+        ] {
+            assert!(patterns.contains(&prefix));
+        }
+        for second in 0..=255 {
+            assert_eq!(
+                patterns.contains(&format!("172.{second}.*").as_str()),
+                (16..=31).contains(&second)
+            );
+        }
+        assert_eq!(patterns.len(), 22);
+        assert!(!patterns.iter().any(|pattern| pattern.contains('/')));
+    }
+
+    #[test]
+    fn legacy_proxy_target_migrates_and_preserves_original_pac_and_bypass() {
+        let mut fake = backend();
+        let original = fake.current.clone();
+        let journal = ProxyJournal {
+            version: 2,
+            owner_pid: std::process::id(),
+            original: original.clone(),
+            target: ProxySettings::legacy_target(),
+            applied: true,
+        };
+        fake.current = journal.target.clone();
+        fake.journal = Some(journal.clone());
+        let migrated = enable_transaction(&mut fake, Some(journal)).unwrap();
+        assert_eq!(migrated.target, ProxySettings::owned_target());
+        assert_eq!(migrated.original, original);
+        restore_transaction(&mut fake, &migrated).unwrap();
+        assert_eq!(fake.current, original);
+        assert!(fake.journal.is_none());
+
+        fake.current = ProxySettings::legacy_target();
+        assert!(enable_transaction(&mut fake, None)
+            .unwrap_err()
+            .starts_with("PROXY_UNKNOWN_OWNER"));
+    }
+    #[test]
+    fn losing_runtime_during_activation_restores_original_pac_and_clears_journal() {
+        let mut fake = backend();
+        let original = fake.current.clone();
+        let error =
+            enable_ready_transaction(&mut fake, None, || Err("PROXY_RUNTIME_EXITED".into()))
+                .unwrap_err();
+        assert_eq!(error, "PROXY_RUNTIME_EXITED");
+        assert_eq!(fake.current, original);
+        assert!(fake.journal.is_none());
+    }
     #[test]
     #[cfg(windows)]
     fn proxy_journal_missing_locked_corrupt_and_oversize_stay_distinct() {

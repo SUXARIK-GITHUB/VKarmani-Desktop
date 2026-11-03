@@ -682,6 +682,23 @@ pub(crate) fn validate_xray_config_with_core(
     config_path: &Path,
     expected_config_hash: &str,
 ) -> Result<(), String> {
+    check_xray_config_with_core(core_path, config_path, expected_config_hash, false)
+}
+
+pub(crate) fn compile_xray_tun_config_with_core(
+    core_path: &Path,
+    config_path: &Path,
+    expected_config_hash: &str,
+) -> Result<(), String> {
+    check_xray_config_with_core(core_path, config_path, expected_config_hash, true)
+}
+
+fn check_xray_config_with_core(
+    core_path: &Path,
+    config_path: &Path,
+    expected_config_hash: &str,
+    compile_only: bool,
+) -> Result<(), String> {
     let integrity = prepare_core_launch(core_path, Some((config_path, expected_config_hash)))?;
     let core_path = integrity.core.as_path();
     let config_path = integrity
@@ -699,10 +716,14 @@ pub(crate) fn validate_xray_config_with_core(
         .env(
             "XRAY_LOCATION_CONFIG",
             config_path.parent().unwrap_or(core_working_dir),
-        )
-        .arg("run")
-        .arg("-test")
-        .arg("-config")
+        );
+    if compile_only {
+        // The pinned core's converter builds the typed config without core.New.
+        command.args(["convert", "pb", "-debug", "-type"]);
+    } else {
+        command.args(["run", "-test", "-config"]);
+    }
+    command
         .arg(if integrity.stdin_config.is_some() {
             Path::new("stdin:")
         } else {
@@ -714,8 +735,18 @@ pub(crate) fn validate_xray_config_with_core(
             Stdio::null()
         });
 
-    run_command_with_timeout_and_input(command, Duration::from_secs(8), "xray config test", integrity.stdin_config.clone())
-        .map(|_| ())
+    let result = run_command_with_timeout_and_input(
+        command,
+        Duration::from_secs(8),
+        "xray config test",
+        integrity.stdin_config.clone(),
+    )
+    .map(|_| ());
+    if compile_only {
+        // Converter output can include provider settings. Never log it.
+        return result.map_err(|_| "XRAY_TUN_CONFIG_COMPILE_FAILED".into());
+    }
+    result
         .map_err(|error| format!("Xray-core не принял runtime-конфиг. Подключение остановлено до запуска процесса: {error}"))
 }
 
@@ -934,8 +965,27 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     )
     .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
 
+    let mut tun_interface_plan = None;
     #[cfg(target_os = "windows")]
     if let Some(route) = physical_route.as_ref() {
+        let disabled_components = read_windows_registry_value(
+            r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters",
+            "DisabledComponents",
+        )
+        .and_then(|value| parse_windows_registry_dword(&value));
+        let interface = TunInterfacePlan {
+            ipv6_guard: !ipv6_globally_disabled(disabled_components),
+            adapter_dns: split_tunnel_plan.default_vpn,
+        };
+        for inbound in config["inbounds"]
+            .as_array_mut()
+            .ok_or("TUN_CONFIG_INBOUNDS")?
+        {
+            if inbound["protocol"] == "tun" {
+                inbound["settings"]["gateway"] = json!(interface.gateways());
+            }
+        }
+        tun_interface_plan = Some(interface);
         bind_tun_outbounds(&mut config, &route.interface_alias)
             .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
     }
@@ -963,6 +1013,21 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         validate_xray_config_with_core(&core_path, &projection_path, &sha256_hex_bytes(&bytes))
             .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
     }
+    if tun_interface_plan.is_some() {
+        compile_xray_tun_config_with_core(&core_path, &config_path, &config_hash)
+            .map_err(|error| format!("CONNECT_PREFLIGHT: {error}"))?;
+        let switching_owned_tun = state
+            .runtime
+            .lock()
+            .map_err(|_| "NETWORK_RUNTIME_UNAVAILABLE")?
+            .as_ref()
+            .is_some_and(|runtime| runtime.network_mode == "tun");
+        if !switching_owned_tun {
+            // Refuse unresolved identities before stopping a working Proxy.
+            // Existing own TUN must release its session before final admission.
+            preflight_owned_tun_adapter(&app)?;
+        }
+    }
     _operation_guard.check()?;
     _operation_guard.stage("stopping")?;
     stop_managed_or_starting_runtime(
@@ -972,7 +1037,9 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         "connect_preflight",
     )?;
     let mut failed_connect = FailedConnectRollback::new(|| {
-        let _ = restore_saved_proxy_state(&app, &state, "connect_failed_after_stop");
+        if let Err(error) = restore_saved_proxy_state(&app, &state, "connect_failed_after_stop") {
+            let _ = append_runtime_event(&app, &format!("PROXY_CLEANUP_INCOMPLETE: {error}"));
+        }
         if let Ok(mut connected) = state.connected.lock() {
             *connected = false;
         }
@@ -980,6 +1047,11 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
             *label = None;
         }
     });
+    if normalized_network_mode == "tun" {
+        cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &outbound_ips).map_err(|error| {
+            format!("Не удалось подготовить Windows-маршруты для TUN режима: {error}")
+        })?;
+    }
     if let Err(first_release_error) = wait_for_runtime_ports_release(if reconnect_requested {
         Duration::from_secs(6)
     } else {
@@ -998,10 +1070,11 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     }
     ensure_runtime_ports_available()?;
 
-    // Full TUN construction can happen only after the old owned child stops.
-    // Projection success is not full TUN readiness or egress proof.
+    // TUN construction belongs exclusively to the owned runtime launch.
     _operation_guard.stage("validating")?;
-    validate_xray_config_with_core(&core_path, &config_path, &config_hash)?;
+    if tun_interface_plan.is_none() {
+        validate_xray_config_with_core(&core_path, &config_path, &config_hash)?;
+    }
     _operation_guard.check()?;
 
     if normalized_network_mode == "tun" {
@@ -1137,6 +1210,12 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
     };
 
     _operation_guard.stage("starting")?;
+    let expected_adapter = if tun_interface_plan.is_some() {
+        prepare_owned_tun_adapter(&app)?
+    } else {
+        None
+    };
+    _operation_guard.check()?;
     let child = match spawn_xray_runtime_child(&core_path, &config_path, &log_path, &config_hash) {
         Ok(child) => child,
         Err(error) => {
@@ -1174,46 +1253,41 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
                 "Xray runtime не стал готовым после запуска, выполняю аварийную очистку: {error}"
             ),
         );
-        clear_starting_runtime(&state, child_pid);
-        let _ = cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &outbound_ips);
-        let _ = restore_saved_proxy_state(&app, &state, "connect_readiness_failed");
-        let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
-        remove_startup_runtime_config(&app, &config_path, "runtime_readiness_failed");
         return Err(error);
     }
 
-    if normalized_network_mode == "tun" {
+    let tun_adapter = if let Some(interface) = tun_interface_plan {
         _operation_guard.stage("configuring-routes")?;
-        configure_tun_routes(&app, TUN_INTERFACE_NAME, &outbound_ips).map_err(|error| {
-            clear_starting_runtime(&state, child_pid);
-            let _ = cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &outbound_ips);
-            let _ = restore_saved_proxy_state(&app, &state, "tun_routes_failed");
-            let _ = terminate_child_with_timeout(&mut child, Duration::from_secs(3));
-            remove_startup_runtime_config(&app, &config_path, "tun_routes_failed");
+        let adapter = configure_tun_routes(
+            &app,
+            TUN_INTERFACE_NAME,
+            interface,
+            expected_adapter.as_ref(),
+        )
+        .map_err(|error| {
             format!("Не удалось подготовить Windows-маршруты для TUN режима: {error}")
         })?;
-        let _ = append_runtime_event(
-            &app,
-            "Owned IPv4/IPv6 split routes applied; unselected traffic DIRECT.",
-        );
         std::thread::sleep(Duration::from_millis(250));
+        confirm_tun_routes_ready(&app, interface, &adapter)?;
+        // Xray v26.10.31 can keep its listeners alive while rejecting dials
+        // bound to a physical interface that changed after preflight.
+        confirm_tun_physical_binding(physical_route.as_ref(), current_physical_binding())?;
         let _ = append_runtime_event(
             &app,
-            "TUN маршруты применены и стабилизированы для текущего сеанса.",
+            "TUN routes confirmed; per-process TCP/UDP egress not measured.",
         );
-    }
+        Some(adapter)
+    } else {
+        None
+    };
 
     if let Some(status) = child.try_wait().map_err(|error| {
         format!("Не удалось проверить Xray перед завершением подключения: {error}")
     })? {
-        clear_starting_runtime(&state, child_pid);
         let code = status.code();
         if let Ok(mut exit_guard) = state.last_exit_code.lock() {
             *exit_guard = code;
         }
-        let _ = cleanup_tun_routes_for_app(&app, TUN_INTERFACE_NAME, &outbound_ips);
-        let _ = restore_saved_proxy_state(&app, &state, "connect_final_check_failed");
-        remove_startup_runtime_config(&app, &config_path, "xray_stopped_before_ready_final_check");
         return Err(format!(
             "Xray остановился до завершения подключения. Exit code: {:?}. Подключение не было помечено активным.",
             code
@@ -1227,6 +1301,9 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
         );
     }
     _operation_guard.stage("publishing")?;
+    if let Some(adapter) = tun_adapter {
+        record_owned_tun_adapter(&app, adapter, &mut child)?;
+    }
 
     if let Ok(mut guard) = state.active_server_label.lock() {
         *guard = Some(server_label.clone());
@@ -1261,6 +1338,7 @@ fn request_connect_blocking(request: ConnectRequest) -> Result<RuntimeStatus, St
             } else {
                 None
             },
+            tun_interface_plan,
             tun_server_ips: if normalized_network_mode == "tun" {
                 outbound_ips.clone()
             } else {
@@ -1674,6 +1752,9 @@ pub(crate) fn set_system_proxy_blocking(
         let runtime = runtime
             .as_mut()
             .ok_or("Сначала запустите runtime, затем включайте системный proxy.")?;
+        if runtime.network_mode != "proxy" {
+            return Err("PROXY_RUNTIME_MODE_MISMATCH".into());
+        }
         crate::listener_owner::require_proxy_runtime_ready(
             &mut runtime.child,
             &[HTTP_PORT, SOCKS_PORT, XRAY_API_PORT],
@@ -1683,7 +1764,15 @@ pub(crate) fn set_system_proxy_blocking(
     }
 
     let status = if enabled {
-        enable_owned_windows_proxy(&app)?
+        enable_owned_windows_proxy(&app, || {
+            _operation_guard.check()?;
+            connectivity_probe_runtime_identity(
+                &state,
+                None,
+                &[HTTP_PORT, SOCKS_PORT, XRAY_API_PORT],
+            )
+            .map(|_| ())
+        })?
     } else {
         match restore_saved_proxy_state(&app, &state, "manual_proxy_toggle")? {
             Some(restored) => restored,
@@ -1750,7 +1839,7 @@ pub(crate) fn connectivity_probe_runtime_identity(
     state: &AppState,
     expected: Option<&str>,
     ports: &[u16],
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let mut runtime = state
         .runtime
         .lock()
@@ -1762,14 +1851,19 @@ pub(crate) fn connectivity_probe_runtime_identity(
     }
     crate::listener_owner::require_proxy_runtime_ready(&mut runtime.child, ports)
         .map_err(|error| format!("CONNECTIVITY_RUNTIME_NOT_READY: {error}"))?;
-    Ok(identity)
+    Ok((identity, runtime.network_mode == "tun"))
 }
 
 pub(crate) fn connectivity_probe_blocking(app: AppHandle) -> Result<ConnectivityProbe, String> {
     let state = app.state::<AppState>();
     let ports = [HTTP_PORT, SOCKS_PORT, XRAY_API_PORT];
-    let identity = connectivity_probe_runtime_identity(&state, None, &ports)?;
+    let (identity, tun) = connectivity_probe_runtime_identity(&state, None, &ports)?;
     let checked_at = unix_now_string();
+    if tun {
+        // Explicit HTTP proxy ingress is a different Xray routing path.
+        // A request here would not exercise the Windows app's TUN policy.
+        return Ok(unverified_tun_probe(checked_at));
+    }
     let http_port_open = tcp_port_open("127.0.0.1", HTTP_PORT, 1200);
     let socks_port_open = tcp_port_open("127.0.0.1", SOCKS_PORT, 1200);
 
@@ -1811,6 +1905,28 @@ pub(crate) fn connectivity_probe_blocking(app: AppHandle) -> Result<Connectivity
         packet_loss_pct: None,
         message: "Маршрут через локальный Xray runtime отвечает.".into(),
     })
+}
+
+fn unverified_tun_probe(checked_at: String) -> ConnectivityProbe {
+    ConnectivityProbe {
+        success: false,
+        checked_at,
+        http_port_open: true,
+        socks_port_open: true,
+        public_ip: None,
+        latency_ms: None,
+        packet_loss_pct: None,
+        message: "TUN_EGRESS_UNVERIFIED: локальные порты Xray готовы, трафик приложений через TUN не проверен.".into(),
+    }
+}
+
+#[test]
+fn owned_listeners_do_not_publish_tun_egress_or_a_public_ip() {
+    let probe = unverified_tun_probe("test".into());
+    assert!(probe.http_port_open && probe.socks_port_open);
+    assert!(!probe.success);
+    assert_eq!(probe.public_ip, None);
+    assert_eq!(probe.latency_ms, None);
 }
 
 pub(crate) fn server_ping_blocking(
@@ -2408,6 +2524,30 @@ fn parse_windows_registry_dword(value: &str) -> Option<u32> {
         return u32::from_str_radix(hex, 16).ok();
     }
     trimmed.parse::<u32>().ok()
+}
+
+#[cfg(target_os = "windows")]
+fn ipv6_globally_disabled(value: Option<u32>) -> bool {
+    // Microsoft DisabledComponents bits 0 and 4 disable all tunnel and
+    // non-tunnel IPv6 respectively. Route admission also verifies live state.
+    value.is_some_and(|mask| mask & 0x11 == 0x11)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+#[test]
+fn only_explicit_global_ipv6_disable_allows_omitting_the_guard() {
+    for value in [
+        None,
+        Some(0),
+        Some(0x01),
+        Some(0x10),
+        Some(0x20),
+        Some(0xaf),
+    ] {
+        assert!(!ipv6_globally_disabled(value));
+    }
+    assert!(ipv6_globally_disabled(Some(0x11)));
+    assert!(ipv6_globally_disabled(Some(0xff)));
 }
 
 #[cfg(target_os = "windows")]
